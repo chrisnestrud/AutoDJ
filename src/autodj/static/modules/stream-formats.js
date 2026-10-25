@@ -2,20 +2,19 @@
 // quality, and the address of every format that is on.
 //
 // Speech rules:
-//   - A quality select saves once the choice settles: arrowing through a
-//     closed select fires change on every step, and each save restarts
-//     that format's encoder and drops its listeners.  The result is said
-//     once in the settings status region.
-//   - A select is never rewritten while it has focus or while its save is
-//     out.
+//   - A select is never rewritten while it has an unsaved draft.
+//   - Save changes says what each changed format now does, after the
+//     tab's result.
 //   - The address list is plain text, rebuilt only when its text changes,
 //     so reading it is not disturbed by the once-a-second push.
 //   - Copy is a user action: its confirmation is forced, and focus stays
 //     on the button.
+//   - A push whose saved bitrates differ from the list's asks for the
+//     addresses again, once, so a saved format is listed without a reload.
 
 import { announceStatus } from "./live-region.js";
+import { registerSettingsGroup } from "./settings-drafts.js";
 
-export const FORMAT_SETTLE_MS = 600;
 const FORMATS = ["aac", "opus"];
 
 // "AAC, 96 kbps: http://host/stream.aac", and what its encoder last
@@ -26,7 +25,7 @@ export function formatLine(item, origin) {
 }
 
 // What a save did, in words.
-export function formatSavedText(label, bitrate) {
+function formatSavedText(label, bitrate) {
   return bitrate ? `${label} stream on at ${bitrate} kbps.` : `${label} stream off.`;
 }
 
@@ -54,10 +53,8 @@ async function copyText(doc, text) {
   }
 }
 
-// save(name, bitrate, control) -> Promise<boolean>; refresh() asks the
-// server for the stream details again, which come back through fill().
 export function installStreamFormats({
-  doc, save, refresh = () => {}, srStatus, settingsStatus,
+  doc, srStatus, refresh = () => {},
 }) {
   const list = doc.getElementById("stream-formats-list");
   const intro = doc.getElementById("stream-formats-intro");
@@ -65,22 +62,22 @@ export function installStreamFormats({
     name, doc.getElementById(`stream-${name}-bitrate`),
   ]));
   const labels = { aac: "AAC", opus: "Opus" };
-  // Per format: the value the server last confirmed, the settle timer
-  // and whether a save is out.
-  const saved = Object.fromEntries(FORMATS.map((name) => [name, selects[name].value]));
-  const timers = {};
-  const saving = {};
+  const settingsDrafts = Object.fromEntries(FORMATS.map((name) => [name, registerSettingsGroup({
+    panel: doc.getElementById("spanel-stream"),
+    group: "stream",
+    controls: [selects[name]],
+    read: () => ({ [`${name}_bitrate`]: Number(selects[name].value) }),
+    write: (body) => {
+      if (body[`${name}_bitrate`] != null) selects[name].value = String(body[`${name}_bitrate`]);
+    },
+    describe: (body) => formatSavedText(labels[name], body[`${name}_bitrate`]),
+  })]));
 
-  function busy(name) {
-    return Boolean(saving[name] || timers[name]);
-  }
-
-  function showValue(name, value) {
-    if (value == null || busy(name)) return;
-    saved[name] = String(value);
-    const select = selects[name];
-    if (doc.activeElement !== select && select.value !== saved[name]) select.value = saved[name];
-  }
+  // The bitrates the list was drawn from, and the pushed ones a lookup was
+  // last asked for.
+  let shown = null;
+  let asked = null;
+  const bitrates = (bitrateOf) => FORMATS.map((name) => Number(bitrateOf(name) || 0)).join();
 
   function showList(items) {
     const origin = doc.location.origin;
@@ -119,8 +116,11 @@ export function installStreamFormats({
   function fill(info) {
     const items = Array.isArray(info?.formats) ? info.formats : [];
     for (const item of items) {
-      if (selects[item.format]) showValue(item.format, item.bitrate);
+      if (settingsDrafts[item.format]) settingsDrafts[item.format].accept({
+        [`${item.format}_bitrate`]: item.bitrate,
+      });
     }
+    shown = bitrates((name) => items.find((item) => item.format === name)?.bitrate);
     showList(items);
   }
 
@@ -128,53 +128,27 @@ export function installStreamFormats({
   function apply(state) {
     const playback = state?.settings?.playback;
     if (!playback) return;
-    for (const name of FORMATS) showValue(name, playback[`stream_${name}_bitrate`]);
+    for (const name of FORMATS) {
+      settingsDrafts[name].accept({ [`${name}_bitrate`]: playback[`stream_${name}_bitrate`] });
+    }
+    const pushed = bitrates((name) => playback[`stream_${name}_bitrate`]);
+    if (shown !== null && pushed !== shown && pushed !== asked) {
+      asked = pushed;
+      refresh();
+    }
   }
 
   function reset() {
+    shown = null;
+    asked = null;
     for (const name of FORMATS) {
-      clearTimeout(timers[name]);
-      timers[name] = null;
-      saving[name] = false;
       selects[name].value = "0";
-      saved[name] = "0";
     }
     list.replaceChildren();
     intro.hidden = true;
     list.hidden = true;
   }
 
-  async function flush(name) {
-    timers[name] = null;
-    const select = selects[name];
-    const chosen = select.value;
-    if (chosen === saved[name] || saving[name]) return;
-    saving[name] = true;
-    let ok = false;
-    try {
-      ok = await save(name, Number(chosen), select);
-    } finally {
-      saving[name] = false;
-    }
-    if (ok) {
-      saved[name] = chosen;
-      announceStatus(settingsStatus, formatSavedText(labels[name], Number(chosen)),
-        { dwellMs: 4000, force: true });
-      refresh();
-    } else if (select.value === chosen) {
-      // postSettings has said why; the select shows what the server has.
-      select.value = saved[name];
-    }
-    // A choice made while the save was out goes now.
-    if (select.value !== saved[name] && !timers[name]) void flush(name);
-  }
-
-  for (const name of FORMATS) {
-    selects[name].addEventListener("change", () => {
-      clearTimeout(timers[name]);
-      timers[name] = setTimeout(() => void flush(name), FORMAT_SETTLE_MS);
-    });
-  }
   reset();
   return { fill, apply, reset };
 }

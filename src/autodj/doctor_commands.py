@@ -38,9 +38,18 @@ def run_recovery_commands(
     """Offer each recovery once, retaining config and interpreter; recheck after execution."""
     from autodj.doctor import CheckStatus, render_text, run_doctor
     from autodj.doctor_cache import backup_dj_meta_cache
+    from autodj.host_tools import ensure_ffmpeg
 
     attempted: set[str] = set()
     failed = False
+    if any(check.repair == "install-ffmpeg" for check in report.checks):
+        try:
+            if ensure_ffmpeg(auto_install=auto_fix):
+                report = run_doctor(cfg, station=station, check_updates=False)
+                click.echo(render_text(report))
+        except (OSError, RuntimeError) as exc:
+            click.echo(f"FFmpeg installation failed: {exc}", err=True)
+            failed = True
     while True:
         recommended = {
             check.repair for check in report.checks if check.status is not CheckStatus.PASS
@@ -91,5 +100,5 @@ def run_recovery_commands(
             click.echo(f"Could not run recovery: {exc}", err=True)
             failed = True
         click.echo("Rechecking after recovery...")
-        report = run_doctor(cfg, station=station)
+        report = run_doctor(cfg, station=station, check_updates=False)
         click.echo(render_text(report))

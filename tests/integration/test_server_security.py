@@ -21,8 +21,9 @@ from starlette.websockets import WebSocketDisconnect
 
 from autodj.config import ServerConfig
 from autodj.security import COOKIE_NAME, SecurityPolicy
-from autodj.server import PlayerBridge, create_app
+from autodj.server import PlayerBridge
 from tests._layout import point_index
+from tests._server import create_app
 
 from ._helpers import _make_player_mock, _make_sim_mock
 
@@ -74,11 +75,11 @@ def test_create_station_needs_session_origin_and_small_body() -> None:
     assert client.post("/api/stations", json=body).status_code == 503
 
 
-def test_settings_request_bodies_are_capped() -> None:
+def test_settings_and_relay_request_bodies_are_capped() -> None:
     client = _security_client()
     assert _pair(client).status_code == 200
-    for path in ("/api/time-settings", "/api/station-settings", "/api/public-settings"):
-        assert client.put(path, content=b" " * (8 * 1024 + 1)).status_code == 413
+    assert client.patch("/api/settings", content=b" " * (64 * 1024 + 1)).status_code == 413
+    assert client.post("/api/stream/relays", content=b" " * (8 * 1024 + 1)).status_code == 413
 
 
 def _security_app():
@@ -380,8 +381,7 @@ def test_secured_route_categories_require_session(path: str) -> None:
         ("post", "/api/library/run", {"json": {}}),
         ("post", "/api/library/remove-missing", {"json": {}}),
         ("put", "/api/library/auto-rescan", {"json": {}}),
-        ("put", "/api/time-settings", {"json": {}}),
-        ("put", "/api/public-settings", {"json": {}}),
+        ("patch", "/api/settings", {"json": {}}),
     ],
 )
 def test_unsafe_route_categories_reject_before_parsing_body(
@@ -651,12 +651,7 @@ def test_options_has_no_cors_bypass() -> None:
         ("post", "/api/advance"),
         ("post", "/api/repick-next"),
         ("post", "/api/random-track"),
-        ("post", "/api/preset"),
-        ("post", "/api/transition"),
-        ("post", "/api/djmix"),
-        ("post", "/api/playback-settings"),
-        ("post", "/api/bpm-range"),
-        ("post", "/api/discovery"),
+        ("patch", "/api/settings"),
         ("post", "/api/discovery/toggle"),
         ("post", "/api/eq"),
         ("post", "/api/library/stop"),
@@ -664,8 +659,6 @@ def test_options_has_no_cors_bypass() -> None:
         ("post", "/api/library/remove-missing"),
         ("put", "/api/library/auto-rescan"),
         ("put", "/api/library/advanced-length"),
-        ("put", "/api/time-settings"),
-        ("put", "/api/public-settings"),
     ],
 )
 def test_every_mutation_route_requires_session_before_body_validation(
@@ -970,13 +963,15 @@ class TestArt:
         # (lines 806-807) is exercised.
         from fastapi.testclient import TestClient
 
-        from autodj.server import PlayerBridge, create_app
+        from autodj.server import PlayerBridge
+        from tests._server import create_app
 
         from ._helpers import _make_player_mock, _make_sim_mock
 
         bridge = PlayerBridge(player=_make_player_mock(), sim=_make_sim_mock())
-        bridge.cover_art_for = lambda path: (b"PNG-bytes", "image/png")  # type: ignore[assignment]
-        with TestClient(create_app(bridge)) as tc:
+        app = create_app(bridge)
+        app.state.library_services.cover_art_for = lambda path: (b"PNG-bytes", "image/png")
+        with TestClient(app) as tc:
             resp = tc.get("/api/art", params={"path": "Z:/Music/song_0.flac"})
             assert resp.status_code == 200
             assert resp.content == b"PNG-bytes"
@@ -985,7 +980,8 @@ class TestArt:
     def test_cover_art_lookup_runs_off_event_loop(self, monkeypatch) -> None:
         from fastapi.testclient import TestClient
 
-        from autodj.server import PlayerBridge, create_app
+        from autodj.server import PlayerBridge
+        from tests._server import create_app
 
         from ._helpers import _make_player_mock, _make_sim_mock
 
@@ -1000,10 +996,11 @@ class TestArt:
             called.append("to_thread")
             return fn(*args, **kwargs)
 
-        bridge.cover_art_for = _cover  # type: ignore[assignment]
+        app = create_app(bridge)
+        app.state.library_services.cover_art_for = _cover
         monkeypatch.setattr("autodj.server.asyncio.to_thread", _fake_to_thread)
 
-        with TestClient(create_app(bridge)) as tc:
+        with TestClient(app) as tc:
             resp = tc.get("/api/art", params={"path": "Z:/Music/song_0.flac"})
 
         assert resp.status_code == 200
@@ -1119,7 +1116,8 @@ class TestLinerUploadDelete:
         # tmp_path / "stations" / "default" / "liners" and writes are isolated.
         from fastapi.testclient import TestClient
 
-        from autodj.server import PlayerBridge, create_app
+        from autodj.server import PlayerBridge
+        from tests._server import create_app
 
         from ._helpers import _make_player_mock, _make_sim_mock, wav_bytes
 
@@ -1139,7 +1137,8 @@ class TestLinerUploadDelete:
     def test_upload_path_with_slash_is_rejected(self, client, tmp_path, monkeypatch) -> None:
         from fastapi.testclient import TestClient
 
-        from autodj.server import PlayerBridge, create_app
+        from autodj.server import PlayerBridge
+        from tests._server import create_app
 
         from ._helpers import _make_player_mock, _make_sim_mock
 
@@ -1157,7 +1156,8 @@ class TestLinerUploadDelete:
     def test_delete_unlink_raises_oserror_returns_500(self, client, tmp_path, monkeypatch) -> None:
         from fastapi.testclient import TestClient
 
-        from autodj.server import PlayerBridge, create_app
+        from autodj.server import PlayerBridge
+        from tests._server import create_app
 
         from ._helpers import _make_player_mock, _make_sim_mock
 

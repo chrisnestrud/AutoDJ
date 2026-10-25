@@ -49,6 +49,7 @@ from autodj.station_log import (
     new_station_scope,
     wait_for_station_threads,
 )
+from autodj.station_name import listener_name, sync_name
 
 if TYPE_CHECKING:
     from autodj._bridge import PlayerBridge
@@ -73,6 +74,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _THREAD_JOIN_TIMEOUT_S = 5.0
+#: How long the station name must stay put before relays reconnect for it
+#: (#472): changes close together, such as a clockwheel switch just before a
+#: show at the top of the hour, cost relay listeners one gap, not two.
+RELAY_SETTLE_S = 1.5
+#: The longest the library's startup scan waits for every station's first
+#: song (see :meth:`SharedLibrary.start`).
+FIRST_SONG_WAIT_S = 120.0
 
 # A station's name: lower-case letters, digits and inner hyphens, at most 32
 # characters.  It names a folder and a URL path segment.
@@ -421,9 +429,10 @@ def start_stream_station(
             cfg.stream.relays.values(),
             stream_out,
             make_output=make_output,
-            station_name=lambda: cfg.stream.station_name,
+            # The name on the air (#472): a relay takes it when it connects.
+            station_name=lambda: listener_name(bridge),
             station_metadata=lambda: {
-                "name": cfg.stream.station_name,
+                "name": listener_name(bridge),
                 "genre": cfg.stream.genre,
                 "description": cfg.stream.description,
                 "url": cfg.stream.url,
@@ -721,14 +730,18 @@ async def stop_stream_station(bridge: PlayerBridge, stream_out: StreamOutput) ->
 
 
 async def tick_every_second(
-    name: str, worker: Any, sleep: Callable[[float], Awaitable[None]]
+    name: str, worker: Any, sleep: Callable[[float], Awaitable[None]], *, at_once: bool = False
 ) -> None:
     """Call ``worker.tick`` off the event loop about once a second, forever.
 
-    A failed tick is logged and the next one still runs.
+    With *at_once*, the first tick runs before the first wait.  A failed
+    tick is logged and the next one still runs.
     """
+    wait = not at_once
     while True:
-        await sleep(1)
+        if wait:
+            await sleep(1)
+        wait = True
         try:
             await asyncio.to_thread(worker.tick)
         except Exception:
@@ -757,7 +770,8 @@ async def tick_stream_workers(
     async with asyncio.TaskGroup() as group:
         for name, worker in workers:
             if worker is not None:
-                group.create_task(tick_every_second(name, worker, sleep))
+                # The station starts its first set at once, not a second late (#584).
+                group.create_task(tick_every_second(name, worker, sleep, at_once=name == "station"))
 
 
 def quiesce_cache_writers(
@@ -798,11 +812,32 @@ def _reusable(task: asyncio.Future[Any] | None) -> bool:
     return not task.cancelled() and task.exception() is None
 
 
+# A shutdown step that takes longer than this is logged at INFO; the rest at DEBUG.
+SLOW_SHUTDOWN_STEP_S = 2.0
+
+
+def _log_step_time(name: str, started: float) -> None:
+    """Log how long shutdown step *name*, begun at monotonic *started*, took."""
+    elapsed = time.monotonic() - started
+    level = logging.INFO if elapsed > SLOW_SHUTDOWN_STEP_S else logging.DEBUG
+    logger.log(level, "Shutdown step %s took %.2f s", name, elapsed)
+
+
+async def timed_shutdown_step[T](name: str, work: Awaitable[T]) -> T:
+    """Await *work*, one step of shutting down, and log how long it took."""
+    started = time.monotonic()
+    try:
+        return await work
+    finally:
+        _log_step_time(name, started)
+
+
 async def _step(what: str, call: Callable[[], Any], problems: list[str]) -> None:
     """Run one step of a stop, awaiting it if it is a coroutine; log a failure and go on.
 
     A failure is also added to *problems*, in plain words, for the reply.
     """
+    started = time.monotonic()
     try:
         result = call()
         if inspect.isawaitable(result):
@@ -810,6 +845,8 @@ async def _step(what: str, call: Callable[[], Any], problems: list[str]) -> None
     except Exception:
         logger.exception("Stopping the station: %s failed", what)
         problems.append(f"{what[0].upper()}{what[1:]} failed; the server log has the details.")
+    finally:
+        _log_step_time(what, started)
 
 
 def _close_master(master: Any, where: str) -> bool:
@@ -964,6 +1001,12 @@ class StationRuntime:
         self.station_list: Callable[[], list[dict[str, Any]]] | None = None
         # Scans in a row that found the liner folder empty (see prune_liner_dates).
         self.liner_folder_empty_scans = 0
+        # Held while relays are reconfigured; the registry shares its own.
+        self.relay_lock: threading.RLock = threading.RLock()
+        # The station name the relays last connected with, and when a
+        # reconnect for a newer one is due (monotonic seconds), if one is.
+        self.relay_name: str | None = None
+        self._relay_reconnect_at: float | None = None
 
     def _playable_liners(self, entries: Sequence[Any], at: float | None = None) -> Sequence[Any]:
         """The liners among *entries* that may play at the expected air time.
@@ -1040,6 +1083,53 @@ class StationRuntime:
             self.nowplaying.refresh()
         except Exception:
             logger.exception("Could not refresh now-playing state")
+
+    def sync_station_name(self) -> bool:
+        """Publish the name the clockwheel or show on the air asks for (#472).
+
+        Whether the published name changed.  It reads memory only, so the
+        schedule tick runs it on the event loop every second at no cost.  A
+        change refreshes the feed at once and books a relay reconnect for
+        :data:`RELAY_SETTLE_S` later (see :meth:`reconnect_relays_if_due`).
+        """
+        return sync_name(
+            self.bridge,
+            getattr(self, "show_runner", None),
+            self.public_state_changed,
+            self._book_relay_reconnect,
+        )
+
+    def _book_relay_reconnect(self) -> None:
+        # A later change moves the reconnect on: the relays reconnect once.
+        self._relay_reconnect_at = time.monotonic() + RELAY_SETTLE_S
+
+    def relay_reconnect_due(self, now: float | None = None) -> bool:
+        """Whether a booked relay reconnect is due (cheap; any thread)."""
+        due = self._relay_reconnect_at
+        return due is not None and (time.monotonic() if now is None else now) >= due
+
+    def reconnect_relays_if_due(self, now: float | None = None) -> bool:
+        """Reconnect the relays once the name has settled; whether they reconnected.
+
+        Blocking.  A name that came back to the one the relays have needs no
+        reconnect at all.
+        """
+        if not self.relay_reconnect_due(now):
+            return False
+        self._relay_reconnect_at = None
+        bridge = self.bridge
+        relays = getattr(bridge, "relays", None)
+        name = listener_name(bridge)
+        if not getattr(bridge, "stream_mode", False) or relays is None or name == self.relay_name:
+            return False
+        self.relay_name = name
+        try:
+            with self.relay_lock:
+                relays.reconfigure(self.cfg.stream.relays.values(), restart_all=True)
+        except Exception:
+            logger.exception("Could not reconnect the relays with the new station name")
+            return False
+        return True
 
     def live_state(self) -> dict[str, Any]:
         """The live DJ and talkover state for the page's push and ``/api/status``."""
@@ -1170,6 +1260,14 @@ class StationRuntime:
                     loop.call_soon_threadsafe(runner.track_changed)
 
         bridge.scheduler_track_changed = schedule_track_changed
+        # The name of what is on the air after a restart, before relays
+        # connect: they start with it, so no reconnect is owed.
+        try:
+            self.sync_station_name()
+        except Exception:
+            logger.exception("Could not set the station name on the air")
+        self.relay_name = listener_name(bridge)
+        self._relay_reconnect_at = None
         self._schedule_ticker = asyncio.create_task(self._tick_schedule())
         if self.stream_mode:
             from autodj.recorder import Recorder
@@ -1296,8 +1394,9 @@ class StationRuntime:
         if self.player_thread is None and not has_background_writers:
             return True
         try:
-            return await asyncio.to_thread(
-                quiesce_cache_writers, bridge, self.player_thread, timeout_s
+            return await timed_shutdown_step(
+                "waiting for its player",
+                asyncio.to_thread(quiesce_cache_writers, bridge, self.player_thread, timeout_s),
             )
         except Exception:
             logger.exception("Stopping the station: waiting for its player failed")
@@ -1404,6 +1503,16 @@ class StationRuntime:
                     await asyncio.to_thread(intros.upkeep)
             except Exception:
                 logger.exception("Matched intro upkeep failed")
+            try:
+                # Whatever changed the programming (a schedule event, an
+                # operator, a show that ended), the name follows within a
+                # second.  Memory only, on the loop; the relays reconnect off
+                # it once the name has settled.
+                self.sync_station_name()
+                if self.relay_reconnect_due():
+                    await asyncio.to_thread(self.reconnect_relays_if_due)
+            except Exception:
+                logger.exception("Station name update failed")
 
 
 # ---------------------------------------------------------------------------
@@ -1417,7 +1526,7 @@ class StationControlError(RuntimeError):
 
 @dataclass(frozen=True)
 class ExtraStation:
-    """A station besides the default one (``[stations.<slug>]``) and how to build it.
+    """A configured station and how to build it.
 
     Attributes:
         slug: The station's name.
@@ -1591,35 +1700,22 @@ def _saved_preset(paths: StationPaths) -> str | None:
 
 
 class StationRegistry:
-    """The stations of one server, each held by a runtime or build factory.
+    """The stations of one server, built through the same lifecycle."""
 
-    A legacy injected default runtime remains running for its whole lifetime.
-    Production can pass an ``ExtraStation`` factory for the default too; it
-    then starts, stops and rebuilds under the same lifecycle as other stations.
-    """
-
-    def __init__(
-        self, default: StationRuntime | ExtraStation, extras: Sequence[ExtraStation] = ()
-    ) -> None:
-        self._default = default
+    def __init__(self, default: ExtraStation, extras: Sequence[ExtraStation] = ()) -> None:
         self._extras = {extra.slug: extra for extra in extras}
-        if isinstance(default, ExtraStation):
-            if default.slug != DEFAULT_SLUG:
-                raise ValueError(f"the default station factory must use {DEFAULT_SLUG!r}")
-            if DEFAULT_SLUG in self._extras:
-                raise ValueError(f"station {DEFAULT_SLUG!r} is already registered")
-            self._extras[DEFAULT_SLUG] = default
-        elif default.slug != DEFAULT_SLUG:
-            raise ValueError(f"the default station runtime must use {DEFAULT_SLUG!r}")
+        if default.slug != DEFAULT_SLUG:
+            raise ValueError(f"the default station factory must use {DEFAULT_SLUG!r}")
+        if DEFAULT_SLUG in self._extras:
+            raise ValueError(f"station {DEFAULT_SLUG!r} is already registered")
+        self._extras[DEFAULT_SLUG] = default
         # The name each stopped station shows: its saved one, read the first
         # time it is asked for, then the name it had when it last stopped (it
         # changes only while the station runs).
         self._stopped_names: dict[str, str] = {}
         # Whether each stopped station takes requests, kept the same way.
         self._stopped_requests: dict[str, bool] = {}
-        self._running: dict[str, StationRuntime] = (
-            {} if isinstance(default, ExtraStation) else {default.slug: default}
-        )
+        self._running: dict[str, StationRuntime] = {}
         # One start or stop of a station at a time.  Each station has its
         # own lock, held for the whole start or stop, so one station's
         # slow stop never holds up another station's start.  Stereo Tool
@@ -1656,8 +1752,8 @@ class StationRegistry:
 
     @property
     def default(self) -> StationRuntime | StoppedStation:
-        """The default station, or its stand-in while a factory-built one is stopped."""
-        return self.get(DEFAULT_SLUG) if isinstance(self._default, ExtraStation) else self._default
+        """The default station, or its stand-in while it is stopped."""
+        return self.get(DEFAULT_SLUG)
 
     def get(self, slug: str) -> StationRuntime | StoppedStation:
         """The station named *slug*, or its stand-in while it is stopped.
@@ -1701,13 +1797,7 @@ class StationRegistry:
         result = {}
         for slug in self.slugs():
             runtime = self._running.get(slug)
-            paths = (
-                runtime.paths
-                if runtime is not None
-                else (
-                    self._default.paths if slug == self._default.slug else self._extras[slug].paths
-                )
-            )
+            paths = runtime.paths if runtime is not None else self._extras[slug].paths
             baseline = (
                 runtime.cfg.stream.relays if runtime is not None else paths._cfg.stream.relays
             )
@@ -1716,7 +1806,7 @@ class StationRegistry:
 
     def slugs(self) -> frozenset[str]:
         """The name of every configured station, running or not."""
-        return frozenset({DEFAULT_SLUG, *self._extras})
+        return frozenset(self._extras)
 
     def add(self, extra: ExtraStation) -> None:
         """Register a stopped station without touching running stations."""
@@ -1732,7 +1822,7 @@ class StationRegistry:
     def paths(self) -> tuple[StationPaths, ...]:
         """Every configured station's paths, the default first."""
         return (
-            self._default.paths,
+            self._extras[DEFAULT_SLUG].paths,
             *(extra.paths for slug, extra in self._extras.items() if slug != DEFAULT_SLUG),
         )
 
@@ -1744,12 +1834,12 @@ class StationRegistry:
         """
         out = []
         for slug in dict.fromkeys((DEFAULT_SLUG, *self._extras)):
-            extra = self._extras.get(slug)
+            extra = self._extras[slug]
             out.append(
                 {
                     **self.get(slug).summary(),
-                    "autostart": True if extra is None else extra.autostart,
-                    "autostart_locked": extra is None or extra.defined_in != "web",
+                    "autostart": extra.autostart,
+                    "autostart_locked": extra.defined_in != "web",
                 }
             )
         return out
@@ -1773,8 +1863,6 @@ class StationRegistry:
 
     def configuration(self, slug: str) -> AutoDJConfig:
         """Saved configuration is available independently of the running engine."""
-        if slug == DEFAULT_SLUG and not isinstance(self._default, ExtraStation):
-            return self._default.cfg
         return self._extras[slug].paths._cfg
 
     def save_options(self, slug: str, changes: dict[str, Any]) -> dict[str, Any]:
@@ -1851,8 +1939,6 @@ class StationRegistry:
             KeyError: No station has that name.
             StationControlError: The page cannot change it for this station.
         """
-        if slug == DEFAULT_SLUG and not isinstance(self._default, ExtraStation):
-            raise StationControlError("The injected station has no saved definition.")
         from autodj.fsutil import atomic_write
 
         with self.configuration_lock:
@@ -1883,12 +1969,6 @@ class StationRegistry:
 
     async def start_all(self) -> None:
         """Start configured autostart stations; a failure leaves the server available."""
-        if not isinstance(self._default, ExtraStation):
-            await _run_as(
-                self._default.slug,
-                self._default.start(),
-                getattr(self._default, "thread_scope", None),
-            )
         for slug in dict.fromkeys((DEFAULT_SLUG, *self._extras)):
             extra = self._extras.get(slug)
             if extra is None or not extra.autostart:
@@ -1905,8 +1985,6 @@ class StationRegistry:
             KeyError: No station has that name.
             StationControlError: The station could not start.
         """
-        if slug == DEFAULT_SLUG and not isinstance(self._default, ExtraStation):
-            return self._default
         extra = self._extras[slug]
         self._refuse_while_stopping(extra)
         # Shielded: a request cancelled at shutdown must not leave a
@@ -1971,10 +2049,7 @@ class StationRegistry:
 
         Raises:
             KeyError: No station has that name.
-            StationControlError: *slug* is the injected legacy default runtime.
         """
-        if slug == DEFAULT_SLUG and not isinstance(self._default, ExtraStation):
-            raise StationControlError("The default station cannot be stopped.")
         extra = self._extras[slug]
         if slug in self._stopping:
             return []  # already stopping; its summary says so
@@ -2143,13 +2218,26 @@ class StationRegistry:
                 await held.enter_async_context(lock)
             writers_quiesced = True
             for station in self.all():
-                quiet = await _run_as(
-                    station.slug, station.stop(timeout_s), getattr(station, "thread_scope", None)
+                quiet = await timed_shutdown_step(
+                    f"stopping station {station.slug}",
+                    _run_as(
+                        station.slug,
+                        station.stop(timeout_s),
+                        getattr(station, "thread_scope", None),
+                    ),
                 )
                 writers_quiesced = quiet and writers_quiesced
-            cache_closed = await library.close(writers_quiesced, readers_stopped=readers_stopped)
+            cache_closed = await timed_shutdown_step(
+                "closing the library",
+                library.close(
+                    writers_quiesced, readers_stopped=readers_stopped, timeout_s=timeout_s
+                ),
+            )
             for station in self.all():
-                await _run_as(station.slug, station.close(), getattr(station, "thread_scope", None))
+                await timed_shutdown_step(
+                    f"closing station {station.slug}",
+                    _run_as(station.slug, station.close(), getattr(station, "thread_scope", None)),
+                )
             self._running.clear()
             return writers_quiesced, cache_closed
 
@@ -2161,13 +2249,53 @@ class SharedLibrary:
         self.library = library
         self._stations = stations
         self._ticker: asyncio.Task[None] | None = None
+        self._scan_stopped: asyncio.Future[bool] | None = None
+        self._scan_timeout_s = 0.0
+        self._scan_starter: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
-        """Start the library's scan and its two-second tick."""
+        """Start the library's two-second tick, and its scan once the stations play.
+
+        The scan starts once every station with a mix bus has started its
+        first song, or after :data:`FIRST_SONG_WAIT_S` seconds.  A first
+        pick works out the categories and clockwheel conditions for the
+        whole library, and a scan running beside it made that several
+        times slower, so a restarted station stayed silent longer (#584).
+        """
         if self.library is not None:
+            from autodj.library import freeze_long_lived
+
+            # The library and the stations have loaded: what they hold now
+            # lives as long as the server, so full collections skip it.
+            freeze_long_lived()
             self.library.on_scan_done = self._scan_done
-            self.library.start_scan()
+            if self._first_songs_pending():
+                self._scan_starter = asyncio.create_task(self._scan_after_first_songs())
+            else:
+                self.library.start_scan()
             self._ticker = asyncio.create_task(self._tick())
+
+    def _first_songs_pending(self) -> bool:
+        """Whether a station with a mix bus has not started its first song yet."""
+        for station in self._stations.all():
+            player = getattr(station, "player", None)
+            started = getattr(player, "first_song_started", None)
+            if (
+                getattr(player, "bus", None) is not None
+                and isinstance(started, threading.Event)
+                and not started.is_set()
+            ):
+                return True
+        return False
+
+    async def _scan_after_first_songs(self) -> None:
+        library = self.library
+        assert library is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + FIRST_SONG_WAIT_S
+        while self._first_songs_pending() and loop.time() < deadline:
+            await asyncio.sleep(0.25)
+        library.start_scan()
 
     def _scan_done(self) -> None:
         """After a clean scan (on its thread): forget liner dates and song intros now gone."""
@@ -2181,37 +2309,73 @@ class SharedLibrary:
             except Exception:
                 logger.exception("Station %s: could not tidy the matched intros", station.slug)
 
-    async def close(self, writers_quiesced: bool, *, readers_stopped: bool = True) -> bool:
-        """Close the DJ-meta cache if no writer remains, then the library.
+    def stop_scan(self, timeout_s: float) -> None:
+        """Tell the scan to stop, so it winds down while the rest of shutdown runs.
 
-        The library stays open while a reader has not stopped
-        (*readers_stopped* false): closing it under that reader would fail it.
+        :meth:`close` then waits for it, up to *timeout_s* seconds from now.
+        """
+        if self._scan_starter is not None:
+            # Shutdown began before the stations played: no scan starts now.
+            self._scan_starter.cancel()
+        if self.library is None or self._scan_stopped is not None:
+            return
+        self._scan_timeout_s = timeout_s
+        self._scan_stopped = asyncio.ensure_future(
+            asyncio.to_thread(self.library.stop_scan, timeout_s)
+        )
+
+    async def close(
+        self, writers_quiesced: bool, *, timeout_s: float, readers_stopped: bool = True
+    ) -> bool:
+        """Stop the scan, close the DJ-meta cache if no writer remains, then the library.
+
+        The scan writes the cache, so a scan that has not ended in time
+        (the timeout given to :meth:`stop_scan` when shutdown called it
+        first, else *timeout_s* from now) keeps the cache and the library
+        open.  So does a reader that has not stopped (*readers_stopped*
+        false): closing the library under it would fail it.
 
         Returns:
             Whether the DJ-meta cache closed.
         """
+        scan_stopped = True
+        if self.library is not None:
+            self.stop_scan(timeout_s)
+            assert self._scan_stopped is not None
+            scan_stopped = await self._scan_stopped
+            if not scan_stopped:
+                logger.error(
+                    "The library scan was still running %.2f seconds after it was told to "
+                    "stop; the library and the DJ-meta cache are left open",
+                    self._scan_timeout_s,
+                )
         cache_closed = False
-        if writers_quiesced:
+        if writers_quiesced and scan_stopped:
             try:
                 from autodj.dj_meta import close_cache
 
-                close_cache()
+                await asyncio.to_thread(close_cache)
                 cache_closed = True
             except Exception:  # pragma: no cover -- defensive shutdown logging
                 logger.debug("shutdown: DJ-meta close failed", exc_info=True)
         if self._ticker is not None and self.library is not None:
             await _cancel(self._ticker)
-            if readers_stopped:
+            if readers_stopped and scan_stopped:
                 await asyncio.to_thread(self.library.close)
+            else:
+                # Left open, but the plays since the last tick are still saved.
+                await asyncio.to_thread(self.library.flush_ledgers)
         return cache_closed
 
     async def _tick(self) -> None:
-        from autodj.player import apply_repeat_windows
-
         library = self.library
         assert library is not None
 
         def tick() -> None:
+            # On the worker thread: a first import of the player takes
+            # seconds, which would stall the event loop (#580).
+            from autodj.player import apply_repeat_windows
+
             library.tick()
             for station in self._stations.all():
                 apply_repeat_windows(station.player)

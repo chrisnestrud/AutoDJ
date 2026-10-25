@@ -61,15 +61,16 @@
   <!-- With several stations the heading names the one this page controls
        ("AutoDJ: Night Owl Radio"); app.js keeps it current. -->
   <h1 id="page-heading">AutoDJ</h1>
-  <!-- Station switcher (#70): the APG menu button with menuitemradio
-       items, hidden while the server has one station.  The button's name
-       is its text, "Station: <name>", so the current station is heard on
-       every visit; a choice is made only with Enter, Space or a click.
-       See modules/stations.js for the keys. -->
+  <!-- Station switcher (#70, #576): a disclosure, hidden while the server
+       has one station.  The Station button shows or hides the list of
+       station buttons right after it.  Its name is its text, "Station:
+       <name>", so the current station is heard on every visit; a station
+       is chosen only by pressing its button.  See modules/stations.js
+       for the keys. -->
   <div id="station-switcher" class="station-switcher" hidden>
-    <button type="button" id="station-button" aria-haspopup="menu" aria-expanded="false"
-            aria-controls="station-menu"><span>Station:</span> <span class="station-switcher-name">AutoDJ</span><span class="station-switcher-caret" aria-hidden="true">▾</span></button>
-    <ul id="station-menu" role="menu" aria-labelledby="station-button" hidden></ul>
+    <button type="button" id="station-button" aria-expanded="false"
+            aria-controls="station-list"><span>Station:</span> <span class="station-switcher-name">AutoDJ</span><span class="station-switcher-caret" aria-hidden="true">▾</span></button>
+    <ul id="station-list" hidden></ul>
   </div>
   <!-- A description, never shown: "Shared by all stations" for the
        library, cue points and Stations.  Empty while the server has one
@@ -229,6 +230,10 @@
          reach with Tab than with a roving tabindex. -->
     <div role="group" aria-label="Playback controls">
       <div class="controls-row">
+        <!-- Stream mode only.  Fixed name plus aria-pressed, like Mute:
+             it plays the station in this browser, while Play / Pause
+             pauses the station for every listener. -->
+        <button type="button" id="btn-listen" aria-pressed="false" aria-describedby="listen-station" hidden><span aria-hidden="true">🔊</span> Listen here</button>
         <!-- Fix 2: emoji wrapped in aria-hidden so screen readers don't double-announce -->
         <!-- Play / Pause keeps one name, "Play or Pause"; only the hidden
              glyph shows the state.  A label that changed with the state was
@@ -239,10 +244,6 @@
         <!-- No title attributes on Play, Skip and Mute: NVDA read each one
              as a description that only repeated the name. -->
         <button id="btn-pause" aria-label="Play or Pause" disabled><span aria-hidden="true">▶ Play or Pause</span></button>
-        <!-- Stream mode only.  Fixed name plus aria-pressed, like Mute:
-             it plays the station in this browser, while Play / Pause
-             pauses the station for every listener. -->
-        <button type="button" id="btn-listen" aria-pressed="false" aria-describedby="listen-station" hidden><span aria-hidden="true">🔊</span> Listen here</button>
         <button id="btn-skip">
           <span aria-hidden="true">⏭</span> Skip
         </button>
@@ -708,6 +709,7 @@
   <h2>Settings</h2>
 
   <!-- Shared polite status region for Settings saves and failures. -->
+  <p>Changes stay in the form until you choose Save changes. Discard changes restores the saved settings. Record editors and actions have their own buttons.</p>
   <div id="settings-status" role="status" aria-live="polite" aria-atomic="true" class="visually-hidden"></div>
 
   <!-- Like the section tabs, these carry no aria-controls: that relation
@@ -725,10 +727,11 @@
     <button type="button" role="tab" id="stab-breaks" data-subview="breaks" data-panel="spanel-breaks" aria-selected="false" tabindex="-1">Breaks</button>
     <button type="button" role="tab" id="stab-schedule" data-subview="schedule" data-panel="spanel-schedule" aria-selected="false" tabindex="-1">Schedule</button>
     <button type="button" role="tab" id="stab-stream" data-subview="stream" data-panel="spanel-stream" aria-selected="false" tabindex="-1">Stream</button>
-    <button type="button" role="tab" id="stab-live" data-subview="live" data-panel="spanel-live" aria-selected="false" tabindex="-1" hidden>Live DJ</button>
+    <button type="button" role="tab" id="stab-live" data-subview="live" data-panel="spanel-live" aria-selected="false" tabindex="-1">Live DJ</button>
     <button type="button" role="tab" id="stab-stations" data-subview="stations" data-panel="spanel-stations" aria-selected="false" tabindex="-1" aria-describedby="shared-context">Stations</button>
     <button type="button" role="tab" id="stab-access" data-subview="access" data-panel="spanel-access" aria-selected="false" tabindex="-1">Profiles and access</button>
     <button type="button" role="tab" id="stab-workers" data-subview="workers" data-panel="spanel-workers" aria-selected="false" tabindex="-1">Analysis workers</button>
+    <button type="button" role="tab" id="stab-updates" data-subview="updates" data-panel="spanel-updates" aria-selected="false" tabindex="-1">Updates</button>
   </div>
 
   <div class="card" role="tabpanel" id="spanel-transitions" aria-labelledby="stab-transitions" hidden>
@@ -1274,7 +1277,6 @@
       <!-- A refused value's message; the script moves it under the field it
            names and links it there with aria-describedby. -->
       <p class="field-error" id="repeat-error" hidden></p>
-      <button type="button" id="repeat-save">Save repeat settings</button>
     </fieldset>
     </details>
 
@@ -1378,58 +1380,50 @@
           <option value="stereotool">Stereo Tool</option>
         </select>
       </div>
-      <span class="setting-desc" id="pb-rg-desc">
-        <em>Off</em> leaves levels unchanged. <em>ReplayGain</em> adjusts tracks using their loudness tags. <em>Smooth</em> balances source levels and compresses the mix. <em>Stereo Tool</em> balances sources and runs the mix through the Stereo Tool preset chosen below; get Stereo Tool with the Download Stereo Tool button below first. For stream and server audio playback.
-      </span>
+      <span class="setting-desc" id="pb-rg-desc">For stream and server audio. Off leaves levels unchanged; ReplayGain uses loudness tags; Smooth balances and compresses the mix; Stereo Tool uses the selected preset.</span>
       <div class="settings-row" data-show-when="pb-replaygain=replaygain">
         <label for="pb-intro-lift">Quiet intro lift limit (decibels)</label>
         <input type="number" id="pb-intro-lift" min="0" max="6" step="0.1" value="4"
                inputmode="decimal">
       </div>
-      <span class="setting-desc" id="pb-intro-lift-desc" data-show-when="pb-replaygain=replaygain">
-        Raise a song's quiet opening by up to this much, from 0 to 6. For ReplayGain playback.
-      </span>
+      <span class="setting-desc" id="pb-intro-lift-desc" data-show-when="pb-replaygain=replaygain">Boost quiet openings by up to this amount, from 0 to 6 dB.</span>
       <div class="settings-row" data-show-when="pb-replaygain=replaygain">
         <label for="pb-rg-target">ReplayGain target loudness (decibels)</label>
         <input type="number" id="pb-rg-target" min="-30" max="0" step="1" value="-14"
                inputmode="decimal" data-help="pb-rg-target-desc">
       </div>
-      <span class="setting-desc" id="pb-rg-target-desc" data-show-when="pb-replaygain=replaygain">
-        The loudness every tagged track is brought to, from minus 30 to 0.  Minus 14 is the default; minus 18 is the original ReplayGain reference and plays quieter.  For stream and server audio playback.
-      </span>
+      <span class="setting-desc" id="pb-rg-target-desc" data-show-when="pb-replaygain=replaygain">Target loudness for tagged tracks. Default: -14 dB; -18 dB is quieter.</span>
       <div class="settings-row" data-show-when="pb-replaygain=replaygain">
         <label for="pb-rg-clip">ReplayGain peak limit</label>
         <input type="number" id="pb-rg-clip" min="0.1" max="2" step="0.05" value="1"
-               inputmode="decimal" aria-describedby="pb-rg-clip-desc">
+               inputmode="decimal">
       </div>
-      <span class="setting-desc" id="pb-rg-clip-desc" data-show-when="pb-replaygain=replaygain">
-        ReplayGain never raises a track so far that its tagged peak goes above this level, from 0.1 to 2.  1, the default, prevents clipping; above 1 allows some.  For stream and server audio playback.
-      </span>
+      <span class="setting-desc" id="pb-rg-clip-desc" data-show-when="pb-replaygain=replaygain">1 prevents tagged peaks from clipping. Higher values allow clipping.</span>
     </fieldset>
 
     <fieldset id="stereo-setup" data-show-when="pb-replaygain=stereotool">
       <legend>Stereo Tool</legend>
       <p class="setting-desc" id="stereo-install-status">Checking whether Stereo Tool is installed.</p>
-      <p class="setting-desc" id="stereo-install-desc">Downloads Stereo Tool from thimeo.com, about 320 MB. Press it again to update.</p>
+      <p class="setting-desc" id="stereo-install-desc">Downloads about 320 MB from thimeo.com. Use again to update.</p>
       <div class="settings-check">
-        <input type="checkbox" id="stereo-accept-terms" aria-describedby="stereo-terms-desc">
+        <input type="checkbox" id="stereo-accept-terms">
         <label for="stereo-accept-terms">I accept Thimeo's terms for Stereo Tool</label>
       </div>
       <p class="setting-desc" id="stereo-terms-desc"><a href="https://www.thimeo.com/terms-and-conditions/" target="_blank" rel="noopener noreferrer">Thimeo's terms (opens in a new tab)</a> and <a href="https://www.thimeo.com/stereo-tool/licenses/" target="_blank" rel="noopener noreferrer">licensing (opens in a new tab)</a>.</p>
       <div class="settings-row">
-        <button type="button" id="stereo-download" aria-describedby="stereo-install-status">Download Stereo Tool</button>
+        <button type="button" id="stereo-download">Download Stereo Tool</button>
       </div>
       <p class="setting-desc" id="stereo-license-status">Checking the licence.</p>
       <div class="settings-row">
         <label for="stereo-license-key">Stereo Tool licence key</label>
-        <input type="password" id="stereo-license-key" autocomplete="new-password" spellcheck="false" autocapitalize="off" maxlength="4096" aria-describedby="stereo-license-status stereo-license-desc">
+        <input type="password" id="stereo-license-key" autocomplete="new-password" spellcheck="false" autocapitalize="off" maxlength="4096">
       </div>
       <span class="setting-desc" id="stereo-license-desc">Kept private and never shown again.</span>
       <div class="settings-check" id="stereo-license-station-row" hidden>
-        <input type="checkbox" id="stereo-license-station-only" aria-describedby="stereo-license-station-desc">
+        <input type="checkbox" id="stereo-license-station-only">
         <label for="stereo-license-station-only">For this station only</label>
       </div>
-      <span class="setting-desc" id="stereo-license-station-desc" hidden>Unticked, it is for every station without its own key.</span>
+      <span class="setting-desc" id="stereo-license-station-desc" hidden>Otherwise applies to stations without their own key.</span>
       <p class="field-error" id="stereo-license-error" hidden></p>
       <div class="settings-row">
         <button type="button" id="stereo-license-save">Save licence key</button>
@@ -1437,38 +1431,31 @@
       </div>
       <div class="settings-row">
         <label for="stereo-preset">Preset</label>
-        <select id="stereo-preset" aria-describedby="stereo-preset-warning stereo-preset-desc">
+        <select id="stereo-preset">
           <option value="included">Included</option>
         </select>
         <button type="button" id="stereo-preset-delete" disabled>Delete selected preset</button>
       </div>
       <p class="setting-desc" id="stereo-preset-warning" hidden></p>
-      <span class="setting-desc" id="stereo-preset-desc">
-        Stereo Tool restarts with the chosen preset; the sound bypasses it for a moment while it does.
-      </span>
-      <p class="setting-desc">Included is the free preset that comes with AutoDJ and cannot be deleted. Uploaded presets are kept with the station's data and saved in backups.</p>
+      <p class="setting-desc">Included is the built-in preset and cannot be deleted. Uploaded presets are saved in backups.</p>
       <div class="settings-row">
-        <label for="stereo-preset-file">Preset file to upload (.sts, up to 2 MB)</label>
+        <label for="stereo-preset-file">Preset file (.sts)</label>
         <input type="file" id="stereo-preset-file" accept=".sts">
         <button type="button" id="stereo-preset-upload">Upload preset</button>
       </div>
+      <p class="setting-desc">Maximum file size: 2 MB.</p>
       <div class="settings-row">
         <label for="pb-stereo-trim">Input trim (decibels)</label>
         <input type="number" id="pb-stereo-trim" min="-12" max="6" step="0.5" value="0"
                inputmode="decimal">
       </div>
-      <span class="setting-desc" id="pb-stereo-trim-desc">
-        Lower or raise the mix before Stereo Tool, from minus 12 to plus 6. Lower it when the preset sounds squashed; raise it when it barely acts.
-      </span>
+      <span class="setting-desc" id="pb-stereo-trim-desc">Adjust the level entering Stereo Tool, from -12 to 6 dB.</span>
       <div class="settings-row">
         <label for="pb-stereo-agc-drive">AGC drive boost (dB)</label>
         <input type="number" id="pb-stereo-agc-drive" min="0" max="12" step="0.1" value="7"
-               inputmode="decimal" aria-describedby="pb-stereo-agc-drive-desc">
+               inputmode="decimal">
       </div>
-      <span class="setting-desc" id="pb-stereo-agc-drive-desc">
-        Changing this reloads Stereo Tool, with a brief bypass while it warms up.
-      </span>
-      <p class="setting-desc">Controls how strongly Stereo Tool brings up quieter passages. 7 dB is the default. 0 keeps the selected preset's original drive; it does not turn AGC off. For stream and server audio playback.</p>
+      <span class="setting-desc" id="pb-stereo-agc-drive-desc">Boosts quieter passages. 0 keeps the preset's AGC drive; it does not disable AGC.</span>
     </fieldset>
 
     <fieldset>
@@ -1478,17 +1465,10 @@
         <input type="number" id="pb-music-speed-number" min="-10" max="10" step="0.01" value="0"
                inputmode="decimal">
       </div>
-      <div class="settings-row music-speed-slider-row">
-        <label for="pb-music-speed-slider" class="visually-hidden">Music speed</label>
-        <input type="range" id="pb-music-speed-slider" min="-10" max="10" step="0.01" value="0"
-              >
-        <output id="pb-music-speed-value" for="pb-music-speed-slider" aria-live="off">0%</output>
-      </div>
       <span class="setting-desc" id="pb-music-speed-desc">
         Adjust music speed from 10% slower to 10% faster.
       </span>
     </fieldset>
-
     <fieldset>
       <legend>Browser playback</legend>
       <div class="settings-row">
@@ -1496,14 +1476,11 @@
         <select id="audio-device">
           <option value="">System default</option>
         </select>
-        <button type="button" id="audio-device-refresh"
-                title="Grant the browser microphone permission so device names show up.  Permission is dropped immediately — no audio is captured.">
+        <button type="button" id="audio-device-refresh">
           Show device names
         </button>
       </div>
-      <span class="setting-desc" id="audio-device-desc">
-        Choose the browser’s speakers or headphones.
-      </span>
+      <span class="setting-desc" id="audio-device-desc">Choose the browser's speakers or headphones. Showing names briefly requests microphone permission.</span>
       <div class="settings-row">
         <label for="preview-device">Preview output device</label>
         <select id="preview-device">
@@ -1517,17 +1494,16 @@
         <input type="checkbox" id="pb-prefetch" checked>
         <label for="pb-prefetch">Load the next song early</label>
       </div>
-      <span class="setting-desc" id="pb-prefetch-desc">
-        Start loading the next song as soon as it is picked, so it starts without a gap.  Turn this off only on a slow or metered connection.  On by default.  For browser playback.
-      </span>
+      <span class="setting-desc" id="pb-prefetch-desc">Loads the next track early to reduce gaps.</span>
       <div class="settings-check">
         <input type="checkbox" id="pb-silence-trigger" checked>
         <label for="pb-silence-trigger">Crossfade when a song goes quiet</label>
       </div>
-      <span class="setting-desc" id="pb-silence-trigger-desc">
-        Start the crossfade early when the playing song has gone silent past its halfway point, so long fade-outs leave no dead air.  On by default.  For browser playback.
-      </span>
+      <span class="setting-desc" id="pb-silence-trigger-desc">Starts the crossfade when a track goes silent after its halfway point.</span>
     </fieldset>
+    <div class="settings-row">
+    </div>
+    <p class="setting-desc" id="mastering-save-note">Changing the Stereo Tool preset or AGC drive restarts Stereo Tool, with a brief bypass.</p>
   </div>
 
   <div class="card" role="tabpanel" id="spanel-display" aria-labelledby="stab-display" hidden>
@@ -1886,21 +1862,25 @@
     <span class="setting-desc" id="tc-recorded-folder-desc">
       Where the clips named 00_00 to 23_59 are, such as 15_05.wav for 3:05 in the afternoon. A folder chosen here is not a voice pack.
     </span>
+    <!-- Each clip has its own help; the shared note on where the choices
+         come from is read by browsing, not on each focus. -->
     <div class="settings-row">
       <label for="tc-intro">Intro clip</label>
-      <select id="tc-intro" aria-describedby="tc-clip-choice-desc">
+      <select id="tc-intro" aria-describedby="tc-intro-desc">
         <option value="">None</option>
       </select>
     </div>
+    <span class="setting-desc" id="tc-intro-desc">Played before every time check.</span>
     <div class="settings-row">
       <label for="tc-outro">Outro clip</label>
-      <select id="tc-outro" aria-describedby="tc-clip-choice-desc">
+      <select id="tc-outro" aria-describedby="tc-outro-desc">
         <option value="">None</option>
       </select>
     </div>
-    <span class="setting-desc" id="tc-clip-choice-desc">
-      Played before and after every time check. Choose from the audio files in the time checks folder, or upload one below.
-    </span>
+    <span class="setting-desc" id="tc-outro-desc">Played after every time check.</span>
+    <p class="setting-desc" id="tc-clip-choice-desc">
+      Choose the intro and outro from the audio files in the time checks folder, or upload one below.
+    </p>
     <fieldset id="tc-add-clip">
       <legend>Upload a clip</legend>
       <div class="settings-row">
@@ -1931,7 +1911,7 @@
   <div class="card" role="tabpanel" id="spanel-breaks" aria-labelledby="stab-breaks" hidden>
     <h3>Breaks</h3>
     <!-- breaks-settings.js fills this panel when it is seen.  The settings
-         are this station's, saved with Save break settings; the result is
+         are this station's, saved with Save changes; the result is
          said once through #brk-status.  The upload limits, quotas and
          waiting times stay in config.toml.  #brk-reason is plain text,
          not live: it says why breaks cannot be taken now, if they cannot. -->
@@ -1988,7 +1968,6 @@
         <span class="setting-desc" id="brk-duck-help">How far the music drops under a break's voice, from minus 30 to 0. Blank uses the voice liner duck depth<span id="brk-duck-liners"></span>.</span>
         <p id="brk-duck-error" class="field-error" hidden></p>
       </div>
-      <button type="submit" id="brk-save">Save break settings</button>
     </form>
   </div>
 
@@ -2007,14 +1986,17 @@
     <button type="button" id="schedule-add">Add event</button>
     <!-- Add and Edit share this form.  It checks its own fields: an error
          is said, the field gets aria-invalid and focus, and the words stay
-         in #schedule-form-error. -->
+         in #schedule-form-error.  Its required fields are aria-required,
+         not required: Firefox calls an empty required field, even a hidden
+         one such as Date for a repeating event, and its group "invalid
+         entry" before anything is typed. -->
     <form id="schedule-form" novalidate hidden>
       <fieldset>
         <legend><h1 id="schedule-form-legend">Add event</h1></legend>
         <p id="schedule-form-error" class="field-error" hidden></p>
         <div class="settings-row">
           <label for="schedule-name">Name</label>
-          <input type="text" id="schedule-name" maxlength="100" autocomplete="off" required>
+          <input type="text" id="schedule-name" maxlength="100" autocomplete="off" aria-required="true">
         </div>
         <div class="settings-row">
           <label for="schedule-action">Action</label>
@@ -2035,16 +2017,16 @@
         <!-- data-repeat lists the repeat choices each part belongs to. -->
         <div class="settings-row" data-repeat="once">
           <label for="schedule-date">Date</label>
-          <input type="date" id="schedule-date" required>
+          <input type="date" id="schedule-date" aria-required="true">
         </div>
         <div class="settings-row" data-repeat="once daily weekdays days">
           <label for="schedule-time">Time</label>
-          <input type="time" id="schedule-time" required>
+          <input type="time" id="schedule-time" aria-required="true">
         </div>
         <div data-repeat="interval">
           <div class="settings-row">
             <label for="schedule-interval">Minutes between runs</label>
-            <input type="number" id="schedule-interval" min="1" max="1440" step="1" required>
+            <input type="number" id="schedule-interval" min="1" max="1440" step="1" aria-required="true">
           </div>
           <div class="settings-row">
             <label for="schedule-window-start">Active from</label>
@@ -2076,12 +2058,21 @@
           <legend>Date range</legend>
           <div class="settings-row">
             <label for="schedule-start-date">Start date</label>
-            <input type="date" id="schedule-start-date">
+            <input type="date" id="schedule-start-date" aria-describedby="schedule-dates-repeat-desc">
           </div>
           <div class="settings-row">
             <label for="schedule-end-date">End date</label>
-            <input type="date" id="schedule-end-date">
+            <input type="date" id="schedule-end-date" aria-describedby="schedule-dates-repeat-desc">
           </div>
+          <div class="settings-row">
+            <label for="schedule-dates-repeat">Repeat dates</label>
+            <select id="schedule-dates-repeat" aria-describedby="schedule-dates-repeat-desc">
+              <option value="none">Don't repeat</option>
+              <option value="yearly">Every year</option>
+            </select>
+          </div>
+          <!-- scheduler-panel.js sets the words for the Repeat dates choice. -->
+          <p class="setting-desc" id="schedule-dates-repeat-desc">The event runs only between these dates, both included.</p>
         </fieldset>
         <div class="settings-row">
           <label for="schedule-timing">Timing</label>
@@ -2128,7 +2119,6 @@
         <div class="settings-row"><label for="public-origins">Sites allowed to embed</label><textarea id="public-origins" rows="3" aria-describedby="public-origins-help"></textarea></div>
         <p class="setting-desc" id="public-origins-help">One HTTP(S) site per line, or * for any site; blank allows only this server.</p>
         <p class="field-error" id="public-origins-error" hidden></p>
-        <button type="submit" id="public-page-save">Save player pages</button>
       </fieldset>
     </form>
     <!-- Live stream controls appear only in stream mode. The listener count
@@ -2161,13 +2151,12 @@
               >
       </div>
       <span class="setting-desc" id="stream-station-name-desc">
-        The name players such as Sonos and VLC show for this station, up to 100 characters.  A player shows a new name the next time it connects.
+        The name players such as Sonos and VLC show for this station, up to 100 characters.  A player shows a new name the next time it connects.  A clockwheel or show can set another name while it is on the air.
       </span>
       <div class="settings-row"><label for="stream-station-genre">Genre</label><input id="stream-station-genre" maxlength="255" autocomplete="off"></div>
       <div class="settings-row"><label for="stream-station-description">Description</label><input id="stream-station-description" maxlength="255" autocomplete="off"></div>
       <div class="settings-row"><label for="stream-station-url">Website URL</label><input id="stream-station-url" type="url" maxlength="2048" autocomplete="url"></div>
       <p class="setting-desc">Station metadata changes reconnect enabled relays after you save. Description is sent to Icecast; Shoutcast and direct listener streams do not support it.</p>
-      <button type="button" id="stream-metadata-save">Save station metadata</button>
       <div class="settings-row">
         <label for="stream-bitrate">Quality</label>
         <select id="stream-bitrate" aria-describedby="stream-bitrate-desc">
@@ -2218,7 +2207,7 @@
         </span>
         <div class="settings-row">
           <label for="recording-retention-days">Days to keep recordings</label>
-          <input type="number" id="recording-retention-days" min="0" step="1" required
+          <input type="number" id="recording-retention-days" min="0" step="1" value="0" required
                  inputmode="numeric" aria-describedby="recording-retention-desc">
         </div>
         <span class="setting-desc" id="recording-retention-desc">
@@ -2226,13 +2215,12 @@
         </span>
         <div class="settings-row">
           <label for="recording-free-space-mb">Minimum free space in MB</label>
-          <input type="number" id="recording-free-space-mb" min="0" step="1" required
+          <input type="number" id="recording-free-space-mb" min="0" step="1" value="100" required
                  inputmode="numeric" aria-describedby="recording-free-space-desc">
         </div>
         <span class="setting-desc" id="recording-free-space-desc">
           Recording pauses when the recordings drive has less free space than this, and resumes when space returns. The stream keeps playing.
         </span>
-        <button type="button" id="recording-save">Save recording settings</button>
       </fieldset>
       <!-- Relays, More formats, the now-playing feed and Listener statistics
            are set up once or read now and then, so each is a card closed by
@@ -2247,12 +2235,18 @@
           <tbody id="stream-relay-rows"></tbody>
         </table>
         </div>
-        <form id="stream-relay-form" hidden>
+        <!-- Required fields here and in the forms below are aria-required,
+             not required, and checked in script: Firefox calls an empty
+             required field, and every fieldset around it, "invalid entry"
+             before anything is typed, so the whole Stream group was read
+             as invalid.  The required number settings start at their
+             defaults for the same reason, until the saved values arrive. -->
+        <form id="stream-relay-form" novalidate hidden>
           <h5 id="stream-relay-form-title">Add relay</h5>
-          <label for="stream-relay-name">Name</label><input id="stream-relay-name" maxlength="32" required pattern="[A-Za-z0-9_-]+">
+          <label for="stream-relay-name">Name</label><input id="stream-relay-name" maxlength="32" aria-required="true">
           <label for="stream-relay-type">Server type</label><select id="stream-relay-type"><option value="icecast">Icecast</option><option value="shoutcast1">Shoutcast 1</option><option value="shoutcast2">Shoutcast 2</option></select>
-          <label for="stream-relay-host">Host</label><input id="stream-relay-host" required autocomplete="off">
-          <label for="stream-relay-port">Listener port</label><input id="stream-relay-port" type="number" min="1" max="65535" value="8000" required>
+          <label for="stream-relay-host">Host</label><input id="stream-relay-host" aria-required="true" autocomplete="off">
+          <label for="stream-relay-port">Listener port</label><input id="stream-relay-port" type="number" min="1" max="65535" value="8000" aria-required="true">
           <label for="stream-relay-password">Source password</label><input id="stream-relay-password" type="password" autocomplete="new-password" aria-describedby="stream-relay-password-help">
           <p id="stream-relay-password-help">Saved passwords stay private. Leave blank to keep the current password.</p>
           <p>Relay TLS is unsupported; the source password is sent without encryption.</p>
@@ -2307,8 +2301,8 @@
         <ul class="stream-detail" id="stream-formats-list" aria-labelledby="stream-formats-intro"></ul>
       </fieldset>
       </details>
-      <!-- The public now-playing feed and the webhooks from
-           config.local.toml; nowplaying-settings.js fills it.  Nested so
+      <!-- The public now-playing feed and the webhooks from the station's
+           secrets.json; nowplaying-settings.js fills it.  Nested so
            it shows, hides and hands focus away with the Stream settings.
            The webhook list and its empty note are plain text, not live:
            results of Copy, the show-next save and Send test go to the
@@ -2354,7 +2348,7 @@
         <h4 id="listener-control-title" tabindex="-1">Listeners</h4>
         <p class="stream-detail" id="stream-listeners"></p>
         <p id="listener-password-state">Listener password status not loaded.</p>
-        <p class="setting-desc">Set or clear listener_user and listener_password in config.local.toml, or a station's secrets.json, then restart AutoDJ. Some players cannot send credentials. HTTP sends the password in plain text.</p>
+        <p class="setting-desc">Set or clear listener_user and listener_password in this station's secrets.json, then restart AutoDJ. Some players cannot send credentials. HTTP sends the password in plain text.</p>
         <div class="settings-row">
           <label for="stream-per-address">Connections per address (0 for unlimited)</label>
           <input id="stream-per-address" type="number" min="0" max="100" step="1">
@@ -2362,11 +2356,12 @@
         <ul id="listener-control-list" aria-label="Connected listeners"></ul>
         <p id="listener-control-empty" hidden>No listeners connected.</p>
         <button type="button" id="listener-ban-new">Add address ban</button>
-        <form id="listener-ban-form" hidden>
+        <form id="listener-ban-form" novalidate hidden>
           <fieldset class="flow-form">
             <legend>Ban a listener address</legend>
             <label for="listener-ban-address">Address or CIDR</label>
-            <input id="listener-ban-address" required autocomplete="off">
+            <input id="listener-ban-address" aria-required="true" autocomplete="off">
+            <p id="listener-ban-error" class="field-error" hidden></p>
             <label for="listener-ban-duration">Duration</label>
             <select id="listener-ban-duration">
               <option value="60">1 hour</option>
@@ -2438,7 +2433,7 @@
         <ul class="stream-detail" id="listener-stats-lengths" aria-labelledby="listener-stats-lengths-title" hidden></ul>
         <div class="settings-row">
           <label for="listener-stats-keep">Days to keep statistics</label>
-          <input type="number" id="listener-stats-keep" min="0" max="3650" step="1" required
+          <input type="number" id="listener-stats-keep" min="0" max="3650" step="1" value="90" required
                  aria-describedby="listener-stats-keep-desc">
         </div>
         <span class="setting-desc" id="listener-stats-keep-desc">
@@ -2482,7 +2477,6 @@
           <option value="12">12 hour (3:04 PM)</option>
         </select>
       </div>
-      <button type="button" id="time-settings-save">Save time settings</button>
     </fieldset>
     <fieldset>
       <legend>Output for the selected station</legend>
@@ -2496,7 +2490,6 @@
       <label for="station-upload-cap">Maximum liner upload size (MiB)</label>
       <input type="number" id="station-upload-cap" min="1" max="1024" step="1">
       <p>Output changes apply when this station next starts.</p>
-      <button type="button" id="station-options-save">Save station options</button>
     </fieldset>
     <h4 id="stations-list-heading">Stations on this server</h4>
     <div class="data-table-scroll">
@@ -2528,12 +2521,12 @@
         </span>
         <div class="settings-row">
           <label for="station-create-name">Name</label>
-          <input type="text" id="station-create-name" maxlength="80" autocomplete="off" required>
+          <input type="text" id="station-create-name" maxlength="80" autocomplete="off" aria-required="true">
         </div>
         <div class="settings-row">
           <label for="station-create-slug">Station ID</label>
           <input type="text" id="station-create-slug" maxlength="32" autocomplete="off"
-                 autocapitalize="off" spellcheck="false" required
+                 autocapitalize="off" spellcheck="false" aria-required="true"
                  aria-describedby="station-create-slug-help">
         </div>
         <span class="setting-desc" id="station-create-slug-help">
@@ -2647,7 +2640,6 @@
         </div>
         <span class="setting-desc" id="live-duck-desc">How far below its normal level the music plays while you talk, from 0 to 30 decibels.</span>
         <p class="field-error" id="live-talkover-error" hidden></p>
-        <button type="button" id="live-talkover-save">Save talk settings</button>
       </fieldset>
     </div>
   </div>
@@ -2713,16 +2705,44 @@
          the workers every ten seconds while it stays seen; only Refresh
          workers and the token buttons speak, through #workers-status. -->
     <p class="card-desc">
-      A computer with a graphics card can analyse new songs for this server far faster than the server can.  Create a token below, then run <code>autodj worker</code> on that computer with this server's address and the token.  The worker downloads each song from this server, so it needs no copy of the music.  While a worker is connected, this server pauses its own analysis.
+      A computer with a graphics card can analyse new songs for this server far faster than the server can.  Pair a worker below, or create a token, then run <code>autodj worker</code> on that computer with this server's address.  The worker downloads each song from this server, so it needs no copy of the music.  While a worker is connected, this server pauses its own analysis.
     </p>
     <p class="card-desc">
       An announcer program on this computer sends a station DJ breaks, news and weather with an announcer token.  Turn breaks on for the station in Settings, Breaks.
     </p>
     <div id="workers-status" role="status" aria-live="polite" aria-atomic="true" class="visually-hidden"></div>
+    <!-- Shown only while the server has refused a worker; a refusal a
+         refresh finds is said once through #workers-status. -->
+    <h4 id="workers-refusals-heading" hidden>Refused workers</h4>
+    <ul id="workers-refusals" aria-labelledby="workers-refusals-heading" hidden></ul>
     <h4 id="workers-heading">Workers</h4>
     <p id="workers-queue">Loading…</p>
+    <!-- Each worker row has its own settings and Save button (#554). -->
     <ul id="workers-list" aria-labelledby="workers-heading"></ul>
     <button type="button" id="workers-refresh">Refresh workers</button>
+
+    <h4 id="pair-worker-heading">Worker pairing</h4>
+    <div class="settings-row">
+      <label for="pair-worker-name">Worker name</label>
+      <input type="text" id="pair-worker-name" maxlength="64" autocomplete="off"
+             aria-describedby="pair-worker-name-desc">
+    </div>
+    <span class="setting-desc" id="pair-worker-name-desc">Optional.  Empty uses the worker computer's own name.</span>
+    <button type="button" id="pair-worker-create">Pair a worker</button>
+    <!-- The code works once, for ten minutes.  Getting it moves focus to the
+         selected command and #workers-status says the code digit by digit. -->
+    <div id="pair-worker-new" class="flow-form" hidden>
+      <p>Pairing code <strong id="pair-worker-code" class="pair-code"></strong></p>
+      <p id="pair-worker-expiry"></p>
+      <button type="button" id="pair-worker-copy-code">Copy code</button>
+      <label for="pair-worker-command">Command to run on the worker</label>
+      <input type="text" id="pair-worker-command" readonly autocomplete="off" spellcheck="false">
+      <button type="button" id="pair-worker-copy-command">Copy command</button>
+      <button type="button" id="pair-worker-done">Done</button>
+      <p id="pair-worker-http" class="setting-desc" hidden>
+        This page uses plain HTTP.  A worker pairs only over HTTPS, or on this computer.
+      </p>
+    </div>
 
     <h4>Machine tokens</h4>
     <fieldset>
@@ -2772,6 +2792,50 @@
     <h5 id="token-list-heading">Tokens</h5>
     <p id="token-list-empty">No tokens yet.</p>
     <ul id="token-list" aria-labelledby="token-list-heading"></ul>
+  </div>
+
+  <div class="card" role="tabpanel" id="spanel-updates" aria-labelledby="stab-updates" hidden>
+    <h3>Updates</h3>
+    <!-- updates.js loads this panel when it is seen.  The version and
+         result lines are plain text; only Check now, Save update settings
+         and Restart speak, once each, through #updates-status. -->
+    <div id="updates-status" role="status" aria-live="polite" aria-atomic="true" class="visually-hidden"></div>
+    <h4>This installation</h4>
+    <p id="updates-current" aria-live="off">Loading…</p>
+    <h4>Latest version</h4>
+    <p id="updates-latest" aria-live="off"></p>
+    <p id="updates-notes" hidden><a id="updates-notes-link" href="#">Release notes</a></p>
+    <button type="button" id="updates-check">Check now</button>
+    <!-- Shown while an update is available: AutoDJ does not update itself;
+         whoever installed it runs these, after a backup (#552). -->
+    <div id="updates-how" hidden>
+      <h4 id="updates-how-heading">How to update</h4>
+      <p id="updates-how-note" class="setting-desc"></p>
+      <ol id="updates-commands" aria-labelledby="updates-how-heading"></ol>
+    </div>
+
+    <fieldset>
+      <legend>Update settings</legend>
+      <div class="settings-check">
+        <input type="checkbox" id="updates-enabled" checked>
+        <label for="updates-enabled">Check for updates</label>
+      </div>
+      <span class="setting-desc">When off, AutoDJ never asks GitHub or the git remote about updates.</span>
+      <div class="settings-row">
+        <label for="updates-channel">Update channel</label>
+        <select id="updates-channel">
+          <option value="auto" id="updates-channel-auto">Automatic</option>
+          <option value="stable">Stable</option>
+          <option value="development">Development</option>
+        </select>
+      </div>
+      <span class="setting-desc">Stable follows releases; Development follows the newest code on master. Automatic follows what this installation runs.</span>
+      <button type="button" id="updates-save">Save update settings</button>
+    </fieldset>
+
+    <h4>Restart</h4>
+    <p id="updates-restart-note" class="setting-desc"></p>
+    <button type="button" id="updates-restart" hidden>Restart AutoDJ</button>
   </div>
 
   </section>
@@ -3493,7 +3557,7 @@
           <p id="categories-form-error" class="field-error" hidden></p>
           <div class="settings-row">
             <label for="categories-name">Name</label>
-            <input id="categories-name" type="text" maxlength="64" autocomplete="off" spellcheck="false" required>
+            <input id="categories-name" type="text" maxlength="64" autocomplete="off" spellcheck="false" aria-required="true">
           </div>
           <fieldset>
             <legend>Songs come from</legend>
@@ -3559,12 +3623,22 @@
             </div>
             <div class="settings-row">
               <label for="categories-not-before">Not before</label>
-              <input type="date" id="categories-not-before">
+              <input type="date" id="categories-not-before" aria-describedby="categories-dates-repeat-help">
             </div>
             <div class="settings-row">
               <label for="categories-not-after">Do not play after</label>
-              <input type="date" id="categories-not-after">
+              <input type="date" id="categories-not-after" aria-describedby="categories-dates-repeat-help">
             </div>
+            <div class="settings-row">
+              <label for="categories-dates-repeat">Repeat dates</label>
+              <select id="categories-dates-repeat" aria-describedby="categories-dates-repeat-help">
+                <option value="none">Don't repeat</option>
+                <option value="weekly">Every week</option>
+                <option value="yearly">Every year</option>
+              </select>
+            </div>
+            <!-- categories-panel.js sets the words for the Repeat dates choice. -->
+            <p class="setting-desc" id="categories-dates-repeat-help">The songs play only between these dates, both included.</p>
           </fieldset>
           <button type="button" id="categories-check">Check</button>
           <!-- Browseable count; completed results are announced through categories-status. -->
@@ -3607,6 +3681,11 @@
       <button type="button" id="clock-new-step">New step</button>
       <button type="button" id="clock-undo" aria-keyshortcuts="Control+Z" disabled>Undo step change</button>
       <p id="clock-next"></p>
+      <h4>Station name</h4>
+      <label for="clock-station-name">Station name while active</label>
+      <input id="clock-station-name" type="text" maxlength="100" autocomplete="off" aria-describedby="clock-station-name-help">
+      <p id="clock-station-name-help">Listeners see this name while this clockwheel picks the songs. Leave empty for the station's normal name.</p>
+      <p id="clock-station-name-error" class="field-error" hidden></p>
       <h4>Restarts and saving</h4>
       <label for="clock-resync-minutes">Restart at these minutes past each hour</label>
       <input id="clock-resync-minutes" type="text" inputmode="numeric" value="0" autocomplete="off" aria-describedby="clock-resync-help">
@@ -3643,7 +3722,7 @@
           <p id="shows-form-error" class="field-error" hidden></p>
           <div class="settings-row">
             <label for="shows-name">Name</label>
-            <input id="shows-name" type="text" maxlength="100" autocomplete="off" spellcheck="false" required>
+            <input id="shows-name" type="text" maxlength="100" autocomplete="off" spellcheck="false" aria-required="true">
           </div>
           <fieldset id="shows-source">
             <legend>Songs come from</legend>
@@ -3671,6 +3750,11 @@
             <input id="shows-target" type="text" inputmode="numeric" autocomplete="off" value="60" aria-describedby="shows-target-help">
           </div>
           <p class="setting-desc" id="shows-target-help">5 to 360. Generating stops once the songs reach this length.</p>
+          <div class="settings-row">
+            <label for="shows-station-name">Station name while active</label>
+            <input id="shows-station-name" type="text" maxlength="100" autocomplete="off" aria-describedby="shows-station-name-help">
+          </div>
+          <p class="setting-desc" id="shows-station-name-help">Listeners see this name while the show is on the air. Leave empty to keep the name in use.</p>
           <button type="submit" id="shows-save">Save show</button>
           <button type="button" id="shows-cancel">Cancel</button>
         </fieldset>
@@ -3919,10 +4003,14 @@
      what Escape does: it closes the dialog, keeps the edits and puts focus
      back on the control that opened it. -->
 <!-- New step and Edit open the step form as a modal dialog; Escape
-     or Cancel closes it and returns focus. -->
-<dialog id="clock-step-dialog" aria-labelledby="clock-step-legend">
+     or Cancel closes it and returns focus.  The short description is what
+     NVDA reads after the name: a dialog without one has all of its text
+     read instead, the help, the count and every label, as it opens. -->
+<dialog id="clock-step-dialog" aria-labelledby="clock-step-legend"
+        aria-describedby="clock-step-desc">
 <fieldset id="clock-step-form" class="flow-form">
   <legend><h1 id="clock-step-legend">Add a step</h1></legend>
+  <p class="setting-desc" id="clock-step-desc">Choose what the step plays, how it chooses and when it plays.</p>
   <p id="clock-step-form-error" class="field-error" hidden></p>
   <label for="clock-step-type">Step type</label>
   <select id="clock-step-type">

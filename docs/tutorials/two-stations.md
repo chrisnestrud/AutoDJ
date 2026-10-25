@@ -36,9 +36,10 @@ folders are shared: do not import the same folder again or remove it from
 Library tools as cleanup. Categories and clockwheels belong to each station,
 even when they refer to the same shared songs.
 
-Use Tab and Enter or Space for controls. The **Station** button opens a menu:
-use arrow keys to find a station and Enter or Space to choose it. Confirm the
-button and page heading name the intended station before changing its content.
+Use Tab and Enter or Space for controls. The **Station** button shows a list
+of stations: use the arrow keys or Tab to find a station and Enter or Space to
+choose it. Confirm the button and page heading name the intended station before
+changing its content.
 The [keyboard guide](../guides/keyboard-and-screen-reader.md) covers grid navigation.
 
 ## Leave a marker in Practice's queue
@@ -110,7 +111,7 @@ Now expand **Clockwheels** and create this station's rotation:
 5. Clear **Restart at these minutes past each hour**. Press **Save clockwheel**,
    then **Activate**.
 6. In **Settings**, **Song picking**, choose **Clockwheel** in **Pick mode**.
-   It saves on change.
+   Press **Save changes** in the Song picking tab.
 
 Check the saved one-step wheel is active and the pick mode persists. You have
 edited a stopped station's saved content; a running player is not required.
@@ -121,7 +122,7 @@ production rotation. Saving or activating here must not replace Practice's wheel
 
 1. In **Settings**, **Stations**, check **Playback output** is **Radio stream**
    for Practice Two. Leave **Also play the radio stream on the server sound card**
-   unchecked. Press **Save station options** if you changed either control.
+   unchecked. Press **Save changes** in the Stations tab if you changed either control.
 2. In **Stations on this server**, press **Start Practice Two**. Its visible
    button text is **Start** in the Practice Two row.
 3. Open **Now Playing** and press **Listen here**. Allow the stream to prepare.

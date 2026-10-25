@@ -12,6 +12,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 from setup_hardware import detect_hardware, probe_runtime
 from setup_support import (
     ROOT,
@@ -28,6 +30,11 @@ from setup_support import (
     runtime_environment,
     write_json,
 )
+
+from autodj.host_tools import ensure_ffmpeg
+
+#: Setup's read-only Doctor run gives up after this long.
+DOCTOR_TIMEOUT_SECONDS = 600
 
 
 def ask(prompt: str, default: str) -> str:
@@ -94,6 +101,9 @@ def doctor_findings(stdout: str) -> list[str] | None:
         ):
             continue
         findings.append(f"{status.upper()} {name}: {summary[:300]}")
+        detail = check.get("detail")
+        if isinstance(detail, str) and detail:
+            findings.append(f"  {detail[:1000]}")
     return findings
 
 
@@ -240,12 +250,9 @@ def execute(args: argparse.Namespace, root: Path = ROOT) -> int:
         "Close any running AutoDJ server or import jobs before applying setup so doctor can check the databases."
     )
     print("Model downloads and track imports only run when you request a test import.")
+    print("Setup also checks FFmpeg; on Windows it can install it through WinGet.")
     if issues:
         print("\nPrerequisites to install:\n" + "\n".join(issues))
-    if shutil.which("ffmpeg") is None:
-        print(
-            "FFmpeg was not found; MP3 indexing, AAC/M4A decoding, and streaming need it on PATH."
-        )
     if args.dry_run:
         return 0
     if issues:
@@ -253,6 +260,10 @@ def execute(args: argparse.Namespace, root: Path = ROOT) -> int:
     if not args.yes and (not interactive or not confirm("Apply this setup plan?")):
         print("Setup cancelled. Use --yes to accept the plan without prompts.")
         return 1
+    try:
+        ensure_ffmpeg(auto_install=args.yes)
+    except (OSError, RuntimeError) as exc:
+        print(f"FFmpeg installation failed: {exc}", file=sys.stderr)
     if not reuse:
         install_python(
             root,
@@ -287,16 +298,26 @@ def execute(args: argparse.Namespace, root: Path = ROOT) -> int:
     if not (root / "config.toml").exists():
         create_configuration(root, port)
     initialize_paths(root, python, env)
-    doctor = subprocess.run(
-        [str(python), "-m", "autodj", "doctor", "--no-fix", "--json"],
-        cwd=root,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    findings = doctor_findings(doctor.stdout)
-    if findings or doctor.returncode:
+    # Doctor stays offline here: setup is not the place to ask about updates.
+    doctor_env = {**env, "AUTODJ_UPDATE_CHECK": "0"}
+    try:
+        doctor = subprocess.run(
+            [str(python), "-m", "autodj", "doctor", "--no-fix", "--json"],
+            cwd=root,
+            env=doctor_env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=DOCTOR_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"Doctor did not finish within {DOCTOR_TIMEOUT_SECONDS // 60} minutes; setup will keep "
+            "the verified runtime selection. Run `autodj doctor` to check."
+        )
+        doctor = None
+    findings = doctor_findings(doctor.stdout) if doctor is not None else []
+    if doctor is not None and (findings or doctor.returncode):
         print("Doctor reported an issue; setup will keep the verified runtime selection.")
         if findings is not None:
             for finding in findings:
@@ -316,7 +337,7 @@ def execute(args: argparse.Namespace, root: Path = ROOT) -> int:
     )
     print("\nRuntime verified and saved. Start AutoDJ with:")
     print(".\\autodj.cmd serve" if os.name == "nt" else "./autodj serve")
-    print("Your library is empty. Add music folders from the Library page in AutoDJ.")
+    print("Manage music folders from the Library page in AutoDJ.")
     test_import = args.test_import or (
         backend != "no-model"
         and interactive

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,8 +18,15 @@ from autodj._bridge import PlayerBridge
 from autodj.breaks import BreakDesk, new_id
 from autodj.carts import CartStore
 from autodj.config import AutoDJConfig, load_config
-from autodj.server import create_app
-from autodj.stations import SharedLibrary, StationPaths, StationRegistry, StationRuntime
+from autodj.station_name import listener_name
+from autodj.stations import (
+    ExtraStation,
+    SharedLibrary,
+    StationPaths,
+    StationRegistry,
+    StationRuntime,
+)
+from tests._server import create_app
 
 from ._helpers import _make_player_mock, _make_sim_mock
 
@@ -188,10 +197,28 @@ def _rig(
             log.append("push stopped")
 
     runtime.broadcast = broadcast
+
+    def stop_scan(_timeout: float) -> bool:
+        log.append("library scan stopped")
+        return True
+
     library: Any = SimpleNamespace(
-        start_scan=lambda: None, tick=lambda: None, close=lambda: log.append("library closed")
+        start_scan=lambda: None,
+        tick=lambda: None,
+        stop_scan=stop_scan,
+        flush_ledgers=lambda: log.append("plays saved"),
+        close=lambda: log.append("library closed"),
     )
-    registry = StationRegistry(runtime)
+    registry = StationRegistry(
+        ExtraStation(
+            slug="default",
+            name=runtime.name,
+            autostart=True,
+            paths=runtime.paths,
+            preset="included",
+            build=lambda _registry: runtime,
+        )
+    )
     return runtime, registry, SharedLibrary(library, registry), bridge
 
 
@@ -210,8 +237,64 @@ async def test_station_start_sweeps_old_break_files_before_starting_services(
         assert not leftover.exists()
 
     runtime.schedule.start = start_schedule
-    await runtime.start()
+    await registry.start_all()
     assert not leftover.exists()
+    await registry.shutdown(shared, 1.0)
+
+
+async def test_relays_connect_with_the_name_on_the_air_and_reconnect_when_it_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0009-08: after a restart relays start with the name of what is on the air."""
+    log: list[str] = []
+    runtime, registry, shared, bridge = _rig(tmp_path, monkeypatch, log)
+    bridge.player.clock_station_name = lambda: "Example FM Night Shift"
+    seen: list[str] = []
+
+    def start_stream(*_args: Any) -> Any:
+        seen.append(listener_name(bridge))
+        return SimpleNamespace(name="stream encoder", close=lambda: log.append("stream closed"))
+
+    monkeypatch.setattr(stations, "start_stream_station", start_stream)
+    reconnected: list[tuple[bool, bool]] = []
+
+    def reconfigure(_configs: Any, *, restart_all: bool = False) -> None:
+        # Another thread cannot take the relay lock while this runs.
+        taken: list[bool] = []
+        other = threading.Thread(target=lambda: taken.append(runtime.relay_lock.acquire(False)))
+        other.start()
+        other.join()
+        reconnected.append((restart_all, taken == [False]))
+
+    bridge.relays.reconfigure = reconfigure
+    runtime.public_state_changed = lambda: log.append("feed refreshed")
+    await registry.start_all()
+    # The ticker would also notice the change below; this test makes it once.
+    runtime._schedule_ticker.cancel()
+    assert seen == ["Example FM Night Shift"]
+    # Relays not yet connected when the name was set: they start with it.
+    assert reconnected == []
+    assert runtime.relay_reconnect_due(now=math.inf) is False
+    # A wheel switch, then a show just after it: the feed follows each at
+    # once, the relays reconnect once, after the name settles, with the last.
+    bridge.player.clock_station_name = lambda: ""
+    assert runtime.sync_station_name() is True
+    runtime.show_runner = SimpleNamespace(on_air_station_name=lambda: "Example FM Live")
+    assert runtime.sync_station_name() is True
+    assert log.count("feed refreshed") == 3
+    assert reconnected == []
+    assert runtime.reconnect_relays_if_due() is False  # not settled yet
+    assert await asyncio.to_thread(runtime.reconnect_relays_if_due, math.inf) is True
+    assert reconnected == [(True, True)]
+    assert runtime.relay_name == "Example FM Live"
+    assert runtime.reconnect_relays_if_due(math.inf) is False  # nothing more booked
+    # A name that comes back before the reconnect is due costs no reconnect.
+    runtime.show_runner = SimpleNamespace(on_air_station_name=lambda: "")
+    assert runtime.sync_station_name() is True
+    runtime.show_runner = SimpleNamespace(on_air_station_name=lambda: "Example FM Live")
+    assert runtime.sync_station_name() is True
+    assert runtime.reconnect_relays_if_due(math.inf) is False
+    assert reconnected == [(True, True)]
     await registry.shutdown(shared, 1.0)
 
 
@@ -220,7 +303,7 @@ async def test_shutdown_keeps_the_order_of_the_single_station_server(
 ) -> None:
     log: list[str] = []
     runtime, registry, shared, bridge = _rig(tmp_path, monkeypatch, log)
-    await runtime.start()
+    await registry.start_all()
     await shared.start()
     assert bridge.scheduler_track_changed is not None
 
@@ -238,6 +321,7 @@ async def test_shutdown_keeps_the_order_of_the_single_station_server(
         "player told to stop",
         "player thread joined",
         "background analysis waited for",
+        "library scan stopped",
         "DJ-meta cache closed",
         "library closed",
         "master closed",
@@ -252,9 +336,9 @@ async def test_a_busy_writer_leaves_the_cache_open_but_still_closes_the_rest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     log: list[str] = []
-    runtime, registry, shared, _bridge = _rig(tmp_path, monkeypatch, log)
+    _runtime, registry, shared, _bridge = _rig(tmp_path, monkeypatch, log)
     monkeypatch.setattr(_Player, "_quiet", False)
-    await runtime.start()
+    await registry.start_all()
     await shared.start()
 
     assert await registry.shutdown(shared, 0.0) == (False, False)
@@ -268,11 +352,121 @@ async def test_a_reader_still_running_keeps_the_library_open(
 ) -> None:
     """An hour preview that did not stop must not have the library closed under it (#126)."""
     log: list[str] = []
-    runtime, registry, shared, _bridge = _rig(tmp_path, monkeypatch, log)
-    await runtime.start()
+    _runtime, registry, shared, _bridge = _rig(tmp_path, monkeypatch, log)
+    await registry.start_all()
     await shared.start()
 
     assert await registry.shutdown(shared, 1.0, readers_stopped=False) == (True, True)
 
     assert "library closed" not in log
-    assert log[-2:] == ["master closed", "push stopped"]
+    assert log[-3:] == ["plays saved", "master closed", "push stopped"]
+
+
+async def test_a_scan_that_will_not_stop_keeps_the_cache_and_library_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ADR-0008-31. Closing the DJ-meta cache under the scan would lose its writes.
+
+    The plays since the last tick are saved all the same.
+    """
+    log: list[str] = []
+    _runtime, registry, shared, _bridge = _rig(tmp_path, monkeypatch, log)
+    waits: list[float] = []
+
+    def stop_scan(timeout: float) -> bool:
+        waits.append(timeout)
+        return False
+
+    shared.library.stop_scan = stop_scan
+    await registry.start_all()
+    await shared.start()
+    shared.stop_scan(0.5)
+
+    assert await registry.shutdown(shared, 1.0) == (True, False)
+
+    # Asked once, when shutdown began: the wait is not added to the stations' stop.
+    assert waits == [0.5]
+    assert "DJ-meta cache closed" not in log
+    assert "library closed" not in log
+    assert "plays saved" in log
+    assert "The library scan was still running 0.50 seconds" in caplog.text
+
+
+async def test_each_shutdown_step_logs_how_long_it_took(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ADR-0008-31. Quick steps are logged at DEBUG; one slower than the threshold at INFO."""
+    caplog.set_level(logging.DEBUG, logger="autodj.stations")
+
+    async def step() -> str:
+        return "done"
+
+    assert await stations.timed_shutdown_step("stopping something quick", step()) == "done"
+    monkeypatch.setattr(stations, "SLOW_SHUTDOWN_STEP_S", -1.0)
+    assert await stations.timed_shutdown_step("stopping something slow", step()) == "done"
+
+    levels = {
+        record.getMessage().split(" took ")[0]: record.levelno
+        for record in caplog.records
+        if record.getMessage().startswith("Shutdown step ")
+    }
+    assert levels == {
+        "Shutdown step stopping something quick": logging.DEBUG,
+        "Shutdown step stopping something slow": logging.INFO,
+    }
+
+
+def _scan_rig(monkeypatch: pytest.MonkeyPatch, players: list[Any]) -> tuple[SharedLibrary, list]:
+    scans: list[str] = []
+    monkeypatch.setattr("autodj.player.apply_repeat_windows", lambda _player: None)
+    library: Any = SimpleNamespace(
+        start_scan=lambda: scans.append("scan"),
+        tick=lambda: None,
+        stop_scan=lambda _timeout: True,
+    )
+    registry: Any = SimpleNamespace(all=lambda: [SimpleNamespace(player=p) for p in players])
+    return SharedLibrary(library, registry), scans
+
+
+async def test_the_startup_scan_waits_for_every_station_s_first_song(monkeypatch) -> None:
+    """ADR-0008-35. The scan starts once each station with a mix bus has started a song."""
+    first, second = (
+        SimpleNamespace(bus=object(), first_song_started=threading.Event()) for _ in range(2)
+    )
+    browser = SimpleNamespace(bus=None, first_song_started=threading.Event())
+    shared, scans = _scan_rig(monkeypatch, [first, second, browser])
+    await shared.start()
+    await asyncio.sleep(0.4)
+    first.first_song_started.set()
+    await asyncio.sleep(0.4)
+    assert scans == []
+    second.first_song_started.set()
+    await asyncio.sleep(0.4)
+    assert scans == ["scan"]
+    assert shared._ticker is not None
+    shared._ticker.cancel()
+
+
+async def test_the_startup_scan_starts_anyway_after_the_wait(monkeypatch) -> None:
+    """ADR-0008-35. A station that never plays delays the scan by the wait at most."""
+    monkeypatch.setattr(stations, "FIRST_SONG_WAIT_S", 0.3)
+    idle = SimpleNamespace(bus=object(), first_song_started=threading.Event())
+    shared, scans = _scan_rig(monkeypatch, [idle])
+    await shared.start()
+    await asyncio.sleep(0.8)
+    assert scans == ["scan"]
+    assert shared._ticker is not None
+    shared._ticker.cancel()
+
+
+async def test_a_shutdown_before_the_first_song_starts_no_scan(monkeypatch) -> None:
+    """ADR-0008-35. Shutdown cancels a scan still waiting for the first songs."""
+    waiting = SimpleNamespace(bus=object(), first_song_started=threading.Event())
+    shared, scans = _scan_rig(monkeypatch, [waiting])
+    await shared.start()
+    shared.stop_scan(1.0)
+    waiting.first_song_started.set()
+    await asyncio.sleep(0.4)
+    assert scans == []
+    assert shared._ticker is not None
+    shared._ticker.cancel()

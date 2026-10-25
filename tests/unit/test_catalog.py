@@ -414,6 +414,87 @@ def test_rekey_preserves_record_identity_points_and_history(tmp_path: Path) -> N
         assert catalog.record_for_path(old) is None
 
 
+@pytest.mark.parametrize("states", [("failed", "stale"), ("stale", "failed")])
+@pytest.mark.parametrize("expiries", [(900.0, 800.0), (800.0, 900.0), (900.0, 900.0)])
+def test_rekey_keeps_later_hold(tmp_path, states, expiries):
+    """ADR-0008-24. Colliding holds retain the later expiry without blocking a move."""
+    from autodj.analysis_queue import AnalysisQueue
+    from autodj.catalog import _path
+    from autodj.indexer import file_fingerprint
+
+    old, new = tmp_path / "old.flac", tmp_path / "new.flac"
+    old.write_bytes(b"audio")
+    with LibraryCatalog(tmp_path / "library.db") as catalog:
+        catalog.put_entry(entry(old))
+        queue = AnalysisQueue(catalog.path, now=lambda: 100.0)
+        try:
+            identity = file_fingerprint(old)
+            queue.defer_scan(_path(old), *identity)
+            with queue._write() as db:
+                for path, state, expiry in zip((old, new), states, expiries, strict=True):
+                    db.execute(
+                        "INSERT INTO analysis_leases VALUES (?,?,?,?,?,?,?)",
+                        (_path(path), path.stem, "worker", state, *identity, expiry),
+                    )
+            old.rename(new)
+            assert catalog.rekey(old, new)
+            winner = 0 if expiries[0] > expiries[1] else 1
+            assert queue._read("SELECT path,state,expires_at FROM analysis_leases") == [
+                (_path(new), states[winner], expiries[winner])
+            ]
+            assert queue.scan_identity(_path(new)) == identity
+            assert not queue.scan_pending(_path(old))
+            assert catalog.record_for_path(old) is None
+            assert catalog.record_for_path(new) is not None
+            assert queue.claim("worker", [(_path(new), *identity)], 600) == []
+            queue._now = lambda: 901.0
+            assert queue.claim("worker", [(_path(new), *identity)], 600)
+        finally:
+            queue.close()
+
+
+@pytest.mark.parametrize("failure_table", ["analysis_leases", "catalog_entries"])
+def test_rekey_hold_failure_rolls_back_move(tmp_path, failure_table):
+    """ADR-0008-24. A failed move restores both holds, pending work and catalog history."""
+    from autodj.analysis_queue import AnalysisQueue
+    from autodj.catalog import _path
+    from autodj.indexer import file_fingerprint
+
+    old, new = tmp_path / "old.flac", tmp_path / "new.flac"
+    old.write_bytes(b"audio")
+    with LibraryCatalog(tmp_path / "library.db") as catalog:
+        catalog.put_entry(entry(old))
+        catalog.set_points(old, {"intro": 50.0})
+        catalog.remember_play(old, 42.0, station="second")
+        queue = AnalysisQueue(catalog.path)
+        try:
+            identity = file_fingerprint(old)
+            queue.defer_scan(_path(old), *identity)
+            with queue._write() as db:
+                for path, state, expiry in ((old, "failed", 900.0), (new, "stale", 800.0)):
+                    db.execute(
+                        "INSERT INTO analysis_leases VALUES (?,?,?,?,?,?,?)",
+                        (_path(path), path.stem, "worker", state, *identity, expiry),
+                    )
+                db.execute(
+                    f"CREATE TRIGGER fail_move BEFORE UPDATE OF path ON {failure_table} "
+                    "BEGIN SELECT RAISE(ABORT, 'move failed'); END"
+                )
+            record = catalog.record_for_path(old)
+            pending = queue._read("SELECT * FROM scan_pending")
+            holds = queue._read("SELECT * FROM analysis_leases ORDER BY path")
+            old.rename(new)
+            with pytest.raises(sqlite3.IntegrityError, match="move failed"):
+                catalog.rekey(old, new)
+            assert catalog.record_for_path(old) == record
+            assert catalog.record_for_path(new) is None
+            assert queue._read("SELECT * FROM scan_pending") == pending
+            assert queue._read("SELECT * FROM analysis_leases ORDER BY path") == holds
+            assert catalog.last_played("second") == {_path(old): 42.0}
+        finally:
+            queue.close()
+
+
 def test_settings_and_source_update_are_persistent(tmp_path: Path) -> None:
     root = tmp_path / "music"
     root.mkdir()
@@ -705,14 +786,14 @@ def test_unembedded_count_matches_paths_and_tracks_external_changes(tmp_path: Pa
         catalog.put_entry(entry(songs[0]))
         catalog.put_entry(entry(songs[1]))
         catalog.put_entry(entry(songs[2]))
-        assert catalog.unembedded_count() == len(catalog.unembedded_paths()) == 0
+        assert catalog.unembedded_count() == len(list(catalog.iter_unembedded_paths())) == 0
 
         other.update_source(nested_source["id"], recursive=True, advanced=True)
-        assert catalog.unembedded_count() == len(catalog.unembedded_paths()) == 1
+        assert catalog.unembedded_count() == len(list(catalog.iter_unembedded_paths())) == 1
         set_vector(other, songs[1], np.ones(FEATURE_DIM, dtype=np.float32))
-        assert catalog.unembedded_count() == len(catalog.unembedded_paths()) == 0
+        assert catalog.unembedded_count() == len(list(catalog.iter_unembedded_paths())) == 0
         other.put_entry(entry(nested / "new.flac"))
-        assert catalog.unembedded_count() == len(catalog.unembedded_paths()) == 1
+        assert catalog.unembedded_count() == len(list(catalog.iter_unembedded_paths())) == 1
 
 
 def test_removing_entry_cascades_to_vector(tmp_path: Path) -> None:
@@ -726,6 +807,28 @@ def test_removing_entry_cascades_to_vector(tmp_path: Path) -> None:
         assert catalog.remove_entries([str(song)]) == 1
         assert catalog._db().execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert catalog._db().execute("SELECT COUNT(*) FROM catalog_vectors").fetchone()[0] == 0
+
+
+def test_pending_iterator_advances_past_rejected_pages_without_holding_lock(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(catalog_module, "ANALYSIS_PAGE_SIZE", 2, raising=False)
+    with LibraryCatalog(tmp_path / "library.db") as catalog:
+        eligible = tmp_path / "z-eligible"
+        eligible.mkdir()
+        catalog.add_source(eligible)
+        catalog.seed_entries(entry(tmp_path / "a-excluded" / f"{i}.flac") for i in range(5))
+        catalog.seed_entries(entry(eligible / f"{i}.flac") for i in range(3))
+        candidates = catalog.iter_unembedded_paths()
+        assert next(candidates) == catalog_module.normalize_path(eligible / "0.flac")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                assert executor.submit(catalog.get_setting, "unused", 42).result(timeout=5) == 42
+                assert list(candidates) == [
+                    catalog_module.normalize_path(eligible / f"{i}.flac") for i in (1, 2)
+                ]
+            finally:
+                candidates.close()
 
 
 @pytest.mark.parametrize("kind", [None, "music", "liner"])

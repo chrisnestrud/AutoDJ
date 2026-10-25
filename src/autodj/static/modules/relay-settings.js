@@ -5,6 +5,7 @@ import { captureAuthenticatedRequestEpoch, isAuthenticatedRequestCurrent } from 
 import { clearFieldError, clearFormErrors, showFieldError } from "./dom-helpers.js";
 import { sayIfStillPending } from "./live-region.js";
 import { stationEpoch } from "./stations.js";
+import { registerSettingsGroup } from "./settings-drafts.js";
 
 const root = (slug) => slug === "default" ? "/api" : `/api/stations/${encodeURIComponent(slug)}`;
 
@@ -13,6 +14,18 @@ export function installRelaySettings({ doc, request, post, remove, announce, slu
   const rows = id("relay-rows");
   const form = id("relay-form");
   const formError = id("relay-form-error");
+  const metadata = [id("station-name"), id("station-genre"), id("station-description"), id("station-url")];
+  const metadataKeys = ["station_name", "genre", "description", "url"];
+  metadata.forEach((control, index) => {
+    const key = metadataKeys[index];
+    registerSettingsGroup({
+      panel: doc.getElementById("spanel-stream"),
+      group: "stream",
+      controls: [control],
+      read: () => ({ [key]: control.value }),
+      write: (body) => { if (body[key] != null) control.value = body[key]; },
+    });
+  });
   const table = installTableNavigation(rows);
   let relays = [];
   let statuses = new Map();
@@ -24,14 +37,16 @@ export function installRelaySettings({ doc, request, post, remove, announce, slu
   let formSaveId = 0;
   const rowByName = new Map();
   function validationError(error) {
-    const key = error.message.toLowerCase().includes("password") ? "password"
+    const named = ["name", "type", "host", "port", "password", "mount", "user", "stream_id", "bitrate"].includes(error.field)
+      ? error.field.replaceAll("_", "-") : null;
+    const key = named || (error.message.toLowerCase().includes("password") ? "password"
       : error.message.toLowerCase().includes("host") ? "host"
       : error.message.toLowerCase().includes("port") ? "port"
       : error.message.toLowerCase().includes("mount") ? "mount"
       : error.message.toLowerCase().includes("user") ? "user"
       : error.message.toLowerCase().includes("stream_id") ? "stream-id"
       : error.message.toLowerCase().includes("bitrate") ? "bitrate"
-      : error.message.toLowerCase().includes("type") ? "type" : "name";
+      : error.message.toLowerCase().includes("type") ? "type" : "name");
     clearFormErrors(form, formError);
     showFieldError(id(`relay-${key}`), error.message, formError, doc.getElementById("settings-status"));
   }
@@ -220,23 +235,25 @@ export function installRelaySettings({ doc, request, post, remove, announce, slu
   form.addEventListener("input", (event) => {
     if (event.target.getAttribute("aria-invalid") === "true") clearFieldError(event.target, formError);
   });
+  // The form is novalidate (index.html says why), so its required fields
+  // are checked here, the first missing one said and focused.
+  function missingField(payload) {
+    if (!payload.name) return { field: "name", message: "Enter a name for the relay." };
+    if (!payload.host) return { field: "host", message: "Enter the relay server's host." };
+    if (!Number.isInteger(payload.port) || payload.port < 1 || payload.port > 65535) {
+      return { field: "port", message: "Enter a listener port from 1 to 65535." };
+    }
+    return null;
+  }
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (saving) return;
     const payload = values();
+    const missing = missingField(payload);
+    if (missing) { validationError(missing); return; }
     payload.is_edit = editing !== null;
     if (editing && !payload.password) payload.password = null;
     await save(payload, true);
-  });
-  id("metadata-save").addEventListener("click", async (event) => {
-    const body = {
-      station_name: id("station-name").value,
-      genre: id("station-genre").value,
-      description: id("station-description").value,
-      url: id("station-url").value,
-    };
-    if (await post(`${root(slug)}/stream/settings`, body, event.currentTarget)) {
-      announce("Station metadata saved. Enabled relays are reconnecting.");
-    }
   });
 
   return {

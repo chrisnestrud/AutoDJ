@@ -1,5 +1,5 @@
 // Settings > Stream > Now-playing feed: the public feed's address, whether
-// it shows the next song, and the webhooks set in config.local.toml.
+// it shows the next song, and the webhooks set in the station's secrets.json.
 //
 // Speech rules (docs/accessibility-testing.md, Announcement contract):
 //   - Copy, the show-next save and Send test are user actions, so their
@@ -18,7 +18,7 @@
 
 import { DEFAULT_STATION, currentStation } from "./stations.js";
 import { announceStatus } from "./live-region.js";
-import { saveHolds } from "./settings-panel.js";
+import { registerSettingsGroup } from "./settings-drafts.js";
 import { listRow, rowButton } from "./dom-helpers.js";
 import { installActionListNavigation } from "./action-list-navigation.js";
 import { isLoopbackHost } from "./stream-mode.js";
@@ -40,7 +40,7 @@ export const STATUS_COPIED_TEXT = "Status page link copied.";
 export const STATUS_COPY_FAILED_TEXT =
   "Could not copy. Select the status page link and copy it yourself.";
 export const NO_WEBHOOKS_TEXT =
-  "No webhooks are set up. Add them to config.local.toml on the AutoDJ computer, then restart AutoDJ.";
+  "No webhooks are set up. Add them to this station's secrets.json on the AutoDJ computer, then restart AutoDJ.";
 // While the panel is open, a state push reloads the list at most this
 // often, so each track change's delivery result shows up.
 export const WEBHOOK_REFRESH_MS = 15000;
@@ -89,9 +89,6 @@ export function installNowPlayingSettings({
   doc = document,
   // requestJson from api-client.js.
   request,
-  // (checked, control) => Promise<boolean>, through postSettings, which
-  // says why a save failed and puts the box back.
-  saveShowNext,
   srStatus,
   settingsStatus,
   hostname = doc.location.hostname,
@@ -109,6 +106,18 @@ export function installNowPlayingSettings({
   const list = doc.getElementById("np-webhooks-list");
   const empty = doc.getElementById("np-webhooks-empty");
   if (!link || !copy || !showNext || !list || !empty) return null;
+  const settingsDraft = registerSettingsGroup({
+    panel,
+    group: "stream",
+    controls: [showNext],
+    read: () => ({ show_next: showNext.checked }),
+    write: (body) => {
+      if (body.show_next != null) showNext.checked = Boolean(body.show_next);
+    },
+    describe: (body) => (body.show_next
+      ? "The public now-playing feed now shows the next song."
+      : "The public now-playing feed now hides the next song."),
+  });
   const listNavigation = installActionListNavigation(list);
 
   const statusOpen = doc.getElementById("np-status-open");
@@ -163,7 +172,7 @@ export function installNowPlayingSettings({
           say(settingsStatus, `Test delivered to ${hook.host}.`);
         } else {
           say(settingsStatus,
-            `Test to ${hook.host} failed. Check its address in config.local.toml and the AutoDJ log.`,
+            `Test to ${hook.host} failed. Check its address in this station's secrets.json and the AutoDJ log.`,
             "error");
         }
         void load();
@@ -285,34 +294,18 @@ export function installNowPlayingSettings({
     showNext.setAttribute("aria-describedby", ids.join(" "));
   }
 
-  showNext.addEventListener("change", async () => {
-    const chosen = showNext.checked;
-    const saved = await saveShowNext(chosen, showNext);
-    if (!saved) {
-      // postSettings has said why; the box shows what the server has.
-      showNext.checked = !chosen;
-      return;
-    }
-    say(settingsStatus, chosen
-      ? "The public now-playing feed now shows the next song."
-      : "The public now-playing feed now hides the next song.");
-  });
-
   function apply(state) {
     showAddresses();
     // A push without settings leaves DMCA mode as it was.
     const dmcaSetting = state?.settings?.playback?.dmca_enabled;
     if (typeof dmcaSetting === "boolean" && dmcaSetting !== dmcaLocked()) applyDmca(dmcaSetting);
     const dmca = dmcaLocked();
-    if (!state || !state.stream_mode) {
+    if (!state) {
       active = false;
       return;
     }
     const pushed = state.settings?.playback?.nowplaying_show_next;
-    if (!dmca && typeof pushed === "boolean" && !saveHolds(showNext, pushed)
-        && showNext.checked !== pushed) {
-      showNext.checked = pushed;
-    }
+    if (!dmca && typeof pushed === "boolean") settingsDraft.accept({ show_next: pushed });
     const wasActive = active;
     active = true;
     if (!seen()) return;

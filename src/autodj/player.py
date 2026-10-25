@@ -1,12 +1,11 @@
 """Auto-DJ player: next-track picking and server-side audio playback.
 
 ``autodj serve`` drives the player; the web page is its control surface.
-Offline/local server audio prepares stereo PCM tracks with the next song
-crossfaded into the tail. Stream mode progressively decodes live sources and
-mixes them on the :class:`~autodj.mixbus.MixBus` sample clock; the playout
-worker handles selection and bounded transition work. Outputs receive bus
-blocks, including the sound card (:class:`~autodj.sound_output.SoundDeviceOutput`)
-or stream encoder.
+Server audio progressively decodes live sources and mixes them on the
+:class:`~autodj.mixbus.MixBus` sample clock; offline review keeps its separate
+whole-program renderer. The playout worker handles selection and bounded
+transition work. Outputs receive bus blocks, including the sound card
+(:class:`~autodj.sound_output.SoundDeviceOutput`) or stream encoder.
 """
 
 from __future__ import annotations
@@ -857,6 +856,8 @@ class Player:
     _pending_clock_name: str | None = None
     _pending_clock_boundary: float | None = None
     _clock: dict[str, Any] | None = None
+    # The loaded clockwheel's station name while it picks (#472), or "".
+    _clock_station_name: str = ""
     _clock_next_boundary: float | None = None
     # Hour fitting's hard events (or a callable giving the scheduler's
     # current ones) and the time zone they run in (#126).
@@ -913,14 +914,6 @@ class Player:
     @_bpm_range.setter
     def _bpm_range(self, value: tuple[float, float] | None) -> None:
         self._settings._bpm_range = value
-
-    @property
-    def _pure_shuffle(self) -> bool:
-        return self._settings._pure_shuffle
-
-    @_pure_shuffle.setter
-    def _pure_shuffle(self, value: bool) -> None:
-        self._settings._pure_shuffle = value
 
     @property
     def _anchor_to_seed(self) -> bool:
@@ -1000,7 +993,7 @@ class Player:
         self._sim = sim_index
         self._dry_run = dry_run
         self._stream_mode = stream_mode
-        self.live_mixing = stream_mode
+        self.live_mixing = stream_mode or not dry_run
         self._live_files: dict[tuple, BufferedFile] = {}
         self._live_voice_slot: tuple[RenderedTrack, SlotPlan] | None = None
         self._pending_live_source: BufferedFile | None = None
@@ -1012,6 +1005,10 @@ class Player:
         self._live_queue_target: Any = None
         self._live_queue_edits: dict[int, Any] = {}
         self._server_audio_too = server_audio_too
+        # Set when the first song starts on the mix bus with its successor
+        # picked; the library's startup scan waits for it (see
+        # autodj.stations.SharedLibrary).
+        self.first_song_started = threading.Event()
         # Picker settings.  They start off (discovery at the configured
         # rate) and the web page's settings routes change them.
         # Anchored mode: when True, every similarity query uses the SEED
@@ -1316,6 +1313,11 @@ class Player:
         self._seed_clock_following = None
         self._seed_clock_step = None
         self._chosen_clock_ad_steps = ()
+        from autodj import restored_pick
+
+        restored = restored_pick.restore(self, self._now())
+        if restored is not None:
+            return restored
         chosen: IndexEntry | None
         dmca = self._pick_context() if self._state.dmca_enabled else None
         if self._library is not None:
@@ -1438,9 +1440,30 @@ class Player:
     def _ledger(self, ledger: Any) -> None:
         self._station_ledger = ledger
 
+    def _clock_fingerprint(self) -> str:
+        """A fingerprint of the active clockwheel's definition, kept per definition."""
+        from autodj.restored_pick import clock_hash
+
+        definition = getattr(self, "_clock_definition", None)
+        cached = getattr(self, "_clock_fingerprint_cache", None)
+        if cached is None or cached[0] is not definition:
+            cached = (definition, clock_hash(definition))
+            self._clock_fingerprint_cache = cached
+        return cached[1]
+
     def _clock_name(self) -> str | None:
         """The name of the loaded clockwheel, or ``None`` without one."""
         return (self._clock or {}).get("name")
+
+    def clock_station_name(self) -> str:
+        """The station name the clockwheel asks for while it picks the songs, or ``""`` (#472).
+
+        Only while the station picks by clockwheel and the wheel can play,
+        as the announcer context counts a wheel on the air.
+        """
+        if getattr(self._cfg.playback, "pick_mode", None) != "clock" or self._clock is None:
+            return ""
+        return str(getattr(self, "_clock_station_name", "") or "")
 
     def _forget_other_clock_place(self) -> None:
         """Drop the render cursor's clock place and resync time if another clockwheel's.
@@ -1515,6 +1538,7 @@ class Player:
             self._clock_fallback_reason: str | None = status
             self._pending_clock_update = None
             self._clock = None
+            self._clock_station_name = ""
             self._clock_has_ad_steps = False
             self._clock_has_pending_ad_steps = False
             self._seed_clock_following = None
@@ -1554,7 +1578,9 @@ class Player:
         from datetime import datetime
 
         from autodj.clockwheel import next_boundary
+        from autodj.clockwheel_store import split_station_name
 
+        clock, station_name = split_station_name(clock)
         boundary = next_boundary(
             datetime.fromtimestamp(self._now()).astimezone(), clock["resync_minutes"]
         )
@@ -1571,6 +1597,7 @@ class Player:
                 self._pending_clock_cursor = None
                 self._pending_clock_boundary = None
             self._clock_definition = clock
+            self._clock_station_name = station_name
             self._clock_steps = clock["steps"]
             self._clock_step_hours = step_hours
             self._pending_clock_cursor_revision = self._clock_revision
@@ -1592,9 +1619,18 @@ class Player:
             self._clock_next_boundary = boundary.timestamp() if boundary else None
 
     def apply_clockwheel_update(self, name: str, timing: str = "immediate") -> None:
-        """Apply a saved active wheel now or at its next restart boundary."""
+        """Apply a saved active wheel now or at its next restart boundary.
+
+        Its station name applies at once whatever *timing* says: it does not
+        change how the wheel picks (#472).
+        """
+        from autodj.clockwheel_store import split_station_name
+
         clock, slots = self._load_clockwheel(name)
+        clock, station_name = split_station_name(clock)
         with self._clock_selection_lock, self._clock_lock, settings_lock(self):
+            if self._clock_name() == name:
+                self._clock_station_name = station_name
             refresh = self._apply_loaded_clockwheel_update(name, timing, clock, slots)
         if refresh:
             self.refresh_playout()
@@ -1748,6 +1784,15 @@ class Player:
                 )
             else:
                 raise ValueError(f"Step {number} has type {kind!r}, which the player cannot play")
+        want = getattr(getattr(library, "clock_beets", None), "want", None)
+        if callable(want):
+            # Read with the categories' fields, in one read of Beets (#584).
+            want(
+                condition["name"]
+                for slot in slots
+                for condition in slot.conditions
+                if condition["field"] == "beets"
+            )
         return clock, validate_clock(slots)
 
     def _clock_pick(self, context: _PickContext, cursor: int | None) -> Any:
@@ -1832,8 +1877,11 @@ class Player:
         else:
             self._clock_condition_errors = ()
         cache = getattr(self, "_clock_condition_cache", None)
-        if cache is None or not cache.current(slots, entries, liners, beets_items, categories):
-            cache = ConditionPaths(slots, entries, liners, beets_items, categories)
+        # Relative date conditions are judged for when the song is expected
+        # to start, as the step hours are.
+        at = self._now() if context.at is None else context.at
+        if cache is None or not cache.current(slots, entries, liners, beets_items, categories, at):
+            cache = ConditionPaths(slots, entries, liners, beets_items, categories, at)
             self._clock_condition_cache = cache
 
         closed_steps = self._closed_clock_steps(context, step_hours)
@@ -2985,8 +3033,8 @@ class Player:
     def _run_server_audio(self, current: IndexEntry) -> None:  # pragma: no cover -- sound card
         """Play the set from *current* through the sound card on the mix bus.
 
-        A render-ahead worker keeps the next rendered track ready; the bus
-        pulls it when the playing one ends.  Blocks until the player stops.
+        A live playout worker prepares the next handoff; the bus pulls it when
+        the playing one ends. Blocks until the player stops.
         Not exercised in CI because it needs a real sound device; its parts (the worker, the bus, the output, the callbacks)
         are tested on their own.
         """
@@ -3042,7 +3090,40 @@ class Player:
 
     def _next_rendered(self) -> RenderedTrack | None:
         with self._clock_selection_lock:
+            if self.live_mixing and self.bus is not None and self.bus.current_render() is not None:
+                if self._pending_entry is None:
+                    return None
+                if self._pending_previous is not None:
+                    return self._live_continuation()
             return self._next_rendered_serial()
+
+    def _live_continuation(self) -> RenderedTrack | None:
+        """Carry the incoming cursor without rendering or selecting its successor."""
+        current = self._pending_entry
+        assert current is not None
+        return RenderedTrack(
+            current,
+            LiveAudio(0, ()),
+            None,
+            0,
+            "",
+            start_offset=self._pending_offset,
+            handoff_pending=True,
+            live_source=self._pending_live_source,
+            pick_mode=self._pending_pick_mode,
+            from_queue=self._pending_from_queue,
+            set_generation=self._set_generation,
+            previous_entry=self._pending_previous,
+            mixed_in_fx=self._pending_mixed_in[0],
+            mixed_in_ratio=self._pending_mixed_in[1],
+            glide_in=self._pending_glide,
+            reserved_liners=self._pending_reserved_liners,
+            clock_cursor=self._pending_clock_cursor,
+            clock_boundary=self._pending_clock_boundary,
+            clock_name=self._pending_clock_name,
+            clock_step=self._pending_clock_step,
+            clock_revision=self._pending_clock_cursor_revision,
+        )
 
     def _next_rendered_serial(self) -> RenderedTrack | None:
         """Pick and render the next track for the mix bus.
@@ -3112,12 +3193,21 @@ class Player:
             liners: tuple[tuple[IndexEntry, bool], ...] = ()
             next_cursor, liner_key = None, ""
             next_clock_step = None
+            # A song restored after a restart starts without a successor;
+            # the live queue refresh picks one while it plays (#584).
+            deferred = (
+                current is getattr(self, "_restored_first", None)
+                and self.bus is not None
+                and self.bus.current_render() is None
+            )
             context = self._pick_context(
                 pending=current,
                 starting=previous,
                 peek_queue=True,
                 queue_reserved=current if current_from_queue else None,
                 at=self._handoff_time(current),
+                dayparts=not deferred,
+                with_versions=not deferred,
             )
             next_entry: IndexEntry | None
             self._forget_other_clock_place()
@@ -3213,6 +3303,8 @@ class Player:
                         liners, liner_key, intro = self._transition_voice(
                             current, next_entry, liners, breaks, context.at
                         )
+                elif deferred:
+                    next_entry, next_mode = None, "clock"
                 elif station_mode:
                     next_entry, next_mode, liners, next_cursor, liner_key = (
                         self._choose_station_next(current, context, auto_liner=False)
@@ -3257,16 +3349,6 @@ class Player:
                     *(item for item in breaks if item.break_id not in replaced_ids),
                 )
                 intro = edit.intro
-                if next_entry is not None:
-                    with self._state.queue_lock:
-                        for following in edit.following:
-                            if following.outgoing is None and isinstance(
-                                following.track, RenderedTrack
-                            ):
-                                self._live_queue_edits.pop(id(following.track.entry), None)
-                                self._live_queue_edits[id(next_entry)] = replace(
-                                    following, outgoing=next_entry
-                                )
             render_live_source = getattr(self, "_pending_live_source", None)
             render_next_live_source = None
             try:
@@ -3362,7 +3444,9 @@ class Player:
                 from_queue=next_mode == "queue",
                 # A track that failed to render never starts.
                 previous=current if rendered is not None else previous,
-                live_source=rendered.next_live_source if rendered is not None else None,
+                live_source=rendered.next_live_source
+                if rendered is not None
+                else render_next_live_source,
                 mixed_in=_mixed_in_by(rendered),
                 glide=rendered.next_glide if rendered else None,
                 reserved_liners=rendered.next_reserved_liners if rendered else (),
@@ -3654,8 +3738,18 @@ class Player:
         with self._clock_selection_lock:
             if ready is not None:
                 self._prune_live_files(ready)
+            track = self._playing_render
+            if (
+                ready is not None
+                and ready.handoff_pending
+                and self.bus is not None
+                and self.bus.current_render() is None
+            ):
+                self._playout.reset(lambda: self._rewind_render_cursor(ready))
             if self._live_queue_dirty:
                 self._refresh_live_queue()
+            elif ready is None and track is not None:
+                self._playout.reset(lambda: self._skip_past_render(track))
 
     def _plan_slot(self, ready: RenderedTrack) -> None:
         if self.live_mixing:
@@ -4391,6 +4485,7 @@ class Player:
                     if swapped:
                         self._playing_render = replacement
                         self._state.next_track = replacement.next_entry
+                        self._remember_upcoming(replacement)
             self._playout.reset(lambda: self._skip_past_render(replacement if swapped else track))
             if not swapped:
                 committed_notice = getattr(self, "prepared_audio_committed", None)
@@ -4433,10 +4528,9 @@ class Player:
                 or self._live_queue_target is not self._playing_render
             ):
                 self._live_queue_target = decision.track
-            for item in (decision, *getattr(decision, "following", ())):
-                outgoing = getattr(item, "outgoing", None) or getattr(item.track, "entry", None)
-                if outgoing is not None:
-                    self._live_queue_edits[id(outgoing)] = item
+            outgoing = getattr(decision, "outgoing", None) or getattr(decision.track, "entry", None)
+            if outgoing is not None:
+                self._live_queue_edits[id(outgoing)] = decision
             if self.bus is not None and isinstance(decision.track, RenderedTrack):
                 self.bus.hold_handoff(decision.track)
 
@@ -4599,6 +4693,8 @@ class Player:
             if swapped:
                 self._playing_render = replacement
                 self._state.next_track = replacement.next_entry
+                self._remember_upcoming(replacement)
+                self.first_song_started.set()
                 self._playback_len = replacement.start_offset + round(
                     len(replacement.audio) * replacement.playback_rate
                 )
@@ -4640,7 +4736,12 @@ class Player:
         with self._state.queue_lock:
             if getattr(self, "live_mixing", False):
                 ready = self._playout.ready()
-                if ready is not None:
+                if ready is None:
+                    self._playout.request_plan()
+                else:
+                    if ready.handoff_pending:
+                        self._playout.request_plan()
+                        return None
                     if self._live_queue_dirty:
                         return None
                     audio = (
@@ -4750,6 +4851,8 @@ class Player:
         has anything, because the queue takes priority.  A render with
         announcer breaks is never stale: the breaks name its next track.
         """
+        if track.next_entry is None and track.entry is getattr(self, "_restored_first", None):
+            return True  # A restored first song: its successor is picked while it plays.
         if track.next_pick_mode == "clock" and track.next_clock_revision != self._clock_revision:
             return True
         # A booked break has already committed its next track.
@@ -4819,11 +4922,22 @@ class Player:
                 with self._state.queue_lock:
                     self._state.queue.insert(0, entry)
             return
+        if self.live_mixing:
+            self._playout.request_plan()
         self._current_lyrics = []
         self._current_lyrics_plain = ""
         self.load_lyrics_in_background(entry.path)
         if self.on_track_started is not None:
             self.on_track_started(entry)
+
+    def _remember_upcoming(self, rendered: RenderedTrack) -> None:
+        """Keep the song *rendered* hands over to, for a restart (buffered, #584)."""
+        from autodj.restored_pick import remember
+
+        try:
+            remember(self, rendered, self._now())
+        except Exception:
+            logger.debug("Could not keep the upcoming song for a restart", exc_info=True)
 
     def _start_playing(self, rendered: RenderedTrack) -> None:
         """Make *rendered* the playing track and record it (hold ``_set_lock``)."""
@@ -4836,6 +4950,8 @@ class Player:
         if finished is not None:
             getattr(self, "_live_queue_edits", {}).pop(id(finished.entry), None)
         self._playing_render = rendered
+        if rendered.next_entry is not None or entry is not getattr(self, "_restored_first", None):
+            self.first_song_started.set()
         self._playback_output_pos[0] = 0
         self._heard_liner_events: set[int] = set()
         self._heard_break_starts = set()
@@ -4860,6 +4976,15 @@ class Player:
             self._previous_track = self._state.current_track
         self._state.current_track = entry
         self._state.next_track = rendered.next_entry
+        self._remember_upcoming(rendered)
+        if entry is not getattr(self, "_restored_first", None):
+            self._restored_first = None
+        elif rendered.next_entry is None and self.live_mixing:
+            # Pick its successor now, while it plays: the live queue refresh
+            # runs on the playout worker, never on the bus.
+            self._live_queue_dirty = True
+            self._live_queue_revision += 1
+            self._playout.request_plan()
         self._current_sr = SAMPLE_RATE
         self._playback_pos[0] = rendered.start_offset
         self._playback_len = rendered.start_offset + round(
@@ -5046,6 +5171,8 @@ class Player:
         peek_queue: bool = False,
         queue_reserved: IndexEntry | None = None,
         at: float | None = None,
+        dayparts: bool = True,
+        with_versions: bool = True,
     ) -> _PickContext:
         """Copy the history a pick reads, under ``_pick_lock``.
 
@@ -5069,6 +5196,12 @@ class Player:
             at: When the picked song is expected to start (see
                 :meth:`_handoff_time`), in wall-clock seconds; dayparting
                 reads the station's hours then.  Now when not given.
+            dayparts: Read the categories' days and hours.  ``False``
+                leaves no song closed.
+            with_versions: Hold back the other versions of recent songs
+                (Count versions as one song).  ``False`` skips working out
+                every song's versions, which a restored first song must
+                not wait for: it was picked with them held back (#584).
         """
         with self._pick_lock:
             paths, history = self._recent_exclusions(pending, starting)
@@ -5091,7 +5224,7 @@ class Player:
         if minute_paths:
             held = set(paths)
             paths = deque([*paths, *(path for path in minute_paths if path not in held)])
-        versions = self._song_versions()
+        versions = self._song_versions() if with_versions else None
         if versions is not None:
             # The track rule holds back every version of a song that played.
             paths = deque(versions.with_versions(paths))
@@ -5099,7 +5232,9 @@ class Player:
         protected = {e.path for e in (pending, starting, playing) if e is not None}
         if latest is not None:
             protected.add(latest)
-        closed, closed_categories = self._dayparts(at)
+        # Without *dayparts*, no category hours are read: they need every
+        # category worked out, which a restored first song must not wait for.
+        closed, closed_categories = self._dayparts(at) if dayparts else (frozenset(), {})
         warned = getattr(self, "_all_closed_warned", None)
         if warned is not None and warned is not closed and warned != closed:
             self._all_closed_warned = None  # The hours changed: warn again if it recurs.
@@ -5539,7 +5674,7 @@ class Player:
 
     def _choose_by_mode(self, current: IndexEntry, context: _PickContext) -> tuple[IndexEntry, str]:
         """Pick by pure shuffle, discovery or similarity (see :meth:`_choose_next`)."""
-        if self._pure_shuffle or self._cfg.playback.pick_mode in {"random", "least_recent"}:
+        if self._cfg.playback.pick_mode in {"random", "least_recent"}:
             mode = (
                 "least_recent" if self._cfg.playback.pick_mode == "least_recent" else "pure_shuffle"
             )

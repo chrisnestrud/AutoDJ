@@ -2,6 +2,11 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 
 import { installHotkeys } from "../../src/autodj/static/modules/hotkeys.js";
 
+const { groups } = vi.hoisted(() => ({ groups: [] }));
+vi.mock("../../src/autodj/static/modules/settings-drafts.js", () => ({
+  registerSettingsGroup: (spec) => { groups.push(spec); return { accept: spec.write, dirty: () => false }; },
+}));
+
 function keyEvent(target, key, options = {}) {
   const event = new window.KeyboardEvent("keydown", {
     key,
@@ -554,7 +559,7 @@ describe("spoken status keys", () => {
       expect(stepStation.mock.calls.map(([by]) => by)).toEqual([-1, -1, 1]);
     });
 
-    it("leaves the menu's own type-ahead letters alone", () => {
+    it("leaves an ARIA menu's own type-ahead letters alone", () => {
       const focusStationSwitcher = vi.fn(() => true);
       document.body.innerHTML = '<ul role="menu"><li role="menuitemradio" tabindex="-1">Night</li></ul>';
       const addEventListener = vi.spyOn(window, "addEventListener");
@@ -566,6 +571,30 @@ describe("spoken status keys", () => {
       keydown(event);
       expect(event.preventDefault).not.toHaveBeenCalled();
       expect(focusStationSwitcher).not.toHaveBeenCalled();
+    });
+
+    it("treats a station button in the switcher's list like any other button (#576)", () => {
+      const focusStationSwitcher = vi.fn(() => true);
+      document.body.innerHTML = `<section id="panel-now"></section>
+        <ul id="station-list"><li><button type="button" data-station="nightowl">Night</button></li></ul>`;
+      const addEventListener = vi.spyOn(window, "addEventListener");
+      installHotkeys({ focusStationSwitcher });
+      const keydown = addEventListener.mock.calls.find(([type]) => type === "keydown")[1];
+      addEventListener.mockRestore();
+      const item = document.querySelector("#station-list button");
+      const press = (key) => {
+        const event = { key, repeat: false, target: item, preventDefault: vi.fn() };
+        keydown(event);
+        window.dispatchEvent(new KeyboardEvent("keyup", { key }));
+        return event;
+      };
+      // A letter is the page's shortcut: no type-ahead keeps it.
+      expect(press("c").preventDefault).toHaveBeenCalled();
+      expect(focusStationSwitcher).toHaveBeenCalledOnce();
+      // Space and the arrows stay with the button, as on any button.
+      for (const key of [" ", "ArrowDown", "ArrowUp"]) {
+        expect(press(key).preventDefault, key).not.toHaveBeenCalled();
+      }
     });
   });
 });
@@ -581,7 +610,7 @@ describe("keyboard shortcut toggle (WCAG 2.1.4)", () => {
       setItem: vi.fn((key, value) => values.set(key, String(value))),
     };
   }
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => { groups.length = 0; vi.unstubAllGlobals(); });
 
   it("turns every page shortcut off and back on, and saves the choice", async () => {
     document.body.innerHTML = `
@@ -606,6 +635,9 @@ describe("keyboard shortcut toggle (WCAG 2.1.4)", () => {
 
     toggle.checked = false;
     toggle.dispatchEvent(new Event("change"));
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(hotkeys.shortcutsEnabled()).toBe(true);
+    groups.find((group) => group.controls[0] === toggle).commit({ enabled: false });
     expect(storage.setItem).toHaveBeenLastCalledWith(STORAGE_KEY, "off");
     press("k");
     expect(click).not.toHaveBeenCalled();
@@ -619,6 +651,7 @@ describe("keyboard shortcut toggle (WCAG 2.1.4)", () => {
 
     toggle.checked = true;
     toggle.dispatchEvent(new Event("change"));
+    groups.find((group) => group.controls[0] === toggle).commit({ enabled: true });
     expect(storage.setItem).toHaveBeenLastCalledWith(STORAGE_KEY, "on");
     press("k");
     expect(click).toHaveBeenCalledOnce();
@@ -638,6 +671,8 @@ describe("keyboard shortcut toggle (WCAG 2.1.4)", () => {
     expect(hotkeys.bracketSeekEnabled()).toBe(false);
     box.checked = true;
     box.dispatchEvent(new Event("change"));
+    expect(hotkeys.bracketSeekEnabled()).toBe(false);
+    groups.find((group) => group.controls[0] === box).commit({ enabled: true });
     expect(hotkeys.bracketSeekEnabled()).toBe(true);
     expect(storage.setItem).toHaveBeenLastCalledWith("autodj.bracketSeek", "on");
 
@@ -657,8 +692,11 @@ describe("keyboard shortcut toggle (WCAG 2.1.4)", () => {
     blocked.installHotkeys({ bracketSeekToggle: offBox });
     expect(offBox.checked).toBe(false);
     offBox.checked = true;
-    expect(() => offBox.dispatchEvent(new Event("change"))).not.toThrow();
-    expect(blocked.bracketSeekEnabled()).toBe(true);
+    offBox.dispatchEvent(new Event("change"));
+    expect(blocked.bracketSeekEnabled()).toBe(false);
+    expect(() => groups.find((group) => group.controls[0] === offBox).commit({ enabled: true }))
+      .toThrow("blocked");
+    expect(blocked.bracketSeekEnabled()).toBe(false);
   });
 
   it("starts with the saved choice and defaults on when storage throws", async () => {
@@ -681,7 +719,11 @@ describe("keyboard shortcut toggle (WCAG 2.1.4)", () => {
     blocked.installHotkeys({ shortcutToggle: onToggle });
     expect(onToggle.checked).toBe(true);
     onToggle.checked = false;
-    expect(() => onToggle.dispatchEvent(new Event("change"))).not.toThrow();
+    onToggle.dispatchEvent(new Event("change"));
+    expect(blocked.shortcutsEnabled()).toBe(true);
+    expect(() => groups.find((group) => group.controls[0] === onToggle).commit({ enabled: false }))
+      .toThrow("blocked");
+    expect(blocked.shortcutsEnabled()).toBe(true);
   });
 });
 

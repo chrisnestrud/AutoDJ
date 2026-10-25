@@ -77,6 +77,48 @@ function jsonResponse(body, status = 200) {
   });
 }
 
+function settingsServer(initialValues = {}) {
+  let revision = "one";
+  const values = globalThis.structuredClone(initialValues);
+  let nextFailure = null;
+  const handle = (url, options = {}) => {
+    // api-client routes /api/settings to the selected station's settings URL.
+    if (url !== "/api/settings" && !/^\/api\/stations\/[^/]+\/settings$/.test(url)) return null;
+    if (String(options.method || "GET").toUpperCase() !== "PATCH") {
+      return jsonResponse({ revision, values: globalThis.structuredClone(values) });
+    }
+    if (nextFailure) {
+      const failure = nextFailure;
+      nextFailure = null;
+      return jsonResponse(failure.payload, failure.status);
+    }
+    const body = JSON.parse(options.body);
+    if (body.revision !== revision) return jsonResponse({ detail: "Settings revision changed." }, 409);
+    for (const [group, changes] of Object.entries(body.changes)) {
+      values[group] = { ...(values[group] || {}), ...changes };
+    }
+    revision = revision === "one" ? "two" : `next-${revision}`;
+    return jsonResponse({ revision, settings: { revision, values: globalThis.structuredClone(values) },
+      applied: Object.keys(body.changes), failed: {} });
+  };
+  handle.failNext = (payload, status = 503) => { nextFailure = { payload, status }; };
+  return handle;
+}
+
+async function settingsDraftApi() {
+  return import("../../src/autodj/static/modules/settings-drafts.js");
+}
+
+async function applyAppSettings(values, revision = "one") {
+  const { applySettingsDrafts } = await settingsDraftApi();
+  applySettingsDrafts({ revision, values }, document);
+}
+
+async function saveSettingsControl(control) {
+  const { saveSettingsPanel } = await settingsDraftApi();
+  return saveSettingsPanel(control.closest('[id^="spanel-"]'));
+}
+
 function installDocument() {
   const html = readFileSync(
     join(process.cwd(), "src/autodj/static/index.html"), "utf8",
@@ -246,10 +288,10 @@ async function setupApp({
 
 function cleanupApp() {
   // A switch remembers its station per browser (#70); every test starts fresh.
-  try {
-    globalThis.localStorage?.removeItem("autodj.station");
-  } catch {
-    // No storage here: nothing was remembered.
+  for (const storage of new Set([globalThis.localStorage, window.localStorage].filter(Boolean))) {
+    for (const key of ["autodj.station", "autodj.announceTrackChanges", "autodj.announceTrackChangesEverywhere"]) {
+      try { storage.removeItem(key); } catch { /* No storage here: nothing was remembered. */ }
+    }
   }
   // Real timers first: a fake clock put in after setupApp hands back the
   // tracking wrapper, which the cleanups then remove.
@@ -267,6 +309,7 @@ function cleanupApp() {
 }
 
 afterEach(cleanupApp);
+
 
 describe("app fixture cleanup", () => {
   it("removes microphone permission callbacks from the discarded app", async () => {
@@ -670,7 +713,8 @@ describe("app request behavior", () => {
 
   it("reports a failing saved sink once, not once per devicechange", async () => {
     const deck = {
-      audio: { setSinkId: vi.fn().mockRejectedValue(new Error("device gone")) },
+      audio: { setSinkId: vi.fn((id) => id === "usb-dac"
+        ? Promise.reject(new Error("device gone")) : Promise.resolve()) },
     };
     let deviceChange = null;
     vi.stubGlobal("navigator", {
@@ -692,17 +736,19 @@ describe("app request behavior", () => {
     });
     vi.stubGlobal("HTMLMediaElement", { prototype: { setSinkId() {} } });
 
+    const settings = settingsServer({});
     await setupApp({
       audio: { decks: [deck] },
       initialState: { current_track: { path: "current.mp3", title: "Current" } },
-      onRequest: () => jsonResponse({ ok: true }),
+      onRequest: (url, options) => settings(url, options) || jsonResponse({ ok: true }),
     });
     const status = document.querySelector("#settings-status");
+    const saveStatus = document.querySelector("#spanel-sound .settings-save-status");
     const records = [];
     await vi.waitFor(() =>
       expect(status.textContent).toContain("Could not switch audio device"));
     new window.MutationObserver((r) => records.push(...r))
-      .observe(status, { childList: true, characterData: true, subtree: true });
+      .observe(saveStatus, { childList: true, characterData: true, subtree: true });
 
     // Three USB plug events, same failure every time.
     for (let i = 0; i < 3; i += 1) {
@@ -712,14 +758,60 @@ describe("app request behavior", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(records.filter((r) => r.addedNodes.length > 0)).toHaveLength(0);
 
-    // The user picking the device is a fresh action and must be reported,
-    // even though the sentence has not changed.
-    document.querySelector("#audio-device").value = "usb-dac";
-    document.querySelector("#audio-device")
-      .dispatchEvent(new window.Event("change"));
+    // Picking the system default is a new browser preference edit. Its
+    // successful tab save gets one shared status message.
+    const select = document.querySelector("#audio-device");
+    select.value = "";
+    select.dispatchEvent(new window.Event("change", { bubbles: true }));
+    await saveSettingsControl(select);
     await vi.waitFor(() =>
       expect(records.filter((r) => r.addedNodes.length > 0)).toHaveLength(1));
 
+  });
+
+  it("does not route to an output device when saving its browser preference fails", async () => {
+    let liveRoute = "";
+    const deck = {
+      audio: { setSinkId: vi.fn(async (id) => { liveRoute = id || ""; }) },
+    };
+    vi.stubGlobal("navigator", {
+      mediaDevices: {
+        enumerateDevices: vi.fn().mockResolvedValue([
+          { deviceId: "old-dac", kind: "audiooutput", label: "Old DAC" },
+          { deviceId: "new-dac", kind: "audiooutput", label: "New DAC" },
+        ]),
+        addEventListener: () => {},
+      },
+    });
+    const store = new Map([["autodj.sinkId", "old-dac"]]);
+    vi.stubGlobal("localStorage", {
+      getItem: (key) => store.get(key) ?? null,
+      setItem: (key, value) => {
+        if (key === "autodj.sinkId" && value === "new-dac") throw new Error("storage full");
+        store.set(key, value);
+      },
+      removeItem: (key) => store.delete(key),
+    });
+    vi.stubGlobal("HTMLMediaElement", { prototype: { setSinkId() {} } });
+    const settings = settingsServer({});
+    await setupApp({
+      audio: { decks: [deck] },
+      onRequest: (url, options) => settings(url, options) || jsonResponse({ ok: true }),
+    });
+    const select = document.querySelector("#audio-device");
+    await vi.waitFor(() => expect(liveRoute).toBe("old-dac"));
+    select.value = "new-dac";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+
+    expect(await saveSettingsControl(select)).toBe(false);
+    expect(store.get("autodj.sinkId")).toBe("old-dac");
+    expect(liveRoute).toBe("old-dac");
+    await vi.waitFor(() => expect(document.querySelector("#spanel-sound .settings-save-status").textContent)
+      .toContain("storage full"));
+    document.querySelector("#spanel-sound [data-settings-discard]").click();
+    expect(select.value).toBe("old-dac");
+    expect(liveRoute).toBe("old-dac");
+    expect(deck.audio.setSinkId).not.toHaveBeenCalledWith("new-dac");
   });
 
   it("lets a preview on its own device keep its own volume and mute", async () => {
@@ -743,9 +835,10 @@ describe("app request behavior", () => {
       volume: 0.5,
       is_muted: true,
     };
+    const settings = settingsServer({});
     const { webSocket } = await setupApp({
       initialState: state,
-      onRequest: () => jsonResponse({ ok: true }),
+      onRequest: (url, options) => settings(url, options) || jsonResponse({ ok: true }),
     });
     const preview = document.getElementById("points-preview");
     await vi.waitFor(() => expect(preview.sinkId).toBe("phones"));
@@ -762,7 +855,8 @@ describe("app request behavior", () => {
     // Back on the system default, it follows the page again.
     const select = document.querySelector("#preview-device");
     select.value = "";
-    select.dispatchEvent(new Event("change"));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    await saveSettingsControl(select);
     await vi.waitFor(() => expect(preview.sinkId).toBe(""));
     expect(preview.volume).toBe(document.getElementById("stream-audio").volume);
     expect(preview.volume).toBeLessThan(1);
@@ -793,6 +887,100 @@ describe("app request behavior", () => {
 
     expect(records.filter((r) => r.addedNodes.length > 0)).toHaveLength(1);
     expect(pill.textContent).toBe("Disconnected, retrying");
+  });
+
+  it("says nothing and does not retry when the socket closes as the page unloads", async () => {
+    // A reload said "Disconnected, retrying": Firefox closes the socket
+    // after beforeunload and before pagehide.
+    const { webSocket, WebSocketImpl } = await setupApp({
+      initialState: { current_track: { path: "current.mp3", title: "Current" } },
+      onRequest: () => jsonResponse({ ok: true }),
+    });
+    const pill = document.querySelector("#conn-status");
+    const before = pill.textContent;
+    vi.useFakeTimers();
+    window.dispatchEvent(new Event("beforeunload"));
+    webSocket.onerror();
+    webSocket.onclose({ code: 1001, wasClean: true });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(pill.textContent).toBe(before);
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(pill.textContent).toBe(before);
+    expect(WebSocketImpl).toHaveBeenCalledOnce();
+    // Brought back from the back-forward cache, the page connects again.
+    webSocket.readyState = 3;
+    const shown = new Event("pageshow");
+    Object.defineProperty(shown, "persisted", { value: true });
+    window.dispatchEvent(shown);
+    expect(WebSocketImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("still reports a dropped link when an unload prompt keeps the page", async () => {
+    // The unsaved-settings prompt can cancel the unload; a close held back
+    // after beforeunload must then be said and retried as usual.
+    const { webSocket, WebSocketImpl } = await setupApp({
+      initialState: { current_track: { path: "current.mp3", title: "Current" } },
+      onRequest: () => jsonResponse({ ok: true }),
+    });
+    const pill = document.querySelector("#conn-status");
+    vi.useFakeTimers();
+    window.dispatchEvent(new Event("beforeunload"));
+    webSocket.onclose({ code: 1006, wasClean: false });
+    expect(pill.textContent).not.toBe("Disconnected, retrying");
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(pill.textContent).toBe("Disconnected, retrying");
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(WebSocketImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("says nothing when the leave-page prompt closes and the page then goes", async () => {
+    // The prompt gives focus back as it closes, before pagehide: focus must
+    // not count as staying ("Disconnected, retrying" on a reload with
+    // unsaved settings).
+    const { webSocket, WebSocketImpl } = await setupApp({
+      initialState: { current_track: { path: "current.mp3", title: "Current" } },
+      onRequest: () => jsonResponse({ ok: true }),
+    });
+    const pill = document.querySelector("#conn-status");
+    const before = pill.textContent;
+    vi.useFakeTimers();
+    window.dispatchEvent(new Event("beforeunload"));
+    await vi.advanceTimersByTimeAsync(2500);
+    window.dispatchEvent(new Event("focus"));
+    webSocket.onerror();
+    webSocket.onclose({ code: 1001, wasClean: true });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(pill.textContent).toBe(before);
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(pill.textContent).toBe(before);
+    expect(WebSocketImpl).toHaveBeenCalledOnce();
+  });
+
+  it("waits for focus before saying a drop held while the page may be leaving", async () => {
+    // While the prompt has focus the page may still go; once it has focus
+    // again and no pagehide follows, the drop is said and retried.
+    const { webSocket, WebSocketImpl } = await setupApp({
+      initialState: { current_track: { path: "current.mp3", title: "Current" } },
+      onRequest: () => jsonResponse({ ok: true }),
+    });
+    const pill = document.querySelector("#conn-status");
+    const focus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    vi.useFakeTimers();
+    window.dispatchEvent(new Event("beforeunload"));
+    webSocket.onclose({ code: 1006, wasClean: false });
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(pill.textContent).not.toBe("Disconnected, retrying");
+    focus.mockReturnValue(true);
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(2900);
+    expect(pill.textContent).not.toBe("Disconnected, retrying");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(pill.textContent).toBe("Disconnected, retrying");
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(WebSocketImpl).toHaveBeenCalledTimes(2);
+    focus.mockRestore();
   });
 
   it("backs off between retries instead of hammering every three seconds", async () => {
@@ -1207,16 +1395,21 @@ describe("app request behavior", () => {
   });
 
   it("saves key notation without announcing into the hidden Now Playing panel", async () => {
-    const { fetchImpl } = await setupApp({ onRequest: () => jsonResponse({ ok: true }) });
+    const initial = { playback: { key_notation: "standard", key_prefer_flats: false } };
+    const settings = settingsServer(initial);
+    const { fetchImpl } = await setupApp({ onRequest: (url, options) => settings(url, options) || jsonResponse({ ok: true }) });
+    await applyAppSettings(initial);
     const notation = document.querySelector("#key-notation");
     notation.value = "musical";
-    notation.dispatchEvent(new Event("change"));
+    notation.dispatchEvent(new Event("change", { bubbles: true }));
     const flats = document.querySelector("#key-prefer-flats");
     flats.checked = true;
-    flats.dispatchEvent(new Event("change"));
+    flats.dispatchEvent(new Event("change", { bubbles: true }));
+    await saveSettingsControl(notation);
 
-    await vi.waitFor(() => expect(fetchImpl.mock.calls
-      .filter(([url]) => url === "/api/playback-settings")).toHaveLength(2));
+    expect(fetchImpl.mock.calls.filter(([url, options]) => options?.method === "PATCH"
+      && url.endsWith("/settings")).map(([, options]) => JSON.parse(options.body).changes))
+      .toEqual([{ playback: { key_notation: "musical", key_prefer_flats: true } }]);
     const nowPanel = document.querySelector("#panel-now").textContent;
     expect(nowPanel).not.toContain("Key notation");
     expect(nowPanel).not.toContain("key spelling");
@@ -1328,7 +1521,11 @@ describe("app request behavior", () => {
   });
 
   it("speaks a track change on every tab, only on Now Playing, or not at all", async () => {
-    const { webSocket } = await setupApp();
+    const settings = settingsServer({});
+    vi.stubGlobal("localStorage", window.localStorage);
+    window.localStorage.removeItem("autodj.announceTrackChanges");
+    window.localStorage.removeItem("autodj.announceTrackChangesEverywhere");
+    const { webSocket } = await setupApp({ onRequest: (url, options) => settings(url, options) || jsonResponse({ ok: true }) });
     const region = document.querySelector("#track-announce");
     const choice = document.querySelector("#announce-track-changes");
     const push = (path) => webSocket.onmessage({ data: JSON.stringify({
@@ -1342,13 +1539,16 @@ describe("app request behavior", () => {
     expect(region.textContent).not.toContain("one.mp3");
 
     choice.value = "all";
-    choice.dispatchEvent(new Event("change"));
+    choice.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(await saveSettingsControl(choice)).toBe(true);
+    expect(window.localStorage.getItem("autodj.announceTrackChanges")).toBe("all");
     push("two.mp3");
     expect(region.textContent).toBe("Artist — two.mp3");
 
     document.querySelector("#panel-now").hidden = false;
     choice.value = "off";
-    choice.dispatchEvent(new Event("change"));
+    choice.dispatchEvent(new Event("change", { bubbles: true }));
+    await saveSettingsControl(choice);
     push("three.mp3");
     expect(region.textContent).not.toContain("three.mp3");
   });
@@ -3450,10 +3650,12 @@ describe("stream mode", () => {
       return lyricsFor("a.mp3");
     };
 
-    it("stays hidden in browser mode", async () => {
-      await setupApp();
-      expect(document.getElementById("stream-settings").hidden).toBe(true);
+    it("keeps Settings configuration available in browser mode", async () => {
+      const settings = settingsServer({ stream: { bitrate: 320, continuous: false } });
+      const app = await setupApp({ onRequest: (url, options) => settings(url, options) || jsonResponse({ ok: true }) });
+      expect(document.getElementById("stream-settings").hidden).toBe(false);
       expect(document.getElementById("stream-url").value).toBe("");
+      expect(app.fetchImpl.mock.calls.some(([url]) => url === "/api/stream")).toBe(false);
     });
 
     it("shows the address, playlist link and listener count in stream mode", async () => {
@@ -3466,24 +3668,28 @@ describe("stream mode", () => {
     });
 
     it("sends one quality save for quick arrow presses", async () => {
+      const initial = { stream: { bitrate: 320, continuous: false } };
+      const settings = settingsServer(initial);
       const { fetchImpl } = await setupApp({
         initialState: streamState,
-        onRequest: stationServer({
-          "/api/stream/settings": () => jsonResponse({ ...oldInfo, bitrate: 128 }),
-        }),
+        onRequest: (url, options) => settings(url, options) || stationServer()(url, options),
       });
+      await applyAppSettings(initial);
       const quality = document.getElementById("stream-bitrate");
       await vi.waitFor(() => expect(document.getElementById("stream-url").value)
         .toContain("/stream.mp3"));
       for (const value of ["256", "192", "128"]) {
         quality.value = value;
-        quality.dispatchEvent(new Event("change"));
+        quality.dispatchEvent(new Event("change", { bubbles: true }));
       }
-      const saves = () => fetchImpl.mock.calls.filter(([called]) => called === "/api/stream/settings");
-      await vi.waitFor(() => expect(saves()).toHaveLength(1));
+      const saves = () => fetchImpl.mock.calls.filter(([called, options]) =>
+        called.endsWith("/settings") && options?.method === "PATCH");
+      expect(saves()).toHaveLength(0);
+      await saveSettingsControl(quality);
+      expect(saves()).toHaveLength(1);
       await new Promise((resolve) => setTimeout(resolve, 800));
       expect(saves()).toHaveLength(1);
-      expect(JSON.parse(saves()[0][1].body)).toEqual({ bitrate: 128 });
+      expect(JSON.parse(saves()[0][1].body).changes).toEqual({ stream: { bitrate: 128 } });
     });
 
     it("follows the quality pushed by the server", async () => {
@@ -3524,30 +3730,62 @@ describe("stream mode", () => {
       }
     });
 
-    it("saves the quality and puts it back when the encoder cannot restart", async () => {
-      let bitrateReply = () => jsonResponse({ ...oldInfo, bitrate: 192 });
+    it("says what Opus quality and show-next now do after Save, with focus kept on Save", async () => {
+      const initial = { stream: { bitrate: 320, continuous: false, aac_bitrate: 0, opus_bitrate: 0, show_next: false } };
+      const settings = settingsServer(initial);
+      await setupApp({
+        initialState: streamState,
+        onRequest: (url, options) => settings(url, options) || stationServer()(url, options),
+      });
+      await applyAppSettings(initial);
+      const opus = document.getElementById("stream-opus-bitrate");
+      const showNext = document.getElementById("np-show-next");
+      opus.value = "64";
+      opus.dispatchEvent(new Event("change", { bubbles: true }));
+      showNext.checked = true;
+      showNext.dispatchEvent(new Event("change", { bubbles: true }));
+      const save = document.querySelector("#spanel-stream [data-settings-save]");
+      const status = document.querySelector("#spanel-stream .settings-save-status");
+      save.focus();
+      save.click();
+      await vi.waitFor(() => expect(status.textContent).toContain("Settings saved for"));
+      expect(status.textContent).toContain("Opus stream on at 64 kbps.");
+      expect(status.textContent).toContain("The public now-playing feed now shows the next song.");
+      expect(document.activeElement).toBe(save);
+      expect(save.disabled).toBe(false);
+      expect(save.getAttribute("aria-disabled")).toBe("true");
+    });
+
+    it("retains a quality draft when the encoder cannot restart", async () => {
+      const initial = { stream: { bitrate: 320, continuous: false } };
+      const settings = settingsServer(initial);
       const { fetchImpl } = await setupApp({
         initialState: streamState,
-        onRequest: stationServer({ "/api/stream/settings": () => bitrateReply() }),
+        onRequest: (url, options) => settings(url, options) || stationServer()(url, options),
       });
+      await applyAppSettings(initial);
       const quality = document.getElementById("stream-bitrate");
       await vi.waitFor(() => expect(quality.value).toBe("320"));
       quality.value = "192";
-      quality.dispatchEvent(new Event("change"));
-      await vi.waitFor(() => expect(fetchImpl.mock.calls
-        .filter(([called]) => called === "/api/stream/settings")).toHaveLength(1));
-      const [, options] = fetchImpl.mock.calls.find(([called]) => called === "/api/stream/settings");
-      expect(options.method).toBe("POST");
-      expect(JSON.parse(options.body)).toEqual({ bitrate: 192 });
+      quality.dispatchEvent(new Event("change", { bubbles: true }));
+      expect(fetchImpl.mock.calls.filter(([called, options]) =>
+        called.endsWith("/settings") && options?.method === "PATCH")).toHaveLength(0);
+      expect(await saveSettingsControl(quality)).toBe(true);
+      const saves = () => fetchImpl.mock.calls.filter(([called, options]) =>
+        called.endsWith("/settings") && options?.method === "PATCH");
+      expect(saves()).toHaveLength(1);
+      expect(JSON.parse(saves()[0][1].body).changes).toEqual({ stream: { bitrate: 192 } });
       await settle();
       expect(quality.value).toBe("192");
 
-      bitrateReply = () => jsonResponse({ detail: "stream encoder failed" }, 503);
+      settings.failNext({ detail: "stream encoder failed" }, 503);
       quality.value = "128";
-      quality.dispatchEvent(new Event("change"));
-      await vi.waitFor(() => expect(document.getElementById("settings-status").textContent)
-        .toBe("Could not save Quality; it is still 192 kbps. stream encoder failed"));
-      await vi.waitFor(() => expect(quality.value).toBe("192"));
+      quality.dispatchEvent(new Event("change", { bubbles: true }));
+      expect(await saveSettingsControl(quality)).toBe(false);
+      await vi.waitFor(() => expect(document.querySelector("#spanel-stream .settings-save-status").textContent)
+        .toContain("stream encoder failed"));
+      expect(quality.value).toBe("128");
+      expect(saves()).toHaveLength(2);
     });
   });
 });
@@ -3814,16 +4052,19 @@ describe("several stations (#70)", () => {
     window.history.replaceState(null, "", "/");
   });
 
+  // Opens the list unless a switch that did not happen left it open, then
+  // presses Night Owl.
   function chooseOwl() {
     const button = document.getElementById("station-button");
-    button.focus();
-    button.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    // Keys go where focus is: from the checked AutoDJ down to Night Owl.
-    const press = (key) => document.activeElement.dispatchEvent(
-      new KeyboardEvent("keydown", { key, bubbles: true }));
-    press("ArrowDown");
+    if (button.getAttribute("aria-expanded") !== "true") {
+      button.focus();
+      button.click();
+      // Keys go where focus is: from the current AutoDJ down to Night Owl.
+      document.activeElement.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    }
     expect(document.activeElement.dataset.station).toBe("nightowl");
-    press("Enter");
+    document.activeElement.click();
   }
 
   it("shows no switcher and changes nothing with one station", async () => {
@@ -3865,21 +4106,44 @@ describe("several stations (#70)", () => {
     first.onclose({ code: 1000, wasClean: true });
     expect(document.getElementById("conn-status").textContent).not.toMatch(/Disconnected/);
 
-    // Named everywhere a reader looks; focus stays on the switcher.
-    expect(document.activeElement.id).toBe("station-button");
+    // Named everywhere a reader looks; focus goes back to the switcher
+    // once the list's delayed close has run.
+    await vi.waitFor(() => expect(document.activeElement.id).toBe("station-button"));
     expect(document.getElementById("page-heading").textContent).toBe("AutoDJ: Night Owl Radio");
     expect(document.title).toBe("Owl - Hoot - Night Owl Radio - AutoDJ");
     expect(document.getElementById("shared-context").textContent).toBe("Shared by all stations");
     // Only the heading names the station; panels and the main region do not repeat it.
     expect(document.getElementById("main-content").hasAttribute("aria-label")).toBe(false);
     expect(document.getElementById("panel-queue").getAttribute("aria-labelledby")).toBe("tab-queue");
-    expect(document.querySelector('[data-station="nightowl"]').getAttribute("aria-checked")).toBe("true");
+    expect(document.querySelector('[data-station="nightowl"]').getAttribute("aria-current")).toBe("true");
+    expect(document.querySelector('[data-station="default"]').hasAttribute("aria-current")).toBe(false);
+    expect(document.getElementById("station-list").hidden).toBe(true);
     expect(location.search).toBe("?station=nightowl");
     // Its own public feed and status page, not the default station's.
     expect(document.getElementById("np-url").value).toMatch(/\/api\/stations\/nightowl\/nowplaying$/);
     expect(document.getElementById("np-status-open").getAttribute("href")).toBe("/stations/nightowl/status");
     await vi.waitFor(() => expect(said.join(" | ")).toContain(
       "Night Owl Radio. Playing Owl — Hoot. On air, 3 listeners."));
+    // Said once.
+    expect(said.filter((text) => text.startsWith("Night Owl Radio."))).toHaveLength(1);
+  });
+
+  it("only closes the list when the current station is chosen (#576)", async () => {
+    const app = await setupApp({ stations: [AUTODJ, OWL], onRequest: owlRequests });
+    const sockets = trackSockets(app.WebSocketImpl);
+    const said = spoken();
+    const button = document.getElementById("station-button");
+    button.focus();
+    button.click();
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(document.activeElement.dataset.station).toBe("default");
+    document.activeElement.click();
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    await vi.waitFor(() => expect(document.getElementById("station-list").hidden).toBe(true));
+    expect(document.activeElement).toBe(button);
+    expect(sockets).toHaveLength(0);
+    expect(location.search).toBe("");
+    expect(said).toEqual([]);
   });
 
   it("says a dropped link that comes inside the switch's quiet second (#327)", async () => {
@@ -3906,17 +4170,20 @@ describe("several stations (#70)", () => {
   });
 
   it("says a switch once: not the song line, and not Live when the socket opens (#327)", async () => {
+    const settings = settingsServer({});
     const app = await setupApp({
       initialState: { current_track: { path: "a.mp3", artist: "A", title: "B" } },
       stations: [AUTODJ, OWL],
-      onRequest: owlRequests,
+      onRequest: (url, options) => settings(url, options) || owlRequests(url, options),
     });
     const sockets = trackSockets(app.WebSocketImpl);
     const said = spoken();
     const pill = document.getElementById("conn-status");
     const song = document.getElementById("track-announce");
     document.getElementById("announce-track-changes").value = "all";
-    document.getElementById("announce-track-changes").dispatchEvent(new Event("change"));
+    const announceChoice = document.getElementById("announce-track-changes");
+    announceChoice.dispatchEvent(new Event("change", { bubbles: true }));
+    await saveSettingsControl(announceChoice);
     // The pill said something else before: the words "Live" would be news.
     pill.textContent = "Off air";
     const written = [];
@@ -3984,14 +4251,10 @@ describe("several stations (#70)", () => {
   });
 
   it("loads and edits saved playback settings while the selected station is stopped", async () => {
-    const playback = { hour_fit: true, hour_fit_window_minutes: 12 };
+    const initial = { playback: { hour_fit: true, hour_fit_window_minutes: 12 } };
+    const settings = settingsServer(initial);
     const onRequest = (url, options) => {
-      if (url === "/api/stations/nightowl/settings") return jsonResponse({ playback });
-      if (url === "/api/stations/nightowl/playback-settings") {
-        Object.assign(playback, JSON.parse(options.body));
-        return jsonResponse({ playback });
-      }
-      return owlRequests(url, options);
+      return settings(url, options) || owlRequests(url, options);
     };
     const app = await setupApp({
       stations: [AUTODJ, OWL],
@@ -4009,15 +4272,18 @@ describe("several stations (#70)", () => {
     expect(app.fetchImpl.mock.calls.map(([url]) => url))
       .toContain("/api/stations/nightowl/settings");
     await vi.waitFor(() => expect(fit.checked).toBe(true));
+    await applyAppSettings(initial);
     expect(fitWindow.value).toBe("12");
     expect(fit.disabled).toBe(false);
     expect(fitWindow.disabled).toBe(false);
 
     fitWindow.value = "9";
     fitWindow.dispatchEvent(new Event("change", { bubbles: true }));
-    await vi.waitFor(() => expect(playback.hour_fit_window_minutes).toBe(9));
-    expect(app.fetchImpl.mock.calls.map(([url]) => url))
-      .toContain("/api/stations/nightowl/playback-settings");
+    expect(await saveSettingsControl(fitWindow)).toBe(true);
+    const writes = app.fetchImpl.mock.calls.filter(([url, options]) => url.endsWith("/settings")
+      && options?.method === "PATCH");
+    expect(writes).toHaveLength(1);
+    expect(JSON.parse(writes[0][1].body).changes).toEqual({ playback: { hour_fit_window_minutes: 9 } });
     expect(fit.disabled).toBe(false);
   });
 
@@ -4158,7 +4424,7 @@ describe("several stations (#70)", () => {
     }
   });
 
-  it("leaves focus on the Station button after the question, answered either way", async () => {
+  it("puts focus back on the station after No, and on the Station button after Yes", async () => {
     const clockwheelPath = "../../src/autodj/static/modules/clockwheel-panel.js";
     vi.doMock(clockwheelPath, async () => ({
       ...(await vi.importActual(clockwheelPath)),
@@ -4184,22 +4450,29 @@ describe("several stations (#70)", () => {
         confirm.dispatchEvent(new Event("close"));
       });
       const button = document.getElementById("station-button");
+      const owl = document.querySelector('#station-list [data-station="nightowl"]');
 
+      // The list stays open while the question is asked, so No puts focus
+      // back on the station chosen, with the list still open.
       chooseOwl();
       await vi.waitFor(() => expect(confirm.showModal).toHaveBeenCalledOnce());
-      expect(opener).toBe(button);
+      expect(opener).toBe(owl);
       expect(document.activeElement).toBe(document.getElementById("confirm-cancel"));
       document.getElementById("confirm-cancel").click();
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(document.activeElement).toBe(button);
+      expect(document.activeElement).toBe(owl);
+      expect(button.getAttribute("aria-expanded")).toBe("true");
 
+      // Yes switches; the list closes and focus goes to the renamed button.
       chooseOwl();
       await vi.waitFor(() => expect(confirm.showModal).toHaveBeenCalledTimes(2));
       document.getElementById("confirm-accept").click();
       await vi.waitFor(() => expect(sockets).toHaveLength(1));
       await vi.waitFor(() => expect(document.getElementById("page-heading").textContent)
         .toBe("AutoDJ: Night Owl Radio"));
-      expect(document.activeElement).toBe(button);
+      await vi.waitFor(() => expect(document.activeElement).toBe(button));
+      expect(button.getAttribute("aria-expanded")).toBe("false");
+      expect(document.getElementById("station-list").hidden).toBe(true);
     } finally {
       vi.doUnmock(clockwheelPath);
     }
@@ -4248,7 +4521,9 @@ describe("several stations (#70)", () => {
       .toBe("AutoDJ is reconnecting. Choose the station again once it is back."));
     expect(sockets).toHaveLength(0);
     expect(document.getElementById("page-heading").textContent).toBe("AutoDJ");
-    expect(document.activeElement.id).toBe("station-button");
+    // No switch: the list stays open on the station, to choose again.
+    expect(document.activeElement.dataset.station).toBe("nightowl");
+    expect(document.getElementById("station-button").getAttribute("aria-expanded")).toBe("true");
   });
 
   it("keeps Listen here on the station it started on, and says so", async () => {
@@ -4342,9 +4617,9 @@ describe("several stations: the first station (#70 review)", () => {
     await setupApp({ stations: [AUTODJ, OWL], onRequest: owlStatus });
     const button = document.getElementById("station-button");
     button.focus();
-    button.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    button.click();
     document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
-    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    document.activeElement.click();
     await vi.waitFor(() => expect(storage.values.get("autodj.station")).toBe("nightowl"));
   });
 });

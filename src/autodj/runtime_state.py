@@ -83,7 +83,7 @@ BREAK_SETTING_KEYS = (
 )
 
 #: Saved under ``playback`` but set by their own routes (``/api/volume``,
-#: ``/api/mute``, ``/api/stream/settings``).
+#: ``/api/mute``, ``PATCH /api/settings``).
 _OWN_ROUTE_PLAYBACK_FIELDS = frozenset(
     {
         "volume",
@@ -512,10 +512,11 @@ def load_into_bridge(bridge: PlayerBridge, index_dir: Path | None) -> None:
     """Compatibility wrapper for callers that still hold a PlayerBridge."""
     bridge.settings.paths = bridge.paths or bridge.settings.paths
     load_into_settings(bridge.settings, index_dir)
-    bridge.settings.sync_to_player()
 
 
-def save_from_player(settings: dict, index_dir: Path | None) -> None:
+def save_from_player(
+    settings: dict, index_dir: Path | None, *, raise_on_error: bool = False
+) -> None:
     """Write *settings* (PlayerBridge.get_settings shape) to disk atomically.
 
     The ``available_presets`` list and the playback values no settings route
@@ -530,7 +531,11 @@ def save_from_player(settings: dict, index_dir: Path | None) -> None:
         return
     playback = settings.get("playback", {})
     persisted_playback = (
-        {key: value for key, value in playback.items() if key in PERSISTED_PLAYBACK_FIELDS}
+        {
+            key: value
+            for key, value in playback.items()
+            if key in PERSISTED_PLAYBACK_FIELDS and key != "pure_shuffle"
+        }
         if isinstance(playback, dict)
         else {}
     )
@@ -552,3 +557,5 @@ def save_from_player(settings: dict, index_dir: Path | None) -> None:
         atomic_write(path, json.dumps(payload, indent=2, ensure_ascii=False))
     except OSError as exc:
         logger.warning("Failed to save web_state.json: %s", exc)
+        if raise_on_error:
+            raise

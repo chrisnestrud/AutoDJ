@@ -27,7 +27,6 @@ class StationSettings:
         self.player: Any = None
         self._preset: Any = None
         self._bpm_range: tuple[float, float] | None = None
-        self._pure_shuffle = False
         self._anchor_to_seed = False
         self._eq_low = self._eq_mid = self._eq_high = 1.0
         self._discovery_every = getattr(cfg.playback, "discovery_every", None)
@@ -50,24 +49,6 @@ class StationSettings:
         player._state.discovery_enabled = (
             self._discovery_enabled and self._discovery_every is not None
         )
-        self.sync_to_player()
-
-    def sync_to_player(self) -> None:
-        """Mirror state to legacy duck-typed player fixtures; real Player properties alias us."""
-        if self.player is None:
-            return
-        for name in (
-            "_preset",
-            "_bpm_range",
-            "_pure_shuffle",
-            "_anchor_to_seed",
-            "_eq_low",
-            "_eq_mid",
-            "_eq_high",
-            "_discovery_every",
-        ):
-            if not isinstance(getattr(type(self.player), name, None), property):
-                setattr(self.player, name, getattr(self, name))
 
     @property
     def state_dir(self) -> Path | None:
@@ -85,14 +66,14 @@ class StationSettings:
         """Compatibility name shared with PlayerBridge."""
         self.load()
 
-    def save(self) -> None:
+    def save(self, *, strict: bool = False) -> None:
         from autodj.runtime_state import save_from_player
 
-        save_from_player(self.get_settings(), self.state_dir)
+        save_from_player(self.get_settings(), self.state_dir, raise_on_error=strict)
 
-    def save_persistent_state(self) -> None:
+    def save_persistent_state(self, *, strict: bool = False) -> None:
         """Compatibility name shared with PlayerBridge."""
-        self.save()
+        self.save(strict=strict)
 
     def get_settings(self) -> dict[str, Any]:
         """Return the same settings document shape served by PlayerBridge."""
@@ -129,8 +110,8 @@ class StationSettings:
                 "fade_in_seconds": pb.fade_in_seconds,
                 "music_speed_percent": float(pb.music_speed_percent),
                 "crossfade_eq_duck": pb.crossfade_eq_duck,
-                "pure_shuffle": self._pure_shuffle,
-                "pick_mode": "random" if self._pure_shuffle else pb.pick_mode,
+                "pure_shuffle": pb.pick_mode == "random",
+                "pick_mode": pb.pick_mode,
                 "anchor_to_seed": self._anchor_to_seed,
                 "replaygain_enabled": cfg.replaygain.enabled,
                 "loudness_processing": pb.loudness_processing
@@ -216,7 +197,77 @@ class StationSettings:
             "eq": self.get_eq(),
         }
 
-    def set_preset(self, name: str | None) -> None:
+    def editable_values(self) -> dict[str, dict[str, Any]]:
+        """Return stable bodies for editable groups, without runtime status fields."""
+        from autodj.settings_bodies import DjMixBody, PlaybackSettingsBody
+
+        settings = self.get_settings()
+        playback = settings["playback"]
+        return {
+            "preset": {"name": settings["preset"]},
+            "transition": {"effect": settings["transition"]},
+            "djmix": {
+                key: value
+                for key, value in settings["djmix"].items()
+                if key in DjMixBody.model_fields and value is not None
+            },
+            "playback": {
+                key: value
+                for key, value in playback.items()
+                if key in PlaybackSettingsBody.model_fields and value is not None
+            },
+            "bpm_range": settings["bpm_range"],
+            "discovery": {"every": settings["discovery_every"]},
+            "eq": settings["eq"],
+        }
+
+    def apply_settings_patch(self, changes: Any) -> None:
+        """Apply validated groups and persist them through the station settings store."""
+        from autodj.presets import get_preset
+        from autodj.settings_bodies import StationSettingsChangesBody
+        from autodj.transitions import TRANSITION_EFFECT_NAMES
+
+        patch = StationSettingsChangesBody.model_validate(changes)
+        if not any(
+            getattr(patch, name) is not None for name in StationSettingsChangesBody.model_fields
+        ):
+            raise ValueError("At least one settings group is required")
+        with self._lock:
+            if patch.preset is not None and patch.preset.name:
+                get_preset(patch.preset.name, self.cfg.presets)
+            if patch.transition is not None and patch.transition.effect.lower() not in (
+                TRANSITION_EFFECT_NAMES
+            ):
+                raise ValueError(f"unknown transition effect: {patch.transition.effect}")
+
+            # Playback is the only setter here that can reject file-backed choices;
+            # run it before the simple in-memory groups so validation cannot leave a
+            # subset applied.
+            if patch.playback is not None:
+                self.set_playback_settings(patch.playback, refresh=False)
+            if patch.preset is not None:
+                self.set_preset(patch.preset.name, refresh=False)
+            if patch.transition is not None:
+                self.set_transition(patch.transition.effect)
+            if patch.djmix is not None:
+                self.set_djmix(**patch.djmix.model_dump(exclude_none=True))
+            if patch.bpm_range is not None:
+                self.set_bpm_range(patch.bpm_range.lo, patch.bpm_range.hi)
+            if patch.discovery is not None:
+                self.set_discovery_every(patch.discovery.every, refresh=False)
+            if patch.eq is not None:
+                self.set_eq(**patch.eq.model_dump(exclude_none=True))
+            self.save(strict=True)
+            if (
+                self.player is not None
+                and any(
+                    getattr(patch, name) is not None for name in ("playback", "preset", "discovery")
+                )
+                and (refresh_playout := getattr(self.player, "refresh_playout", None))
+            ):
+                refresh_playout()
+
+    def set_preset(self, name: str | None, *, refresh: bool = True) -> None:
         if not name:
             self._preset = None
         else:
@@ -228,9 +279,12 @@ class StationSettings:
                 return
             if self._preset.discovery_every and self._discovery_every is None:
                 self._discovery_every = self._preset.discovery_every
-        if self.player is not None and (refresh := getattr(self.player, "refresh_playout", None)):
-            refresh()
-        self.sync_to_player()
+        if (
+            refresh
+            and self.player is not None
+            and (refresh_playout := getattr(self.player, "refresh_playout", None))
+        ):
+            refresh_playout()
 
     def set_transition(self, effect: str) -> None:
         from autodj.transitions import TRANSITION_EFFECT_NAMES
@@ -257,8 +311,17 @@ class StationSettings:
             elif hasattr(self.cfg.djmix, key):
                 setattr(self.cfg.djmix, key, bool(value))
 
-    def set_playback_settings(self, body: PlaybackSettingsBody, *, restoring: bool = False) -> None:
+    def set_playback_settings(
+        self,
+        body: PlaybackSettingsBody,
+        *,
+        restoring: bool = False,
+        refresh: bool = True,
+    ) -> None:
         values = body.model_dump(exclude_none=True)
+        legacy_shuffle = values.pop("pure_shuffle", None)
+        if legacy_shuffle is not None and "pick_mode" not in values:
+            values["pick_mode"] = "random" if legacy_shuffle else "similarity"
         from autodj.settings_bodies import validate_playback_choices
 
         validate_playback_choices(values)
@@ -280,7 +343,6 @@ class StationSettings:
             if related_tracks is not None:
                 self._related_tracks, self.related_tracks_problem = related_tracks
             targets = {
-                "pure_shuffle": (self, "_pure_shuffle"),
                 "anchor_to_seed": (self, "_anchor_to_seed"),
                 "replaygain_enabled": (self.cfg.replaygain, "enabled"),
                 "replaygain_target_db": (self.cfg.replaygain, "target_db"),
@@ -290,12 +352,8 @@ class StationSettings:
             for key, value in values.items():
                 target, attr = targets.get(key, (self.cfg.playback, key))
                 setattr(target, attr, value)
-            if "pick_mode" in values:
-                self._pure_shuffle = values["pick_mode"] == "random"
-                if values["pick_mode"] == "clock":
-                    self.cfg.playback.transition_mode = "saved_points"
-            elif "pure_shuffle" in values:
-                self.cfg.playback.pick_mode = "random" if values["pure_shuffle"] else "similarity"
+            if values.get("pick_mode") == "clock":
+                self.cfg.playback.transition_mode = "saved_points"
             if "loudness_processing" in values:
                 self.cfg.replaygain.enabled = values["loudness_processing"] == "replaygain"
             elif "replaygain_enabled" in values:
@@ -333,23 +391,23 @@ class StationSettings:
                     from autodj.player import apply_repeat_windows
 
                     apply_repeat_windows(player)
-            self.sync_to_player()
         if player is not None:
             picking_changed = any(hasattr(self.cfg.playback, key) for key in values) or bool(
-                {"pure_shuffle", "anchor_to_seed"} & values.keys()
+                {"pick_mode", "anchor_to_seed"} & values.keys()
             )
             if (
                 picking_changed
                 and not restoring
-                and (refresh := getattr(player, "refresh_playout", None))
+                and refresh
+                and (refresh_playout := getattr(player, "refresh_playout", None))
             ):
-                refresh()
+                refresh_playout()
             if (
                 "repeat_rules" in values
                 and (ledger := getattr(player, "_ledger", None)) is not None
                 and hasattr(ledger, "recent_plays")
             ):
-                player.restore_repeat_history(ledger, refresh=True)
+                player.restore_repeat_history(ledger, refresh=refresh)
 
     def _read_related_artists(self, body: PlaybackSettingsBody, *, restoring: bool) -> Any:
         if body.repeat_rules is None:
@@ -405,9 +463,10 @@ class StationSettings:
 
     def set_bpm_range(self, lo: float | None, hi: float | None) -> None:
         self._bpm_range = None if lo is None or hi is None or lo >= hi else (lo, hi)
-        self.sync_to_player()
 
-    def set_discovery_every(self, every: int | None, *, restoring: bool = False) -> None:
+    def set_discovery_every(
+        self, every: int | None, *, restoring: bool = False, refresh: bool = True
+    ) -> None:
         self._discovery_every = None if every is None or every <= 0 else int(every)
         if every is not None and every > 0:
             self._discovery_enabled = True
@@ -415,9 +474,12 @@ class StationSettings:
             self._discovery_enabled = False
         if self.player is not None:
             self.player._state.discovery_enabled = self._discovery_enabled
-            if not restoring and (refresh := getattr(self.player, "refresh_playout", None)):
-                refresh()
-        self.sync_to_player()
+            if (
+                not restoring
+                and refresh
+                and (refresh_playout := getattr(self.player, "refresh_playout", None))
+            ):
+                refresh_playout()
 
     def set_volume(self, volume: float) -> None:
         self._volume = max(0.0, min(1.0, volume))
@@ -444,7 +506,6 @@ class StationSettings:
             self._eq_mid = max(0.0, min(2.0, mid))
         if high is not None:
             self._eq_high = max(0.0, min(2.0, high))
-        self.sync_to_player()
         return self.get_eq()
 
     def get_eq(self) -> dict[str, float]:
@@ -458,5 +519,4 @@ class StationSettings:
         self._discovery_enabled = not self._discovery_enabled
         if self.player is not None:
             self.player._state.discovery_enabled = self._discovery_enabled
-        self.sync_to_player()
         return self._discovery_enabled

@@ -212,13 +212,14 @@
     #conn-status.connecting  { background: #e67e22; color: #000; }
     #conn-status.error       { background: var(--danger);  color: #fff; }
 
-    /* Station switcher (#70): a menu button in the banner.  The banner
-       wraps so the button never pushes the page sideways at 320 px. */
+    /* Station switcher (#70, #576): a disclosure in the banner, its list
+       of station buttons drawn as a panel under the Station button.  The
+       banner wraps so the button never pushes the page sideways at 320 px. */
     header { flex-wrap: wrap; }
     .station-switcher { position: relative; }
     #station-button .station-switcher-name { font-weight: 600; }
     #station-button .station-switcher-caret { margin-left: 0.25rem; }
-    #station-menu {
+    #station-list {
       position: absolute;
       top: calc(100% + 0.25rem);
       left: 0;
@@ -232,35 +233,46 @@
       border: 1px solid var(--control-border);
       border-radius: var(--radius);
     }
+    /* Each station is a button drawn as a row of the panel.  It keeps the
+       control border, so its boundary is 3:1 like every other button's
+       (WCAG 1.4.11), and the rows are spaced so the borders stay apart. */
+    #station-list > li + li { margin-top: 0.25rem; }
     .station-switcher-item {
       display: flex;
       align-items: center;
       gap: 0.5rem;
+      width: 100%;
       min-height: 44px;
       padding: 0.5rem 0.75rem;
+      background: transparent;
+      color: inherit;
+      border: 1px solid var(--control-border);
       border-radius: var(--radius);
+      font: inherit;
+      text-align: left;
       cursor: pointer;
     }
-    /* The checked station is marked by shape as well as by state: a tick
-       before its name, and room for one before the others (WCAG 1.4.1). */
+    /* The current station is marked by shape as well as by state: a tick
+       before its name, and room for one before the others (WCAG 1.4.1).
+       The tick's alt text is empty: aria-current already says it. */
     .station-switcher-item::before {
       content: "";
       flex: 0 0 1rem;
     }
-    .station-switcher-item[aria-checked="true"]::before { content: "\2713" / ""; }
-    .station-switcher-item[aria-checked="true"] { font-weight: 600; }
+    .station-switcher-item[aria-current="true"]::before { content: "\2713" / ""; }
+    .station-switcher-item[aria-current="true"] { font-weight: 600; }
     .station-switcher-item:hover,
     .station-switcher-item:focus {
       background: var(--tab-hover-bg);
       color: var(--tab-hover-text);
     }
     .station-switcher-item:focus-visible { outline-offset: -2px; }
-    /* On a phone the menu spans the banner, so a long station name never
+    /* On a phone the list spans the banner, so a long station name never
        pushes it past the right edge (WCAG 1.4.10). */
     @media (max-width: 40rem) {
       header { position: relative; }
       .station-switcher { position: static; }
-      #station-menu {
+      #station-list {
         top: auto;
         left: 0.75rem;
         right: 0.75rem;
@@ -433,18 +445,28 @@
       content: "\2713" / "";
       font-weight: 700;
     }
-    /* .is-pending: a focused button or checkbox busy with a request
-       keeps focus and stays enabled (see withDisabled in
-       modules/api-client.js) but must look busy.  aria-disabled is the
-       history pager's Prev / Next, and the show-next box in DMCA mode. */
+    /* Unavailable controls are dimmed.  aria-disabled is the history
+       pager's Prev / Next, and the show-next box in DMCA mode. */
     button:disabled,
     button[aria-disabled="true"],
-    input[type="checkbox"][aria-disabled="true"],
-    button.is-pending,
-    input[type="checkbox"].is-pending {
+    input[type="checkbox"][aria-disabled="true"] {
       opacity: 0.45;
       cursor: not-allowed;
     }
+    /* .is-pending: a focused button or checkbox busy with a request keeps
+       focus and stays enabled (see withDisabled in modules/api-client.js),
+       so its text and boundary keep their full contrast (WCAG 1.4.3 and
+       1.4.11): it was dimmed like a disabled control, and a Save changes
+       button mid-save measured under 4.5:1.  It looks busy without colour:
+       the progress cursor, and a button's border turns dashed, which
+       forced colours keep too.  The class is only visual; what the press
+       did is said when it settles. */
+    button.is-pending,
+    input[type="checkbox"].is-pending {
+      opacity: 1;
+      cursor: progress;
+    }
+    button.is-pending { border-style: dashed; }
 
     input:not([type="checkbox"]):not([type="radio"]),
     select,
@@ -1255,7 +1277,6 @@
     .settings-row label {
       min-width: 10rem;
     }
-    .music-speed-slider-row label { min-width: 0; }
     .settings-row input[type="number"] {
       width: 6rem;
     }
@@ -1842,7 +1863,6 @@
       .settings-row > *:not(input[type="checkbox"]) {
         width: 100%;
       }
-      #main-content .music-speed-slider-row > label { width: 1px; }
       .settings-row select,
       .settings-row input[type="number"],
       .settings-row input[type="text"] {
@@ -2276,6 +2296,10 @@ dialog h1 { font-size: 1.5em; }
 .editor-dialog {
   max-height: calc(100vh - 2rem);
   overflow-y: auto;
+  /* Firefox does not scroll a focused control that is partly hidden
+     under the dialog's bottom padding; with the padding as scroll
+     padding, Tab brings Save and Cancel fully into view (2.4.11). */
+  scroll-padding-block: 1.25rem;
 }
 .editor-dialog .dialog-actions {
   margin-top: var(--control-gap);
@@ -2298,3 +2322,15 @@ dialog h1 { font-size: 1.5em; }
 .path-picker #path-picker-location { overflow-wrap: anywhere; }
 .browse-button { margin-inline-start: var(--control-gap); }
 #track-info-error { margin: 0.5rem 0 1rem; color: var(--error-text); }
+
+/* Keep a tab's save action reachable without covering keyboard focus. */
+.settings-save-bar {
+  border-top: 1px solid var(--border);
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+}
+.settings-dirty:not(:focus) { outline: 2px dashed currentColor; outline-offset: 2px; }
+/* An empty save status stays rendered, without its margin.  Hidden until its
+   words arrive, it was a new region each time, and NVDA in Firefox said
+   nothing. */
+.settings-save-status:empty { margin: 0; }

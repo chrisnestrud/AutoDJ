@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -542,3 +543,382 @@ def test_each_station_keeps_its_own_categories(tmp_path: Path) -> None:
     assert store_path(cfg) == tmp_path / "stations" / "default" / "categories.json"
     owl = StationPaths.for_station(cfg, "owl")
     assert store_path(cfg, owl) == tmp_path / "stations" / "owl" / "categories.json"
+
+
+def test_a_new_music_category_follows_the_clock(tmp_path, monkeypatch):
+    """ADR-0009-07: songs added within the last N days, worked out again as the hours pass."""
+    music = tmp_path / "music"
+    songs = [song(music / f"{n}.flac") for n in range(3)]
+    now = [1_760_000_000 // 3600 * 3600 + 900]
+    day = 86400
+    db = tmp_path / "library.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, path BLOB, title TEXT, added REAL, mtime REAL)"
+    )
+    conn.executemany(
+        "INSERT INTO items (id, path, title, added, mtime) VALUES (?, ?, ?, ?, ?)",
+        [
+            (1, b"0.flac", "Old", now[0] - 90 * day, now[0] - 90 * day),
+            (2, b"1.flac", "Recent", now[0] - 20 * day, now[0] - 20 * day),
+            (3, b"2.flac", "New", now[0] - day, now[0] - 2 * day),
+        ],
+    )
+    conn.execute(
+        "CREATE TABLE item_attributes (id INTEGER PRIMARY KEY, entity_id INTEGER, key TEXT, "
+        "value TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    index = CategoryIndex(config(tmp_path, beets_db=db), Entries(songs), clock=lambda: now[0])
+    new_music = parse_spec(
+        {
+            "name": "New music",
+            "source": "filters",
+            "conditions": [
+                {"field": "beets", "name": "added", "operator": "within_days", "value": 30}
+            ],
+        }
+    )
+    index.save([Category(id="new", **new_music.model_dump())])
+    saved = json.loads(index.store.path.read_text(encoding="utf-8"))
+    # The file keeps the number of days, not a date worked out when it was saved.
+    assert saved["categories"][0]["conditions"][0]["value"] == 30
+
+    import autodj.categories as module
+
+    runs = []
+    real = module.resolve_checked
+    monkeypatch.setattr(module, "resolve_checked", lambda *a, **k: runs.append(1) or real(*a, **k))
+    assert index.members()["new"][1] == {songs[1].path, songs[2].path}
+    signature = index.cache_signature()
+    now[0] += 1800  # The same hour: nothing is worked out again.
+    assert index.members()["new"][1] == {songs[1].path, songs[2].path}
+    assert index.cache_signature() == signature
+    assert len(runs) == 1
+    now[0] += 11 * day  # The recent song is now 31 days old.
+    assert index.members()["new"][1] == {songs[2].path}
+    assert index.cache_signature() != signature
+    assert len(runs) == 2
+    # The Check button judges an unsaved category at the same time.
+    by_mtime = parse_spec(
+        {
+            "name": "Changed this week",
+            "source": "filters",
+            "conditions": [
+                {"field": "beets", "name": "mtime", "operator": "within_days", "value": 7}
+            ],
+        }
+    )
+    now[0] -= 11 * day
+    assert index.check(by_mtime).paths == {songs[2].path}
+
+
+def test_a_category_without_relative_dates_ignores_the_hour(tmp_path):
+    songs = [song(tmp_path / "music" / "0.flac", genre="Rock")]
+    now = [1_760_000_000.0]
+    index = CategoryIndex(config(tmp_path), Entries(songs), clock=lambda: now[0])
+    index.save([query("Rock", "genre:rock")])
+    signature = index.cache_signature()
+    now[0] += 7 * 86400
+    assert index.cache_signature() == signature
+
+
+def test_the_clockwheel_and_every_station_read_beets_once(tmp_path, monkeypatch):
+    """ADR-0008-35, ADR-0009-10. One Beets read per change serves the clock and all stations."""
+    import autodj.beets as beets
+    from autodj.clock_condition_data import BeetsConditions
+
+    music = tmp_path / "music"
+    songs = [song(music / f"{n}.flac") for n in range(3)]
+    db = make_beets(
+        tmp_path / "library.db",
+        [(1, b"0.flac", "Zero", "Rock", 1985, 1985), (2, b"1.flac", "One", "Pop", 1995, 1995)],
+        [(1, "mood", "happy"), (2, "mood", "sad")],
+    )
+    cfg = config(tmp_path, beets_db=db)
+    entries = Entries(songs)
+    reads = []
+    real = beets.read_items
+    monkeypatch.setattr(
+        beets, "read_items", lambda path, fields: reads.append(set(fields)) or real(path, fields)
+    )
+    shared = BeetsConditions(cfg, entries)
+    shared.want(["mood"])  # the clockwheel's Beets conditions, announced when it loads
+    stations = [
+        CategoryIndex(cfg, entries, path=tmp_path / name / "categories.json", beets=shared)
+        for name in ("one", "two")
+    ]
+    for index in stations:
+        index.save([query("Rock", "genre:rock")])
+        assert index.members() == {"c1": ("Rock", frozenset({songs[0].path}))}
+    _names, values, error = shared.snapshot(["mood"])
+    from autodj.catalog import normalize_path
+
+    assert error is None and values[normalize_path(songs[0].path)]["mood"] == "happy"
+    assert len(reads) == 1 and {"genre", "mood"} <= reads[0]
+
+    # A song's tags or analysis changed: the same songs, so Beets is not read again.
+    entries.value = (*entries.value,)
+    for index in stations:
+        index.members()
+    assert shared.snapshot(["mood"])[1] is values
+    assert len(reads) == 1
+
+    # Songs were added and removed: the values read are counted against the
+    # new songs, and Beets is not read again (a removal cost a full read before).
+    entries.value = (*entries.value[1:], song(music / "3.flac"))
+    for index in stations:
+        assert index.members() == {"c1": ("Rock", frozenset())}
+    assert shared.snapshot(["mood"])[1] is values
+    assert len(reads) == 1
+    check = shared.read()[2]
+    assert check is not None and (check.library, check.matched) == (3, 1)
+    from autodj.beets_paths import latest
+
+    assert latest(cfg) == check  # what the library page shows, without a read of its own
+
+    # The database changed: the first reader reads every field again, once.
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE items SET genre = 'Rock' WHERE id = 2")
+    conn.commit()
+    conn.close()
+    os.utime(db, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
+    for index in stations:
+        assert index.members() == {"c1": ("Rock", frozenset({songs[1].path}))}
+    assert shared.snapshot(["mood"])[1] is not values
+    assert len(reads) == 2 and {"genre", "mood"} <= reads[1]
+
+
+def test_working_categories_out_again_says_why(tmp_path, caplog):
+    """ADR-0008-35. Each full rebuild is logged with its trigger and how long it took."""
+    songs = [song(tmp_path / "music" / "0.flac", genre="Rock")]
+    entries = Entries(songs)
+    index = CategoryIndex(config(tmp_path), entries)
+    index.save([query("Rock", "genre:rock")])
+    with caplog.at_level(logging.INFO, logger="autodj.categories"):
+        index.members()
+        index.members()  # nothing changed: nothing worked out or logged
+        entries.value = (*entries.value, song(tmp_path / "music" / "1.flac", genre="Rock"))
+        index.members()
+    lines = [r.getMessage() for r in caplog.records if "Categories worked out" in r.getMessage()]
+    assert len(lines) == 2
+    assert lines[0].startswith("Categories worked out for 1 songs in ")
+    assert lines[0].endswith("(first time since the start)")
+    assert lines[1].endswith("(the library changed)")
+
+
+def test_matching_whole_columns_gives_the_same_songs_as_matching_each_song():
+    """ADR-0009-10. Column matching agrees with Query.matches on varied library and Beets data."""
+    import random
+
+    from autodj.beets_query import first_release_year, parse_query
+    from autodj.catalog import normalize_path
+    from autodj.categories import LIBRARY_FIELDS, Resolution, _Sources, resolve_columns
+
+    def library_item(entry):
+        return {name: getattr(entry, name, None) for name in LIBRARY_FIELDS}
+
+    def resolve_query(query, items):
+        # Song by song, as the categories were worked out before #584.
+        matched = [(entry, item) for entry, item in items if query.matches(item)]
+        fallback = (
+            sum(first_release_year(item)[1] for _entry, item in matched)
+            if query.uses_first_release_year()
+            else 0
+        )
+        return Resolution(frozenset(entry.path for entry, _item in matched), fallback=fallback)
+
+    rng = random.Random(584)
+    texts = ["Rock", "rock", "ROCK and Roll", "Pop", "Christmas", "", "  ", "Ünïcode Straße"]
+    numbers = [
+        0, 1, 4, 4.0, 1989.7, 1999.0, 2005, -3, True, False,
+        "4", " 4 ", "4.0", "1990", "abc", "", "1_000", "nan", "inf", b"1985", b"\xffbad",
+    ]  # fmt: skip
+    songs, overlay = [], {}
+    for n in range(3000):
+        values = {
+            "title": rng.choice([*texts, None, f"Love Song {n}"]),
+            "artist": rng.choice(["Artist 1", "artist 12", "ARTIST 2", None, b"Artist 1"]),
+            "album": rng.choice([*texts, None]),
+            "genre": rng.choice([*texts, None, "Rock; Pop"]),
+            "year": rng.choice([*numbers, None]),
+            "bpm": rng.choice([*numbers, None, 120.0, 132]),
+            "length": rng.choice([180.0, 0.0, None]),
+        }
+        songs.append(SimpleNamespace(path=f"/music/{n}.flac", is_silent=n % 97 == 0, **values))
+        extra = {}
+        for name, pool in (
+            ("original_year", [*numbers, None]),
+            ("rating", ["4", "5", "3", "4.5", "x", 4, None]),
+            ("mood", ["Chill", "chill", "happy", None, b"CHILL"]),
+            ("label", ["Label 1", "label 10", None]),
+            ("genre", ["Reggae", "rock", None]),
+            ("comments", ["love it", None, ""]),
+            ("year", [1985, "2021", None]),
+        ):
+            if rng.random() < 0.6:
+                extra[name] = rng.choice(pool)
+        if extra or n % 5:
+            overlay[normalize_path(songs[-1].path)] = extra
+    queries = [
+        "", "genre:rock", "^genre:rock", "genre:rock genre:pop", "GENRE:Rock", "love",
+        "^love", "artist:artist 1", "year:1990", "year:4", "year:1989..1999", "year:..0",
+        "year:-5..", "bpm:120", "bpm:118..132", "original_year:1980..1989",
+        "original_year:1999", "^original_year:1990..", "original_year:..1989.5",
+        "rating:4..", "rating:4", "rating:..4.5", "mood:chill", "^mood:chill",
+        "label:label 1", "comments:love", "length:180", "length:0..", "title:straße",
+        'artist:"artist 1"', "genre:rock original_year:2000.. ^mood:happy",
+    ]  # fmt: skip
+
+    class Shared:
+        def read(self, _fields, _entries):
+            return (
+                frozenset({"original_year", "rating", "mood", "label", "comments"}),
+                overlay,
+                None,
+            )
+
+    sources = _Sources(songs, SimpleNamespace(), None, Path("."), shared=Shared())
+    sources.read(set())
+    items = []
+    for song in songs:
+        if song.is_silent:
+            continue
+        item = library_item(song)
+        extra = overlay.get(normalize_path(song.path))
+        if extra:
+            item.update(extra)
+        items.append((song, item))
+    assert set(LIBRARY_FIELDS) <= set(items[0][1])
+    sizes = set()
+    for text in queries:
+        query = parse_query(text)
+        expected = resolve_query(query, items)
+        found = resolve_columns(query, sources.songs, sources.columns)
+        assert found.paths == expected.paths, text
+        assert found.fallback == expected.fallback, text
+        sizes.add(len(expected.paths))
+    # The data is varied enough that the queries pick very different songs.
+    assert len(sizes) > 20 and len(items) in sizes
+
+
+def test_a_changed_song_updates_the_categories_as_a_full_rebuild_would(tmp_path, caplog):
+    """ADR-0009-10. Changed, added, silenced and removed songs alone are worked out again."""
+    from autodj.clock_condition_data import BeetsConditions
+
+    music = tmp_path / "music"
+    music.mkdir()
+    genres = ["Rock", "Pop", "Jazz"]
+    songs = [
+        song(music / f"{n}.flac", genre=genres[n % 3], year=1980 + n % 30, is_silent=False)
+        for n in range(60)
+    ]
+    rows = [(n + 1, f"{n}.flac".encode(), f"S{n}", genres[n % 3], 1980 + n % 30,
+             (1970 + n) * (n % 4 > 0)) for n in range(60)]  # fmt: skip
+    db = make_beets(
+        tmp_path / "library.db", rows, [(n + 1, "mood", "chill") for n in range(0, 60, 2)]
+    )
+    cfg = config(tmp_path, beets_db=db)
+    entries = Entries(songs)
+    shared = BeetsConditions(cfg, entries)
+    index = CategoryIndex(cfg, entries, beets=shared)
+    specs = [
+        query("Rock", "genre:rock", "rock"),
+        query("Eighties", "original_year:1980..1989", "eighties"),
+        query("Chill", "mood:chill ^genre:jazz", "chill"),
+        Category(
+            id="calm",
+            **parse_spec(
+                {
+                    "name": "Calm",
+                    "source": "filters",
+                    "conditions": [
+                        {"field": "beets", "name": "mood", "operator": "is", "value": "chill"}
+                    ],
+                }
+            ).model_dump(),
+        ),
+    ]
+    index.save(specs)
+    first = index.resolutions()[1]
+    assert first["eighties"].fallback > 0 and first["rock"].paths and first["calm"].paths
+    assert first["chill"].paths and first["chill"].paths != first["calm"].paths
+
+    def full():
+        fresh = CategoryIndex(cfg, Entries(entries.value), path=tmp_path / "x" / "c.json")
+        fresh.save(specs)
+        return {k: (v.paths, v.fallback) for k, v in fresh.resolutions()[1].items()}
+
+    def changed(entry, **fields):
+        return SimpleNamespace(**{**vars(entry), **fields})
+
+    steps = [
+        lambda value: (changed(value[0], genre="Jazz"), *value[1:]),  # leaves Rock
+        lambda value: (*value[:5], changed(value[5], genre="Rock", year=1985), *value[6:]),
+        lambda value: (
+            *value,
+            SimpleNamespace(**{**vars(value[1]), "path": str(music / "new.flac")}),
+        ),
+        lambda value: (*value[:7], changed(value[7], is_silent=True), *value[8:]),
+        lambda value: value[:-3],  # removed
+    ]
+    with caplog.at_level(logging.INFO, logger="autodj.categories"):
+        for step in steps:
+            entries.value = step(entries.value)
+            caplog.clear()
+            _cats, results = index.resolutions()
+            assert {k: (v.paths, v.fallback) for k, v in results.items()} == full()
+            # Worked out one song (or the three removed), not all of them.
+            assert "Categories worked out for 1 songs" in caplog.text or (
+                "Categories worked out for 3 songs" in caplog.text
+            )
+
+
+def test_on_the_hour_only_categories_with_relative_dates_are_worked_out_again(
+    tmp_path, monkeypatch
+):
+    """ADR-0009-10. The hour moving on keeps every category without a relative date."""
+    import autodj.categories as module
+    from autodj.clock_condition_data import BeetsConditions
+
+    songs = [song(tmp_path / "music" / f"{n}.flac", genre="Rock") for n in range(3)]
+    now = [1_760_000_000.0]
+    db = tmp_path / "library.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, path BLOB, title TEXT, added REAL)")
+    conn.executemany(
+        "INSERT INTO items VALUES (?, ?, ?, ?)",
+        [(n + 1, f"{n}.flac".encode(), "T", now[0] - n * 86400 * 20) for n in range(3)],
+    )
+    conn.execute("CREATE TABLE item_attributes (entity_id INTEGER, key TEXT, value TEXT)")
+    conn.commit()
+    conn.close()
+    cfg = config(tmp_path, beets_db=db)
+    entries = Entries(songs)
+    index = CategoryIndex(cfg, entries, clock=lambda: now[0], beets=BeetsConditions(cfg, entries))
+    recent = parse_spec(
+        {
+            "name": "Recent",
+            "source": "filters",
+            "conditions": [
+                {"field": "beets", "name": "added", "operator": "within_days", "value": 30}
+            ],
+        }
+    )
+    index.save([query("Rock", "genre:rock"), Category(id="new", **recent.model_dump())])
+    index.resolutions()
+    worked = []
+    real = module.resolve_checked
+    monkeypatch.setattr(
+        module,
+        "resolve_checked",
+        lambda categories, *a, **k: (
+            worked.append([c.id for c in categories]) or real(categories, *a, **k)
+        ),
+    )
+    first = index.members()
+    assert first["c1"][1] and first["new"][1]
+    now[0] += 3600
+    assert index.members() == first
+    assert worked == [["new"]]

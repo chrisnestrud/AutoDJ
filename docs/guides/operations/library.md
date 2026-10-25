@@ -22,6 +22,8 @@ counts from the end of the last startup, manual or automatic scan; if a scan or 
 the next tick tries again. **Queue & Search** uses one paginated list: choose Music or Voice liners,
 choose all folders or one folder, and optionally
 search by artist or title. Each result has Play now, Play next, Add to queue and Track info.
+One song plays next: a second Play next takes the place of the first, and the page names the song
+it replaced.
 Manage liner files, including Delete and Play dates, under **Settings > Voice liners** (see
 [Liner and cart play dates](carts-and-liners.md#liner-and-cart-play-dates)). Track info's Return button puts focus
 back on the result that opened it. **Music duck (dB)** sets the music drop under overlays and
@@ -63,6 +65,10 @@ audio prefetch. `--no-enrich` skips the optional beets refresh.
 
 The import status in Library tools gives counts. Files that could not be read or decoded are
 errors; open **Import errors** below the summary for the list.
+
+When the server starts, it rescans the library once every streaming or server-audio station has
+started its first song and picked the one after it, or after 2 minutes, so the scan does not slow the first songs. Files added
+while the server was stopped appear after that scan.
 
 The old published-index format, including `index-manifest.json`, is deprecated. Stop AutoDJ
 and run `autodj migrate-index` to preview the upgrade, then add `--apply` to import the old

@@ -5,6 +5,14 @@ import { requestJson } from "../../src/autodj/static/modules/api-client.js";
 
 vi.mock("../../src/autodj/static/modules/api-client.js", () => ({ requestJson: vi.fn() }));
 
+const { groups } = vi.hoisted(() => ({ groups: [] }));
+vi.mock("../../src/autodj/static/modules/settings-drafts.js", () => ({
+  registerSettingsGroup: (spec) => {
+    groups.push(spec);
+    return { accept: (body) => spec.write(body), dirty: () => false };
+  },
+}));
+
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
 
 function setup() {
@@ -16,19 +24,19 @@ function setup() {
     <p id="listener-control-empty" hidden>No listeners connected.</p>
     <button type="button" id="listener-ban-new">Add address ban</button>
     <form id="listener-ban-form" hidden><label for="listener-ban-address">Address</label>
-      <input id="listener-ban-address" required><label for="listener-ban-duration">Duration</label>
+      <input id="listener-ban-address" aria-required="true"><label for="listener-ban-duration">Duration</label>
       <select id="listener-ban-duration"><option value="60">1 hour</option><option value="">Until removed</option></select>
       <label for="listener-ban-note">Note</label><input id="listener-ban-note">
       <button type="submit">Ban address</button><button type="button" id="listener-ban-cancel">Cancel</button></form>
     <h4 id="listener-bans-title" tabindex="-1">Bans</h4><ul id="listener-ban-list"></ul>
     <p id="listener-ban-empty" hidden>No bans.</p>`;
-  const saveLimit = vi.fn(async () => true);
-  const controls = createListenerControls(document, document.getElementById("settings-status"), saveLimit);
-  return { controls, saveLimit };
+  const controls = createListenerControls(document, document.getElementById("settings-status"));
+  return { controls };
 }
 
 describe("listener controls", () => {
   beforeEach(() => {
+    groups.length = 0;
     vi.clearAllMocks();
     requestJson.mockImplementation(async (url, options) => {
       if (url === "/api/stream/listeners") return {
@@ -40,6 +48,25 @@ describe("listener controls", () => {
       if (options?.method === "POST") return { ban: { address: "192.0.2.4" } };
       throw new Error(`unexpected ${url}`);
     });
+  });
+
+  it("refuses an empty ban address itself, linked to the field and focused", async () => {
+    setup();
+    document.getElementById("listener-ban-new").click();
+    const address = document.getElementById("listener-ban-address");
+    document.getElementById("listener-ban-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await tick();
+    const error = document.getElementById("listener-ban-error");
+    expect(error.textContent).toBe("Enter an address or CIDR range to ban.");
+    expect(error.hidden).toBe(false);
+    expect(address.getAttribute("aria-invalid")).toBe("true");
+    expect(address.getAttribute("aria-describedby")).toContain("listener-ban-error");
+    expect(document.activeElement).toBe(address);
+    expect(requestJson).not.toHaveBeenCalledWith("/api/stream/bans", expect.objectContaining({ method: "POST" }));
+    address.value = "192.0.2.4";
+    address.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(address.hasAttribute("aria-invalid")).toBe(false);
+    expect(error.hidden).toBe(true);
   });
 
   it("lists listeners with named buttons and announces a disconnect", async () => {
@@ -73,8 +100,8 @@ describe("listener controls", () => {
     });
   });
 
-  it("saves the per-address limit and shows only the password state", async () => {
-    const { controls, saveLimit } = setup();
+  it("reads the per-address limit into the stream draft and shows only the password state", async () => {
+    const { controls } = setup();
     controls.apply({ stream_mode: true, stream_listener_revision: 1 });
     await tick();
     expect(document.getElementById("listener-password-state").textContent).toBe("Listener password not set.");
@@ -82,10 +109,9 @@ describe("listener controls", () => {
     limit.value = "2";
     limit.dispatchEvent(new Event("change"));
     await tick();
-    expect(saveLimit).toHaveBeenCalledWith(2, limit);
-    await vi.waitFor(() => {
-      expect(document.getElementById("settings-status").textContent).toBe("Connections per address set to 2.");
-    });
+    expect(groups.find((group) => group.group === "stream").read())
+      .toEqual({ max_listeners_per_address: 2 });
+    expect(requestJson.mock.calls.some(([, options]) => options?.method)).toBe(false);
   });
 
   it("moves focus to the next listener and updates names after refresh", async () => {

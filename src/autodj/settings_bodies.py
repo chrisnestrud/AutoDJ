@@ -1,9 +1,8 @@
 """Request bodies of the web settings routes, shared with ``web_state.json``.
 
-``POST /api/playback-settings``, ``/api/djmix``, ``/api/bpm-range`` and the
-other settings routes, including ``/api/eq``, validate their bodies with these models, and
-:mod:`autodj.runtime_state` checks every saved setting against the same
-field rules, so a value the page cannot set is never restored either.
+``PATCH /api/settings`` and operational controls validate their bodies with
+these models, and :mod:`autodj.runtime_state` checks every saved setting against
+the same field rules, so a value the page cannot set is never restored either.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 from autodj.config import MAX_FADE_SECONDS
 from autodj.repeat_settings import RepeatSettings
+from autodj.station_name import STATION_NAME_MAX
 
 #: The groups of settings :attr:`autodj._bridge.PlayerBridge.page_saved` can
 #: name: once a group's own route has saved it for a station, it is written to
@@ -87,13 +87,17 @@ EqGain = Annotated[float, Field(ge=0.0, le=2.0, allow_inf_nan=False)]
 class EqBody(BaseModel):
     """Request body for POST /api/eq; a band outside 0 to 2 is refused."""
 
+    model_config = ConfigDict(extra="forbid")
+
     low: EqGain | None = None
     mid: EqGain | None = None
     high: EqGain | None = None
 
 
 class PresetBody(BaseModel):
-    """Request body for POST /api/preset — empty / null name clears."""
+    """Preset group body — empty / null name clears the active preset."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
 
@@ -150,7 +154,7 @@ class StreamSettingsBody(BaseModel):
     # Days of listener statistics to keep; 0 keeps none.
     stats_days: Annotated[int, Field(ge=0, le=3650, strict=True)] | None = None
     continuous: bool | None = Field(default=None, strict=True)
-    station_name: Annotated[str, Field(max_length=100)] | None = None
+    station_name: Annotated[str, Field(max_length=STATION_NAME_MAX)] | None = None
     genre: Annotated[str, Field(max_length=255)] | None = None
     description: Annotated[str, Field(max_length=255)] | None = None
     url: Annotated[str, Field(max_length=2048)] | None = None
@@ -187,13 +191,15 @@ class StreamSettingsBody(BaseModel):
 
 
 class TransitionBody(BaseModel):
-    """Request body for POST /api/transition."""
+    """Transition settings group body."""
+
+    model_config = ConfigDict(extra="forbid")
 
     effect: str
 
 
 class DjMixBody(BaseModel):
-    """Request body for POST /api/djmix — only set fields are applied.
+    """DJ mix settings group body — only set fields are applied.
 
     Unknown fields are rejected, so a stale client still sending the removed
     ``harmonic_mixing`` switch gets a 422 instead of being silently ignored.
@@ -234,7 +240,7 @@ class DjMixBody(BaseModel):
 
 
 class PlaybackSettingsBody(BaseModel):
-    """Request body for POST /api/playback-settings.
+    """Playback settings group body.
 
     Unknown fields are rejected rather than ignored.
     """
@@ -330,13 +336,48 @@ class PlaybackSettingsBody(BaseModel):
 
 
 class BpmRangeBody(BaseModel):
-    """Request body for POST /api/bpm-range — both null = clear filter."""
+    """BPM range settings group; both null values clear the filter."""
+
+    model_config = ConfigDict(extra="forbid")
 
     lo: FiniteFloat | None = None
     hi: FiniteFloat | None = None
 
 
 class DiscoveryBody(BaseModel):
-    """Request body for POST /api/discovery — null disables."""
+    """Discovery settings group; null disables automatic discovery."""
+
+    model_config = ConfigDict(extra="forbid")
 
     every: int | None = None
+
+
+class StationSettingsChangesBody(BaseModel):
+    """Validated groups accepted by the station settings batch endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    preset: PresetBody | None = None
+    transition: TransitionBody | None = None
+    djmix: DjMixBody | None = None
+    playback: PlaybackSettingsBody | None = None
+    bpm_range: BpmRangeBody | None = None
+    discovery: DiscoveryBody | None = None
+    eq: EqBody | None = None
+    time_checks: dict[str, Any] | None = None
+    stream: StreamSettingsBody | None = None
+    public: dict[str, Any] | None = None
+    breaks: BreakSettingsBody | None = None
+    time: dict[str, Any] | None = None
+    station: dict[str, Any] | None = None
+    live: dict[str, Any] | None = None
+    recording: dict[str, Any] | None = None
+
+
+class StationSettingsPatchBody(BaseModel):
+    """One optimistic, grouped station settings update."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    revision: str = Field(min_length=1, max_length=64)
+    changes: dict[str, Any]

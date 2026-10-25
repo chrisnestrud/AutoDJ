@@ -1278,6 +1278,31 @@ describe("static accessibility contracts", () => {
     expect(appSource).toMatch(/setConnStatus\("connected",\s*"[^"\r\n]+"[,)]/);
   });
 
+  it("keeps a busy control at full contrast, unlike an unavailable one", () => {
+    // .is-pending marks a control that keeps focus and stays enabled while
+    // its request runs (withDisabled).  It was dimmed to 0.45 like a disabled
+    // one, so a Save changes button mid-save fell under 4.5:1 (WCAG 1.4.3).
+    const pendingRules = cssRules.filter((rule) => rule.selectors.some((selector) => selector.includes(".is-pending")));
+    expect(pendingRules.length).toBeGreaterThan(0);
+    for (const rule of pendingRules) {
+      const opacity = rule.declarations.get("opacity");
+      if (opacity !== undefined) expect(Number(opacity), rule.selectors.join(", ")).toBe(1);
+      for (const property of ["color", "background", "background-color", "filter", "border-color"]) {
+        expect(rule.declarations.has(property), `${rule.selectors.join(", ")} ${property}`).toBe(false);
+      }
+    }
+    for (const selector of ["button.is-pending", 'input[type="checkbox"].is-pending']) {
+      expect(lastValue(selector, "opacity"), selector).toBe("1");
+      expect(lastValue(selector, "cursor"), selector).toBe("progress");
+    }
+    // A shape cue as well as the cursor, kept in forced colours.
+    expect(lastValue("button.is-pending", "border-style")).toBe("dashed");
+    // Unavailable controls stay dimmed.
+    for (const selector of ["button:disabled", 'button[aria-disabled="true"]']) {
+      expect(lastValue(selector, "opacity"), selector).toBe("0.45");
+    }
+  });
+
   it("gives controls real high-contrast boundaries and retains focus", () => {
     expect(normalizedColor("#abc")).toBe("#aabbcc");
     expect(normalizedColor("#abcf")).toBe("#aabbcc");
@@ -1715,7 +1740,7 @@ describe("static accessibility contracts", () => {
       ["pb-crossfade", "number", "pb-crossfade-desc"],
       ["pb-show-lyrics", "checkbox", "pb-show-lyrics-desc"],
       ["theme-system", "radio", "theme-choice-desc"],
-      ["pb-music-speed-slider", "range", "pb-music-speed-desc"],
+      ["pb-music-speed-number", "number", "pb-music-speed-desc"],
       ["categories-not-before", "date", "categories-daypart-help"],
       ["stereo-preset-file", "file", null],
       ["stream-relay-password", "password", "stream-relay-password-help"],
@@ -1737,6 +1762,12 @@ describe("static accessibility contracts", () => {
       .toBe("stream-relay-password-help");
     expect(document.getElementById("token-secret").getAttribute("aria-describedby"))
       .toBe("token-secret-warning");
+  });
+
+  it("never hides an empty status region with display: none", () => {
+    // A region shown only once its words arrive is a new region, and NVDA
+    // in Firefox did not say the Settings save result.
+    expect(cssSource).not.toMatch(/:empty\s*\{[^}]*display:\s*none/);
   });
 
   it("gives the status message a Dismiss button that is never announced with it", () => {
@@ -1910,8 +1941,8 @@ describe("static accessibility contracts", () => {
     expect(listen.querySelector('[aria-hidden="true"]')).not.toBeNull();
     // Browser mode renders no Listen here button until stream mode shows it.
     expect(listen.hidden).toBe(true);
-    // Sits in the transport group straight after Play / Pause.
-    expect(listen.previousElementSibling.id).toBe("btn-pause");
+    // Listening comes before station transport in reading and keyboard order.
+    expect(listen.nextElementSibling.id).toBe("btn-pause");
     expect(listen.closest('[role="group"]').getAttribute("aria-label"))
       .toBe("Playback controls");
 
@@ -2056,7 +2087,7 @@ describe("static accessibility contracts", () => {
     // heading: the summary's name is the heading text, and the browser
     // says expanded or collapsed, so no ARIA state is added.
     const folded = [
-      ["#repeat-save", "#spanel-picking", "H4", "Repeats"],
+      ["#repeat-daypart-hours", "#spanel-picking", "H4", "Repeats"],
       ["#rotation-test", "#spanel-picking", "H4", "Test rotation"],
       ["#stream-relay-add", "#spanel-stream", "H4", "Relays"],
       ["#stream-formats", "#spanel-stream", "H4", "More formats"],
@@ -2336,9 +2367,7 @@ describe("static accessibility contracts", () => {
       expect(describedBy(input)).toHaveLength(1);
       expect(describedBy(input).every(Boolean)).toBe(true);
     }
-    const save = document.querySelector("#recording-save");
-    expect(save.getAttribute("type")).toBe("button");
-    expect(save.textContent.trim()).toBe("Save recording settings");
+    expect(document.querySelector("#recording-save")).toBeNull();
     // Nothing on the page names or edits the recordings folder.
     expect(group.querySelector("input[type=text], input[type=file]")).toBeNull();
   });
@@ -2376,6 +2405,42 @@ describe("static accessibility contracts", () => {
       expect(dialog.contains(title), dialog.id).toBe(true);
       expect(dialog.querySelector("h1, h2, h3, h4, h5, h6"), dialog.id).toBe(title);
     }
+  });
+
+  it("keeps groups from starting invalid with an empty required field", () => {
+    // Firefox calls an empty required field, and every fieldset around it,
+    // "invalid entry" before anything is typed: "Stream grouping invalid
+    // entry", "New station grouping invalid entry".  These forms check their
+    // own fields, so the fields are aria-required instead.
+    installDocument();
+    for (const id of ["stream-settings", "station-create-form", "categories-form", "shows-form", "schedule-form"]) {
+      const group = document.getElementById(id);
+      const empty = [...group.querySelectorAll("input[required], textarea[required], select[required]")]
+        .filter((control) => !control.value);
+      expect(empty.map((control) => control.id), id).toEqual([]);
+      const form = group.matches("form") ? group : null;
+      for (const item of [form, ...group.querySelectorAll("form")].filter(Boolean)) {
+        expect(item.noValidate, item.id).toBe(true);
+      }
+    }
+    for (const id of ["stream-relay-name", "stream-relay-host", "listener-ban-address",
+      "station-create-name", "station-create-slug", "categories-name", "shows-name",
+      "schedule-name", "schedule-date", "schedule-time", "schedule-interval"]) {
+      expect(document.getElementById(id).getAttribute("aria-required"), id).toBe("true");
+    }
+  });
+
+  it("describes the clockwheel step dialog in one short sentence", () => {
+    // Without a description NVDA with Firefox read the whole step form as the
+    // dialog opened (the help, the track count, every label), twice.
+    installDocument();
+    const dialog = document.querySelector("#clock-step-dialog");
+    const description = document.getElementById(dialog.getAttribute("aria-describedby"));
+    expect(description?.tagName).toBe("P");
+    expect(dialog.contains(description)).toBe(true);
+    expect(description.hidden).toBe(false);
+    expect(description.textContent.trim().length).toBeGreaterThan(0);
+    expect(description.textContent.length).toBeLessThan(100);
   });
 
   it("never nests a dialog inside a tab panel", () => {
@@ -2562,10 +2627,18 @@ describe("static accessibility contracts", () => {
       const input = document.getElementById(id);
       expect(input.getAttribute("type")).toBe("date");
       expect(document.querySelector(`label[for="${id}"]`).textContent.trim()).toBe(label);
-      // Optional: no required attribute, and the description says so in words.
+      // Optional: no required attribute.  The help under Repeat dates says
+      // how the dates are read (the year is ignored for Every year), so the
+      // date fields read it too.
       expect(input.hasAttribute("required")).toBe(false);
-      expect(input.hasAttribute("aria-describedby")).toBe(false);
+      expect(input.getAttribute("aria-describedby")).toBe("schedule-dates-repeat-desc");
     }
+    const repeat = document.getElementById("schedule-dates-repeat");
+    expect(repeat.tagName).toBe("SELECT");
+    expect(group.contains(repeat)).toBe(true);
+    expect(document.querySelector('label[for="schedule-dates-repeat"]').textContent.trim()).toBe("Repeat dates");
+    expect(repeat.getAttribute("aria-describedby")).toBe("schedule-dates-repeat-desc");
+    expect(document.getElementById("schedule-dates-repeat-desc").classList.contains("setting-desc")).toBe(true);
     // The form's error text has an ID to be linked from the field it names.
     expect(document.querySelector("#schedule-form-error").classList.contains("field-error")).toBe(true);
     // The days description is not linked in the markup: the script links it
@@ -2679,7 +2752,7 @@ describe("static accessibility contracts", () => {
 
   it("gives the daypart and quarter-hour repeat rules labelled native fields and silent help", () => {
     installDocument({ html: htmlSource });
-    const repeats = document.querySelector("#repeat-save").closest("fieldset");
+    const repeats = document.querySelector('fieldset[aria-labelledby="repeat-heading"]');
     expect(repeats.closest("#spanel-picking")).not.toBeNull();
     for (const [id, label, type, legend] of [
       ["repeat-daypart-days", "Days", "number", "Prevent a song from playing in the same daypart"],
@@ -3134,8 +3207,7 @@ describe("static accessibility contracts", () => {
     const help = document.getElementById("preview-device-desc");
     expect(help.hidden).toBe(false);
     expect(help.textContent).toMatch(/previews/);
-    // The unsupported or permission note starts hidden and unlinked: the
-    // script links it only while it is shown.
+    // Device status stays available through normal browsing.
     const note = document.getElementById("preview-device-note");
     expect(note.hidden).toBe(true);
     expect(note.classList.contains("setting-desc")).toBe(true);
@@ -3291,9 +3363,9 @@ describe("static accessibility contracts", () => {
     // The shortcut is listed with the others, in words.
     const keys = [...document.querySelectorAll("#hotkey-help-modal dt kbd")].map((kbd) => kbd.textContent);
     expect(keys).toContain("Alt+M");
-    // Settings > Live DJ: its own tab and panel, hidden until the station can go live.
+    // Settings > Live DJ remains available independently of station playout.
     const tab = document.getElementById("stab-live");
-    expect(tab.hidden).toBe(true);
+    expect(tab.hidden).toBe(false);
     expect(tab.textContent).toBe("Live DJ");
     const panel = document.getElementById(tab.dataset.panel);
     expect(panel.getAttribute("aria-labelledby")).toBe("stab-live");
@@ -3558,11 +3630,11 @@ describe("station switcher and station context contracts (#70)", () => {
   const ids = (element, attribute) => (element.getAttribute(attribute) || "")
     .split(/\s+/).filter(Boolean);
 
-  it("is an APG menu button in the banner, before the Sections tabs", () => {
+  it("is a disclosure in the banner, its list right after the button, before the Sections tabs (#576)", () => {
     installDocument();
     const wrap = document.getElementById("station-switcher");
     const button = document.getElementById("station-button");
-    const menu = document.getElementById("station-menu");
+    const list = document.getElementById("station-list");
     // Hidden until the server lists a second station.
     expect(wrap.hidden).toBe(true);
     expect(wrap.closest('header[role="banner"]')).not.toBeNull();
@@ -3570,9 +3642,10 @@ describe("station switcher and station context contracts (#70)", () => {
       & window.Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(button.tagName).toBe("BUTTON");
     expect(button.getAttribute("type")).toBe("button");
-    expect(button.getAttribute("aria-haspopup")).toBe("menu");
+    // A disclosure: no popup, so no menu role for a screen reader to race.
+    expect(button.hasAttribute("aria-haspopup")).toBe(false);
     expect(button.getAttribute("aria-expanded")).toBe("false");
-    expect(button.getAttribute("aria-controls")).toBe("station-menu");
+    expect(button.getAttribute("aria-controls")).toBe("station-list");
     // Named by its visible text, "Station: <name>"; the caret is not read.
     expect(button.hasAttribute("aria-label")).toBe(false);
     expect(button.querySelector(".station-switcher-caret").getAttribute("aria-hidden")).toBe("true");
@@ -3580,10 +3653,12 @@ describe("station switcher and station context contracts (#70)", () => {
       .filter((node) => !(node instanceof window.Element && node.getAttribute("aria-hidden") === "true"))
       .map((node) => node.textContent).join("").replace(/\s+/g, " ").trim();
     expect(visible).toBe("Station: AutoDJ");
-    expect(menu.tagName).toBe("UL");
-    expect(menu.getAttribute("role")).toBe("menu");
-    expect(menu.getAttribute("aria-labelledby")).toBe("station-button");
-    expect(menu.hidden).toBe(true);
+    // The list comes straight after the button in reading order.
+    expect(button.nextElementSibling).toBe(list);
+    expect(list.tagName).toBe("UL");
+    expect(list.hasAttribute("role")).toBe(false);
+    expect(list.hidden).toBe(true);
+    expect(document.querySelector('[role="menu"], [role="menuitemradio"]')).toBeNull();
   });
 
   it("describes the shared controls as shared by all stations", () => {
@@ -3662,20 +3737,20 @@ describe("station switcher and station context contracts (#70)", () => {
       "station-create-autostart", "station-create-submit"]);
   });
 
-  it("styles the menu with theme tokens, 44 px items and a tick for the checked one", () => {
+  it("styles the list with theme tokens, 44 px items and a tick for the current one", () => {
     const css = stripCssComments(cssSource);
     const rule = (selector) => {
       const start = css.indexOf(`${selector} {`);
       expect(start, selector).toBeGreaterThanOrEqual(0);
       return css.slice(start, css.indexOf("}", start));
     };
-    const menu = rule("#station-menu");
-    expect(menu).toMatch(/background: var\(--bg-card\)/);
-    expect(menu).toMatch(/color: var\(--text\)/);
-    expect(menu).toMatch(/border: 1px solid var\(--control-border\)/);
+    const list = rule("#station-list");
+    expect(list).toMatch(/background: var\(--bg-card\)/);
+    expect(list).toMatch(/color: var\(--text\)/);
+    expect(list).toMatch(/border: 1px solid var\(--control-border\)/);
     const item = rule(".station-switcher-item");
     expect(item).toMatch(/min-height: 44px/);
-    expect(css).toMatch(/\.station-switcher-item\[aria-checked="true"\]::before \{ content: "\\2713" \/ ""; \}/);
+    expect(css).toMatch(/\.station-switcher-item\[aria-current="true"\]::before \{ content: "\\2713" \/ ""; \}/);
     // No literal colours anywhere in the switcher's rules.
     const switcherRules = css.slice(css.indexOf(".station-switcher {"), css.indexOf(".station-off-air[hidden]"));
     expect(switcherRules).not.toMatch(/#[0-9a-f]{3,8}\b|rgba?\(/i);

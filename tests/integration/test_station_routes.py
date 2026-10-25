@@ -12,9 +12,10 @@ from starlette.websockets import WebSocketDisconnect
 
 from autodj.config import ServerConfig, StationConfig
 from autodj.security import station_relative
-from autodj.server import PlayerBridge, create_app
+from autodj.server import PlayerBridge
 from autodj.station_routes import STATION_PREFIX
 from tests._layout import point_index
+from tests._server import create_app
 
 from ._helpers import _make_player_mock, _make_sim_mock
 
@@ -49,6 +50,10 @@ SHARED = frozenset(
         "/api/stereo-tool-presets/upload",
         "/api/stereo-tool-presets/{name}",
         "/api/stereo-tool/download",
+        "/api/updates",
+        "/api/updates/check",
+        "/api/updates/settings",
+        "/api/server/restart",
         "/api/library/tracks",
         "/api/library/folders",
         "/api/library/folders/{source_id}",
@@ -71,7 +76,11 @@ SHARED = frozenset(
         "/api/library/remove-missing",
         "/api/machine-tokens",
         "/api/machine-tokens/{token_id}",
+        "/api/machine-tokens/pairing-code",
         "/api/analysis/workers",
+        "/api/analysis/workers/{token_id}/settings",
+        "/api/analysis/workers/{token_id}/refusal",
+        "/api/worker-pair",
         "/api/worker/claim",
         "/api/worker/audio",
         "/api/worker/result",
@@ -161,12 +170,6 @@ STATION = frozenset(
         "/advance",
         "/repick-next",
         "/random-track",
-        "/preset",
-        "/transition",
-        "/djmix",
-        "/playback-settings",
-        "/bpm-range",
-        "/discovery",
         "/discovery/toggle",
         "/eq",
         "/stream",
@@ -177,12 +180,10 @@ STATION = frozenset(
         "/stream/bans",
         "/stream/stats",
         "/stream/stats/export",
-        "/stream/settings",
         "/recording",
         "/recording/start",
         "/recording/stop",
         "/recording/split",
-        "/recording/settings",
         "/webhooks",
         "/webhooks/{index}/test",
         "/profiles",
@@ -267,9 +268,8 @@ STATION = frozenset(
         "/shows/{show_id}/start",
         # Spoken track landmarks (#60): read through the station's player.
         "/landmarks",
-        # Live DJs (#48): the DJ accounts, talkover settings and microphone.
+        # Live DJs (#48): the DJ accounts and microphone.
         "/live",
-        "/live/settings",
         "/live/djs",
         "/live/djs/{username}",
         "/live/mic",
@@ -628,7 +628,10 @@ def test_each_push_lists_the_stations_when_there_are_several() -> None:
         registry = SimpleNamespace(
             slugs=lambda slugs=slugs: frozenset(slugs),
             summaries=lambda: entries,
+            relay_lock=object(),
         )
         runtime = station()
         _share_station(registry, runtime)  # type: ignore[arg-type]
         assert (runtime.station_list is not None) is listed
+        # Every station reconnects its relays under the registry's one lock (#472).
+        assert runtime.relay_lock is registry.relay_lock

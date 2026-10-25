@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
 import math
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -35,11 +37,87 @@ _TAIL_BLEND_FRAMES = int(0.01 * SAMPLE_RATE)
 # block.  Kept well under the master processors' 16-18 block output cushion
 # (see :mod:`autodj.mastering`), so a catch-up burst never drains it.
 CATCH_UP_BLOCKS = 8
+_LAG_WARNING_SECONDS = 10.0
+# The interpreter's thread switch interval while any bus runs.  The bus
+# thread gives up the GIL several times per block (pipe writes, locks the
+# encoder and master threads share, sleeping), and each time it waits for
+# it again, a thread running Python keeps it for a whole switch interval.
+# At CPython's default 5 ms, two or three such threads (song picking, a
+# library reload, a scan, an hour preview) left the bus seconds behind on a
+# small CPU; at 0.5 ms they cost it a few milliseconds a block.
+REALTIME_SWITCH_INTERVAL = 0.0005
+# The oldest generation's threshold while any bus runs: the collector makes no
+# full pass on its own (#584).  A full pass walks every tracked object the
+# process has not frozen while holding the GIL, so no switch interval helps.  A
+# category build, a Beets read or a scan keeps hundreds of thousands of new
+# objects alive for seconds, and CPython started pass after pass over them as
+# they aged: on a small CPU each one stopped every bus for up to half a second,
+# and none freed anything.  The young generations are still collected as
+# usual; the library makes the full pass itself while nothing big runs
+# (:meth:`autodj.library.LibraryManager.tick`).
+FULL_PASS_HELD_THRESHOLD = 1_000_000
+_switch_lock = threading.Lock()
+_switch_users = 0
+_switch_saved: float | None = None
+_switch_applied: float | None = None
+_gc_saved: tuple[int, int, int] | None = None
+_gc_applied: tuple[int, int, int] | None = None
 _NO_LINER = np.zeros((0, 2), np.float32)
 # Live source audio buffered before it plays, and again after an underrun,
 # so network jitter does not crackle (#48); a browser talker's, shorter.
 _LIVE_PREROLL_FRAMES = int(0.3 * SAMPLE_RATE)
 _MIC_PREROLL_FRAMES = int(0.06 * SAMPLE_RATE)
+
+
+@contextlib.contextmanager
+def realtime_switching() -> Iterator[None]:
+    """Use :data:`REALTIME_SWITCH_INTERVAL` while at least one bus runs.
+
+    The interval is process-wide, so it is shortened when the first bus
+    starts and put back when the last one stops, unless something else
+    changed it meanwhile.  A shorter interval already set is kept.  The
+    garbage collector's full passes are held off the same way
+    (:data:`FULL_PASS_HELD_THRESHOLD`); a collector someone switched off,
+    or one already holding them off longer, is left alone.
+    """
+    global _switch_users, _switch_saved, _switch_applied, _gc_saved, _gc_applied
+    with _switch_lock:
+        if _switch_users == 0:
+            current = sys.getswitchinterval()
+            if current > REALTIME_SWITCH_INTERVAL:
+                sys.setswitchinterval(REALTIME_SWITCH_INTERVAL)
+                _switch_saved, _switch_applied = current, sys.getswitchinterval()
+            else:
+                _switch_saved = _switch_applied = None
+            young, middle, old = gc.get_threshold()
+            if young > 0 and old < FULL_PASS_HELD_THRESHOLD:
+                gc.set_threshold(young, middle, FULL_PASS_HELD_THRESHOLD)
+                _gc_saved, _gc_applied = (young, middle, old), gc.get_threshold()
+            else:
+                _gc_saved = _gc_applied = None
+        _switch_users += 1
+    try:
+        yield
+    finally:
+        with _switch_lock:
+            _switch_users -= 1
+            if _switch_users == 0 and _switch_saved is not None:
+                if sys.getswitchinterval() == _switch_applied:
+                    sys.setswitchinterval(_switch_saved)
+                _switch_saved = _switch_applied = None
+            if _switch_users == 0 and _gc_saved is not None:
+                if gc.get_threshold() == _gc_applied:
+                    gc.set_threshold(*_gc_saved)
+                _gc_saved = _gc_applied = None
+
+
+def full_passes_held() -> bool:
+    """Whether running buses hold off the collector's full passes (see :func:`realtime_switching`).
+
+    While they do, the process makes them itself, at a time it chooses.
+    """
+    with _switch_lock:
+        return _gc_applied is not None and gc.get_threshold() == _gc_applied
 
 
 @dataclass(frozen=True)
@@ -111,6 +189,8 @@ class RenderedTrack:
             voice starts and its speech ends in *audio*, and its label.
         intro_assets: ``(intro_id, path)`` for exact selected audio files;
             paths stay internal unless the catalog identifies one as a liner.
+        handoff_pending: A live cursor awaiting promotion, with no audio or
+            successor prepared. The player must resolve it before bus admission.
     """
 
     entry: IndexEntry
@@ -151,6 +231,7 @@ class RenderedTrack:
     clock_revision: int | None = None
     next_clock_revision: int | None = None
     next_clock_name: str | None = None
+    handoff_pending: bool = False
     handoff_id: str = ""
     ad_steps: tuple[dict, ...] = ()
     liner_plan_key: str = ""
@@ -1088,51 +1169,84 @@ class MixBus:
         ``on_need_track``, or the EQ path — the failure is logged and a
         silent block is substituted so pacing continues. An output whose
         ``write`` raises is logged and removed so the rest of the run
-        keeps going.
+        keeps going.  While it runs, the process uses the short
+        :data:`REALTIME_SWITCH_INTERVAL` and holds off the garbage
+        collector's full passes (see :func:`realtime_switching`).
 
         Args:
             stop: Set by another thread to end the loop.
         """
+        with realtime_switching():
+            self._run_paced(stop)
+
+    def _run_paced(self, stop: threading.Event) -> None:
+        """The paced loop of :meth:`run`."""
         period = self.BLOCK / SAMPLE_RATE
         next_due = self._clock.now()
-        while not stop.is_set():
-            master, master_enabled = self._master_state()
-            try:
-                # Warm the processor without advancing tracks, liners, or their callbacks.
-                block = (
-                    np.zeros((self.BLOCK, 2), np.float32)
-                    if master is not None and master_enabled and master.startup_pending
-                    else self.render_block(master_enabled=master_enabled)
-                )
-            except Exception:
-                logger.exception("Mix bus render_block failed; emitting silence")
-                block = np.zeros((self.BLOCK, 2), np.float32)
-            if master is not None:
+        last_lag_warning = -math.inf
+        skipped_periods = 0
+        worst_delay = 0.0
+
+        def report_lag(now: float) -> None:
+            nonlocal last_lag_warning, skipped_periods, worst_delay
+            logger.warning(
+                "Mix bus fell behind by up to %.3f s; skipped %d periods of %.0f ms since last warning",
+                worst_delay,
+                skipped_periods,
+                period * 1000,
+            )
+            last_lag_warning = now
+            skipped_periods = 0
+            worst_delay = 0.0
+
+        try:
+            while not stop.is_set():
+                master, master_enabled = self._master_state()
                 try:
-                    processed = np.asarray(
-                        master.process(block, enabled=master_enabled), np.float32
+                    # Warm the processor without advancing tracks, liners, or their callbacks.
+                    block = (
+                        np.zeros((self.BLOCK, 2), np.float32)
+                        if master is not None and master_enabled and master.startup_pending
+                        else self.render_block(master_enabled=master_enabled)
                     )
-                    if processed.shape != (self.BLOCK, 2):
-                        raise ValueError("master returned an invalid block shape")
-                    block = processed
                 except Exception:
-                    logger.exception("Mix bus master failed; emitting bounded dry audio")
-                nan_to_num_in_place(block)
-                np.clip(block, -1.0, 1.0, out=block)
-            with self._lock:
-                outputs = list(self._outputs)
-            for output in outputs:
-                try:
-                    output.write(block)
-                except Exception:
-                    logger.exception("Mix bus output failed; removing it")
-                    self.remove_output(output)
-            next_due += period
-            delay = next_due - self._clock.now()
-            if delay > 0:
-                self._clock.sleep(delay)
-            elif delay < -CATCH_UP_BLOCKS * period:
-                # Make up at most CATCH_UP_BLOCKS: a longer burst could drain
-                # a healthy processor's output cushion.  Whole periods are
-                # dropped, so the schedule keeps its phase.
-                next_due += (math.ceil(-delay / period) - CATCH_UP_BLOCKS) * period
+                    logger.exception("Mix bus render_block failed; emitting silence")
+                    block = np.zeros((self.BLOCK, 2), np.float32)
+                if master is not None:
+                    try:
+                        processed = np.asarray(
+                            master.process(block, enabled=master_enabled), np.float32
+                        )
+                        if processed.shape != (self.BLOCK, 2):
+                            raise ValueError("master returned an invalid block shape")
+                        block = processed
+                    except Exception:
+                        logger.exception("Mix bus master failed; emitting bounded dry audio")
+                    nan_to_num_in_place(block)
+                    np.clip(block, -1.0, 1.0, out=block)
+                with self._lock:
+                    outputs = list(self._outputs)
+                for output in outputs:
+                    try:
+                        output.write(block)
+                    except Exception:
+                        logger.exception("Mix bus output failed; removing it")
+                        self.remove_output(output)
+                next_due += period
+                now = self._clock.now()
+                delay = next_due - now
+                if delay < -CATCH_UP_BLOCKS * period:
+                    # Make up at most CATCH_UP_BLOCKS: a longer burst could drain
+                    # a healthy processor's output cushion.  Whole periods are
+                    # dropped, so the schedule keeps its phase.
+                    skipped = math.ceil(-delay / period) - CATCH_UP_BLOCKS
+                    next_due += skipped * period
+                    skipped_periods += skipped
+                    worst_delay = max(worst_delay, -delay)
+                if skipped_periods and now - last_lag_warning >= _LAG_WARNING_SECONDS:
+                    report_lag(now)
+                if delay > 0:
+                    self._clock.sleep(delay)
+        finally:
+            if skipped_periods:
+                report_lag(self._clock.now())

@@ -425,6 +425,9 @@ class PlayerBridge(LibraryAccess):
     # The stream in every format (:class:`~autodj.stream_mounts.StreamMounts`):
     # the MP3 stream above and the AAC and Opus mounts that are on.
     mounts: Any = None
+    # The station name the clockwheel or show on the air asks for, or "" for
+    # the normal one (#472); kept by the station, read by autodj.station_name.
+    station_name_override: str = ""
     public_state_changed: Callable[[], Any] | None = None
     track_started_callback: Callable[[], None] | None = None
     # History is appended on the mix-bus thread, trimmed by the station's
@@ -451,31 +454,8 @@ class PlayerBridge(LibraryAccess):
     _track_dicts: dict[str, tuple[Any, Any, tuple, dict]] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
-        from autodj.station_settings import StationSettings
-
         if self.settings is None:
-            candidate = getattr(self.player, "_settings", None)
-            if isinstance(candidate, StationSettings):
-                self.settings = candidate
-        if self.settings is None:
-            self.settings = StationSettings(self.player._cfg, self.library, self.sim, self.paths)
-            for name in (
-                "_preset",
-                "_bpm_range",
-                "_pure_shuffle",
-                "_anchor_to_seed",
-                "_eq_low",
-                "_eq_mid",
-                "_eq_high",
-                "_discovery_every",
-            ):
-                if hasattr(self.player, name):
-                    setattr(self.settings, name, getattr(self.player, name))
-            state = getattr(self.player, "_state", None)
-            if state is not None:
-                self.settings._volume = getattr(state, "volume", 1.0)
-                self.settings._is_muted = getattr(state, "is_muted", False)
-                self.settings._discovery_enabled = getattr(state, "discovery_enabled", False)
+            self.settings = self.player._settings
         self.settings.library = self.library or self.settings.library
         self.settings.sim = self.sim or self.settings.sim
         self.settings.paths = self.paths or self.settings.paths
@@ -1594,7 +1574,7 @@ class PlayerBridge(LibraryAccess):
         return getattr(self.player, "bus", None) is not None
 
     def _refresh_bus_queue(self) -> None:
-        """Hand a queue edit to the mix bus's render-ahead worker.
+        """Hand a queue edit to the mix bus's playout worker.
 
         Call while holding ``queue_lock``, *after* editing the queue.  The
         rendered next track only peeked at the queue, so nothing needs
@@ -1969,7 +1949,7 @@ class PlayerBridge(LibraryAccess):
                 if error or not fields <= known:
                     return "the clockwheel conditions cannot be read", None
                 beets = items
-            if entry.path not in condition_paths(step, [entry], beets, categories):
+            if entry.path not in condition_paths(step, [entry], beets, categories, when):
                 return "the song does not match the clockwheel conditions", None
         elif entry.path not in {song.path for song in _slot_entries(step, [entry])}:
             return "the song does not match the clockwheel folder", None
@@ -2537,9 +2517,9 @@ class PlayerBridge(LibraryAccess):
         except Exception:
             logger.exception("Could not load earlier plays into the repeat rules")
 
-    def save_persistent_state(self) -> None:
+    def save_persistent_state(self, *, strict: bool = False) -> None:
         """Write the settings owner's web_state.json atomically."""
-        self.settings.save()
+        self.settings.save(strict=strict)
 
     def get_settings(self) -> dict:
         """Return a snapshot of every adjustable setting and available presets."""

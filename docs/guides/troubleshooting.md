@@ -4,7 +4,7 @@ Start with the symptom you can see. Keep the terminal open while testing: AutoDJ
 
 ## Installing and starting
 
-**The launcher cannot find uv or FFmpeg.** On Windows, run `.\autodj.cmd` in PowerShell and accept its tool installation prompt, or install the missing tool yourself. On Linux and macOS, install [uv](https://docs.astral.sh/uv/getting-started/installation/) and [FFmpeg](https://ffmpeg.org/download.html). Run Doctor again.
+**The launcher cannot find uv or FFmpeg.** On Windows, the launcher offers to bootstrap uv. Run `.\autodj.cmd doctor` to diagnose an existing installation and accept its FFmpeg installation offer, or install the missing tool yourself. On Linux and macOS, install [uv](https://docs.astral.sh/uv/getting-started/installation/) and [FFmpeg](https://ffmpeg.org/download.html). Run Doctor again.
 
 **The page does not open.** Use the exact address printed by AutoDJ, usually `http://localhost:8080` on the same computer. If the port is in use, run `autodj serve --port 8081` and open the new address. A different device needs LAN mode and pairing; follow [Use AutoDJ from other devices](install.md#use-autodj-from-other-devices).
 
@@ -32,7 +32,7 @@ Start with the symptom you can see. Keep the terminal open while testing: AutoDJ
 
 ## Streaming
 
-**The stream is missing.** In **Settings**, **Stations**, set **Playback output** to **Radio stream** and press **Save station options**. In **Stations on this server**, stop the station, confirm **Stop station**, then start it again; this applies to the default station too and disconnects its listeners. **Settings**, **Stream** appears when stream output is active. For a one-time default stream, start AutoDJ with `serve --stream`. FFmpeg must be installed. The default stream is `/stream.mp3`; named stations use `/<station-id>.mp3`.
+**The stream is missing.** In **Settings**, **Stations**, set **Playback output** to **Radio stream** and press **Save changes**. In **Stations on this server**, stop the station, confirm **Stop station**, then start it again; this applies to the default station too and disconnects its listeners. **Settings**, **Stream** appears when stream output is active. For a one-time default stream, start AutoDJ with `serve --stream`. FFmpeg must be installed. The default stream is `/stream.mp3`; named stations use `/<station-id>.mp3`.
 
 **A player cannot connect.** Copy **Stream address** from **Settings**, **Stream** while the page is open through a network address. An address containing `127.0.0.1` works only on the AutoDJ computer. Check the firewall, the listener limit, any password, and address bans. A stopped station has no active stream.
 

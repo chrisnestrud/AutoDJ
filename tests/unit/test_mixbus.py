@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import sys
 import threading
 import time
@@ -13,12 +14,16 @@ import pytest
 
 from autodj.mixbus import (
     CATCH_UP_BLOCKS,
+    FULL_PASS_HELD_THRESHOLD,
+    REALTIME_SWITCH_INTERVAL,
     BusEvents,
     LinerCue,
     MixBus,
     RenderedTrack,
     SkipTail,
     SystemClock,
+    full_passes_held,
+    realtime_switching,
 )
 from tests.unit._fakes import FakeClock
 
@@ -343,7 +348,7 @@ def test_run_recovers_from_render_block_exception() -> None:
 
 
 @pytest.mark.parametrize("stall_seconds", [0.07, 0.13, 0.45, 0.95, 2.01])
-def test_run_makes_up_a_stall_in_a_bounded_burst(stall_seconds: float) -> None:
+def test_run_makes_up_a_stall_in_a_bounded_burst(stall_seconds: float, caplog) -> None:
     """A late block is made up, but never with more than CATCH_UP_BLOCKS at once.
 
     Dropping the backlog outright (as the bus once did after a single late
@@ -380,6 +385,209 @@ def test_run_makes_up_a_stall_in_a_bounded_burst(stall_seconds: float) -> None:
     # The stalled block, then the backlog back to back, then one per period.
     assert burst[0] == 1 + made_up
     assert burst[1:] == [burst[0] + 1, burst[0] + 2]
+    if stall_seconds < CATCH_UP_BLOCKS * 0.02:
+        assert "fell behind" not in caplog.text
+
+
+def test_run_warns_about_skipped_periods_with_rate_limited_totals(caplog) -> None:
+    bus, _, _ = _bus([])
+    clock: FakeClock = bus._clock  # type: ignore[assignment]
+    stop = threading.Event()
+    warnings_at: list[float] = []
+    stalls = iter((0.45, 0.95, 0.45, 10.01, 0.45))
+    slept = 0
+    stall_next = True
+
+    class StallingOutput:
+        def write(self, _block: np.ndarray) -> None:
+            nonlocal stall_next
+            if stall_next:
+                clock.t += next(stalls)
+                stall_next = False
+
+    bus.add_output(StallingOutput())
+    original_sleep = clock.sleep
+
+    def sleep_and_maybe_stop(seconds: float) -> None:
+        nonlocal slept, stall_next
+        original_sleep(seconds)
+        records = [r for r in caplog.records if "fell behind" in r.message]
+        if len(records) > len(warnings_at):
+            warnings_at.append(clock.t)
+        slept += 1
+        stall_next = True
+        if slept == 5:
+            stop.set()
+
+    clock.sleep = sleep_and_maybe_stop  # type: ignore[method-assign]
+    bus.run(stop)
+    records = [r for r in caplog.records if "fell behind" in r.message]
+    assert len(records) == 3
+    assert all(r.levelname == "WARNING" for r in records)
+    assert warnings_at[1] - warnings_at[0] >= 10.0
+    # Each stall spends its first 20 ms on the current block, then catches up
+    # eight periods. The second warning totals the three intervening stalls.
+    assert "0.430 s" in records[0].message
+    assert "14 periods of 20 ms" in records[0].message
+    assert "9.990 s" in records[1].message
+    assert "545 periods of 20 ms" in records[1].message  # 39 + 14 + 492
+    assert "14 periods of 20 ms" in records[2].message  # Pending totals flushed at exit.
+
+
+@pytest.mark.parametrize("exit_early", [False, True])
+def test_run_flushes_pending_lag_after_recovery_or_exit(exit_early, caplog) -> None:
+    bus, _, _ = _bus([])
+    clock: FakeClock = bus._clock  # type: ignore[assignment]
+    stop = threading.Event()
+    slept = 0
+    pending_stall = True
+    flushed_while_running = False
+
+    class StallingOutput:
+        def write(self, _block):
+            nonlocal pending_stall
+            if pending_stall:
+                clock.t += 0.45 if slept == 0 else 0.95
+                pending_stall = False
+
+    bus.add_output(StallingOutput())
+    original_sleep = clock.sleep
+
+    def sleep_and_stop(seconds):
+        nonlocal slept, pending_stall, flushed_while_running
+        original_sleep(seconds)
+        slept += 1
+        pending_stall = slept == 1
+        records = [r for r in caplog.records if "fell behind" in r.message]
+        if len(records) == 2:
+            assert clock.t >= 10.45
+            flushed_while_running = True
+            stop.set()
+        if (exit_early and slept == 2) or clock.t > 11:
+            stop.set()
+
+    clock.sleep = sleep_and_stop
+    bus.run(stop)
+    records = [r for r in caplog.records if "fell behind" in r.message]
+    assert len(records) == 2
+    assert "39 periods of 20 ms" in records[1].message
+    assert "0.930 s" in records[1].message
+    assert flushed_while_running is not exit_early
+
+
+@pytest.fixture
+def switch_interval():
+    """Start each test at CPython's default interval and put the real one back."""
+    saved = sys.getswitchinterval()
+    sys.setswitchinterval(0.005)
+    yield
+    sys.setswitchinterval(saved)
+
+
+def _run_bus_for(blocks: int, during=None) -> list[float]:
+    """Run a bus on a fake clock for *blocks* blocks; the interval seen at each write."""
+    bus, _, _ = _bus([_track(0.5, 882 * (blocks + 1))])
+    seen: list[float] = []
+    stop = threading.Event()
+
+    class Watch:
+        def write(self, _block: np.ndarray) -> None:
+            seen.append(sys.getswitchinterval())
+            if during is not None:
+                during(len(seen))
+            if len(seen) >= blocks:
+                stop.set()
+
+    bus.add_output(Watch())
+    bus.start_set()
+    bus.run(stop)
+    return seen
+
+
+def test_run_shortens_the_switch_interval_until_the_last_bus_stops(switch_interval) -> None:
+    """ADR-0004-15: a thread running Python must not keep the GIL from the bus 5 ms at a time.
+
+    With CPython's 5 ms default, two or three busy threads left the bus seconds
+    behind on a small CPU, and both stations of one process skipped periods
+    together.
+    """
+    seen = _run_bus_for(3)
+    assert seen == [pytest.approx(REALTIME_SWITCH_INTERVAL)] * 3
+    assert sys.getswitchinterval() == pytest.approx(0.005)
+
+    # Another station's bus still running keeps the short interval.
+    with realtime_switching():
+        _run_bus_for(2)
+        assert sys.getswitchinterval() == pytest.approx(REALTIME_SWITCH_INTERVAL)
+    assert sys.getswitchinterval() == pytest.approx(0.005)
+
+
+def test_run_leaves_an_interval_someone_else_chose(switch_interval) -> None:
+    """ADR-0004-15: an interval changed during the run, or already shorter, is kept."""
+
+    def choose(written: int) -> None:
+        if written == 1:
+            sys.setswitchinterval(0.002)
+
+    _run_bus_for(2, during=choose)
+    assert sys.getswitchinterval() == pytest.approx(0.002)
+
+    sys.setswitchinterval(0.0002)  # already shorter: kept, and not raised afterwards
+    assert _run_bus_for(2) == [pytest.approx(0.0002)] * 2
+    assert sys.getswitchinterval() == pytest.approx(0.0002)
+
+
+@pytest.fixture
+def gc_thresholds():
+    """Start each test at CPython's default thresholds and put the real ones back."""
+    saved = gc.get_threshold()
+    gc.set_threshold(2000, 10, 10)
+    yield
+    gc.set_threshold(*saved)
+
+
+def test_run_holds_off_full_collections_until_the_last_bus_stops(gc_thresholds) -> None:
+    """ADR-0008-36: the collector's full passes stop every thread, the bus too.
+
+    A category build, a Beets read or a scan keeps hundreds of thousands of
+    new objects alive for seconds; CPython walked them all in pass after pass,
+    and on a small CPU each pass held up every station's bus for up to half a
+    second.  The young generations are still collected.
+    """
+    seen: list[tuple[tuple[int, int, int], bool]] = []
+    _run_bus_for(2, during=lambda _written: seen.append((gc.get_threshold(), full_passes_held())))
+    assert seen == [((2000, 10, FULL_PASS_HELD_THRESHOLD), True)] * 2
+    assert gc.get_threshold() == (2000, 10, 10)
+    assert not full_passes_held()
+
+    with realtime_switching():
+        full = gc.get_stats()[2]["collections"]
+        young = gc.get_stats()[0]["collections"]
+        kept = [[n] for n in range(300_000)]  # objects a build keeps alive while it runs
+        assert gc.get_stats()[2]["collections"] == full
+        assert gc.get_stats()[0]["collections"] > young
+        del kept
+        # Another station's bus still running keeps them held off.
+        _run_bus_for(1)
+        assert full_passes_held()
+    assert gc.get_threshold() == (2000, 10, 10)
+
+
+def test_run_leaves_a_collector_someone_else_set(gc_thresholds) -> None:
+    """ADR-0008-36: thresholds changed during the run, or collection switched off, are kept."""
+
+    def choose(written: int) -> None:
+        if written == 1:
+            gc.set_threshold(700, 10, 10)
+
+    _run_bus_for(2, during=choose)
+    assert gc.get_threshold() == (700, 10, 10)
+
+    gc.set_threshold(0)  # automatic collection off: left off, and no pass is made for it
+    held: list[bool] = []
+    _run_bus_for(1, during=lambda _written: held.append(full_passes_held()))
+    assert held == [False]
+    assert gc.get_threshold() == (0, 10, 10)
 
 
 def test_run_skips_sleep_when_slightly_behind_schedule() -> None:
