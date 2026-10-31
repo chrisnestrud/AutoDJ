@@ -48,7 +48,7 @@ lock, no migration, and the file itself is never written, though SQLite may crea
 read (damaged, not an AutoDJ library, or left half written) stops the command with a message. A
 categories or liner dates file it cannot read is skipped, never moved aside.
 
-In the web page: Settings > Song picking > **Test rotation**. Choose a span or a number of songs,
+In the web page: Settings > Profile > Song picking > **Test rotation**. Choose a span or a number of songs,
 optionally a start and a seed, and press **Test rotation**. The run works in the background; a
 progress bar and a line of text show how far it has got, **Cancel test** stops it with the results
 so far, and the end is announced once. The results appear under **Rotation test results** as
@@ -136,6 +136,18 @@ Each row says in its Status column whether it is fixed or predicted:
 - Clockwheel ad steps appear as **Predicted** ad breaks with their expected length. When no spot
   would play, the row has length 0 and says why.
 
+For near-air recordings, **Voice tracks** reuses a bounded 15-minute preview and
+lets you explicitly confirm a future pair into the ordinary queue. Opening either
+preview remains read-only. Confirmation fixes music choices, not their airtime;
+queue edits remain possible through Keep/Discard/Cancel when speech is affected.
+See [Choose and confirm a future song change](spoken-breaks.md#choose-and-confirm-a-future-song-change).
+
+Random and least-recently-played clockwheel steps keep their previous predicted song while it
+remains eligible and suitable for the step. A step that temporarily falls out before an hour
+restart keeps that preference if it fits again. Each wheel cycle has its own choices; changing
+the wheel or playing a different sequence can require a fresh forecast. These remembered
+choices belong to the preview and do not reserve songs for live playback.
+
 Predicted songs also include song/artist intros and Matched intros rules, using the selected
 station's categories, play dates, cooldowns and liner precedence. Automatic liners use the
 same trigger rules as playback. Talk-ups overlap the song; clips that play before it move
@@ -177,10 +189,21 @@ time zone, as the player does.
 
 The page asks the server only while the card is open. Each preview runs on one worker thread
 below normal priority, never on the web server's event loop and never on the audio threads. The
-dry run stops after 80 songs, or once it has worked about 4 seconds, and says so; the time limit
-is checked before each pick, so one slow pick can run a little past it. A preview is reused for
-45 seconds while nothing new is fixed, longer than the page's 30-second refresh, so an open card
-costs no dry run until a song changes. Several pages asking for the same station and span at once
+dry run stops after 80 songs, and says so. Its first answer comes after at most about 4 seconds of
+work; the time limit is checked before each pick, so one slow pick can run a little past it. On a
+slow server the list may end before the span does. The card then says "Still working out the rest
+of the preview. So far the list runs to 13:02.", and the server goes on from the last pick in the
+background: about 2 seconds of work at a time with a 1-second pause between, only when no other
+preview is waiting, and at most about 20 seconds in all. While that line shows, the card asks
+again every 5 seconds, adding the new rows in place and saying nothing. After **Refresh preview**
+or a new span, the spoken summary ends with "Still working out the rest of the preview", and
+"Hour preview finished." and the summary are said once when it is done. The predicted songs are
+those one longer run would pick. If the 20 seconds run out first, the card says the prediction
+stopped early at its time limit. A preview is reused for 45 seconds from its first answer while
+nothing new is fixed, longer than the page's 30-second refresh, so an open card costs no dry run
+until a song changes; one still filling goes on only during those 45 seconds and while a page
+keeps asking for it. A seek, skip or pause that moves the next song change by more than a second
+makes a new preview. Several pages asking for the same station and span at once
 share one preview, at most 8 different previews wait for the worker, and one more is answered
 with 503 and "try again in a few seconds". At shutdown the server waits for the worker; if it has
 not stopped, the server logs an error and leaves the library open rather than close it under the
@@ -199,7 +222,7 @@ the prediction with an explanation. Unbooked voice tracks, live DJs and manual c
 unpredictable. A scheduled song-picking change affects the next eligible selection. With hour fitting on, predicted picks use the same fitting choice
 as live picks.
 
-To fit song changes near a fixed point, tick **Fit songs to the hour** in Settings > Song picking
+To fit song changes near a fixed point, tick **Fit songs to the hour** in Settings > Profile > Song picking
 (`hour_fit = true` under `[playback]` for the station). **Minutes before to start fitting**
 (`hour_fit_window_minutes`) defaults to 10 and accepts 1 to 30. The setting is off by default.
 The picker considers the next top of hour, clockwheel restart or hard schedule event within that

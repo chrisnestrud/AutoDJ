@@ -29,7 +29,7 @@ describe("automatic rescan", () => {
       expect(document.querySelector(`label[for="${id}"]`).textContent).toBe(label);
       expect(field(id).hasAttribute("aria-describedby")).toBe(false);
     }
-    expect(group.querySelector(".setting-desc").textContent).toMatch(/turns it off; the shortest is 5 minutes/);
+    expect(group.querySelector(".setting-desc").textContent).toMatch(/Minimum 5 minutes; 0 turns it off/);
     expect(field("auto-rescan-error").hidden).toBe(true);
     expect(field("auto-rescan-error").hasAttribute("aria-live")).toBe(false);
     expect(field("auto-rescan-save").textContent).toBe("Save");
@@ -118,31 +118,14 @@ describe("automatic rescan", () => {
   });
 });
 
-describe("find beats and song structure", () => {
-  it("loads the saved setting and saves a change with one Saved", async () => {
-    const page = document.createElement("template");
-    page.innerHTML = html;
-    document.body.replaceChildren(
-      page.content.querySelector("#auto-rescan").cloneNode(true),
-      page.content.querySelector("#dj-analysis").closest("label").cloneNode(true),
-    );
-    const box = field("dj-analysis");
-    expect(box.labels[0].textContent.trim()).toBe("Find beats and song structure");
-    expect(box.checked).toBe(true);
-    const request = vi.fn(async (url, options) => {
-      if (options) return JSON.parse(options.body);
-      return url.endsWith("dj-analysis") ? { enabled: false } : { hours: 0, minutes: 0 };
-    });
-    const say = vi.fn();
-    const controls = installAutoRescan({ document, request, say });
-    await controls.load();
-    expect(box.checked).toBe(false);
-    box.checked = true;
-    box.dispatchEvent(new Event("change"));
-    await flush();
-    expect(request).toHaveBeenLastCalledWith("/api/library/dj-analysis", expect.objectContaining({ method: "PUT" }));
-    expect(JSON.parse(request.mock.lastCall[1].body)).toEqual({ enabled: true });
-    expect(say).toHaveBeenCalledOnce();
-    expect(say).toHaveBeenCalledWith("Saved.");
-  });
+it("does not expose the removed independent Find beats setting", async () => {
+  const page = document.createElement("template");
+  page.innerHTML = html;
+  expect(page.content.querySelector("#dj-analysis")).toBeNull();
+  document.body.replaceChildren(page.content.querySelector("#auto-rescan").cloneNode(true));
+  const request = vi.fn(async () => ({ hours: 0, minutes: 0 }));
+  const controls = installAutoRescan({ document, request, say: vi.fn() });
+  await controls.load();
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(request).toHaveBeenCalledWith("/api/library/auto-rescan");
 });

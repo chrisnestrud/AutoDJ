@@ -35,6 +35,11 @@ clockwheels with a step for the category.
 
 ## Beets paths and `music_dir`
 
+Registered folders supply the music. `music_dir` does not register sources; it is a base for
+relative Beets paths, relative playlist lines, old DJ cue cache keys, relative listener-request
+`blocked_folders` and `migrate-index`, and a place AutoDJ looks for DJ cue exports. Before removing an existing value, review
+[configuration cleanup](catalog-migration.md#clean-up-an-existing-configuration).
+
 AutoDJ finds a song's beets values by its file path. Beets stores full paths, or paths relative
 to its music folder (its `directory` setting); Beets queries and Beets conditions read relative
 paths from `[library] music_dir`. When `music_dir` names the wrong folder, such as an example
@@ -65,6 +70,10 @@ exists, nothing is guessed. Set `music_dir` to the named folder in `config.toml`
 `config.local.toml` (or `AUTODJ_LIBRARY_MUSIC_DIR`) and restart AutoDJ. When beets stores full
 paths that are not the library's, mount the music where beets keeps it, or register it in
 Library tools by that path.
+
+This automatic base detection applies to Beets queries and clock conditions. Enrichment,
+lyrics and tag updates use full Beets paths or the configured base for relative paths.
+Keep `music_dir` when those lookups need it, even if categories work without it.
 
 ## Example: rotations A to D from playlists
 
@@ -107,7 +116,7 @@ The playlists are optional when beets is on the same machine: a category from th
 2. In **Clockwheels**, create **Throwback** with the steps: voice liner from your station ID
    folder, music from category Remembering the 2000s, music from category Remembering the 2000s,
    voice liner, music from category Remembering the 2000s, then save it.
-3. In **Settings**, **Schedule**, add an event at 20:00 on Saturdays that changes song picking to
+3. In **Settings**, **Station**, **Schedule**, add an event at 20:00 on Saturdays that changes song picking to
    **Throwback**, and one at 21:00 that changes it back to your usual clockwheel.
 
 For a narrower hour, add terms: `original_year:2000..2009 genre:rock ^genre:christmas`.

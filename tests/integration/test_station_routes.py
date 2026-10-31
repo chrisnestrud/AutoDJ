@@ -54,6 +54,13 @@ SHARED = frozenset(
         "/api/updates/check",
         "/api/updates/settings",
         "/api/server/restart",
+        "/api/server/update",
+        "/api/server/go-back",
+        "/api/server/certificates",
+        "/api/server/certificates/import",
+        "/api/server/certificates/{certificate_id}",
+        "/api/server/certificates/{certificate_id}/activate",
+        "/api/server/certificates/{certificate_id}/download",
         "/api/library/tracks",
         "/api/library/folders",
         "/api/library/folders/{source_id}",
@@ -61,7 +68,6 @@ SHARED = frozenset(
         "/api/library/browse",
         "/api/library/rescan",
         "/api/library/auto-rescan",
-        "/api/library/dj-analysis",
         "/api/library/advanced-length",
         "/api/library/music-fade",
         "/api/library/points",
@@ -189,6 +195,8 @@ STATION = frozenset(
         "/profiles",
         "/profiles/{name}",
         "/profiles/{name}/apply",
+        "/profiles/apply-defaults",
+        "/profiles/{name}/reset",
         "/categories",
         "/categories/check",
         "/categories/{category_id}",
@@ -232,6 +240,7 @@ STATION = frozenset(
         "/announcer/breaks/{break_id}",
         # The voice tracker (#128): browser routes, by station.
         "/voice-tracks",
+        "/voice-tracks/targets/confirm",
         "/voice-tracks/{break_id}",
         # Settings, Breaks (#88): whether the station takes breaks, and how.
         "/breaks/settings",
@@ -301,7 +310,7 @@ def _app(tmp_path: Path | None = None, **server: object) -> tuple[TestClient, Pl
 def test_every_route_is_classified_as_shared_or_station() -> None:
     """A new route must say whether it acts on one station; this test fails until it does.
 
-    ADR-0005-04.
+    ADR-0005-04, ADR-0018-05.
     """
     client, _bridge = _app()
     paths = {route.path for route in client.app.routes}

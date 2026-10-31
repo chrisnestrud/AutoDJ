@@ -26,7 +26,13 @@ from urllib.parse import urlencode
 
 import pytest
 
-from autodj.config import PlayerPageConfig, RequestsConfig, ServerConfig, TimeChecksConfig
+from autodj.config import (
+    PlayerPageConfig,
+    RequestsConfig,
+    ServerConfig,
+    StationConfig,
+    TimeChecksConfig,
+)
 from autodj.live_protocol import IcecastSourceH11Protocol
 from autodj.repeat_settings import RepeatRule, RepeatSettings
 from autodj.server import PlayerBridge
@@ -396,6 +402,7 @@ class TestLiners:
         response = tc.get("/api/liners/file/stable-liner-id")
         assert response.status_code == 200
         assert response.content == b"registered-audio"
+        assert response.headers["content-type"] == "audio/mpeg"
         deleted = tc.delete("/api/liners/file/stable-liner-id")
         assert deleted.status_code == 200
         assert deleted.json() == {"deleted": "voice.mp3"}
@@ -1013,6 +1020,21 @@ class TestRepeatSettings:
         assert bridge.get_settings()["playback"]["related_artists_problem"].startswith(
             "The related artists file is not valid"
         )
+        assert (
+            bridge.settings.related_artists_problem
+            == bridge.get_settings()["playback"]["related_artists_problem"]
+        )
+
+        path.write_text('[related]\n"Alpha" = ["Beta"]\n', encoding="utf-8")
+        assert patch_station_settings(client, {"playback": payload}).status_code == 200
+        assert bridge.settings.related_artists_problem is None
+        assert bridge.player._related_artists.related_to("alpha") == {"beta"}
+
+        path.write_text("[related\n", encoding="utf-8")
+        payload["repeat_rules"]["use_related_artists"] = False
+        assert patch_station_settings(client, {"playback": payload}).status_code == 200
+        assert bridge.settings.related_artists_problem is None
+        assert bridge.player._related_artists.links == {}
 
     def test_related_tracks_load_on_save_with_their_own_limits(self, bridge, tmp_path) -> None:
         client = self._client(bridge, tmp_path)
@@ -1062,8 +1084,18 @@ class TestRepeatSettings:
         assert bridge.get_settings()["playback"]["related_tracks_problem"] == (
             "The related tracks file is not valid."
         )
+        assert (
+            bridge.settings.related_tracks_problem
+            == bridge.get_settings()["playback"]["related_tracks_problem"]
+        )
+
+        path.write_text('[related]\n"Alpha - One" = ["Beta - Two"]\n', encoding="utf-8")
+        assert patch_station_settings(client, {"playback": payload}).status_code == 200
+        assert bridge.settings.related_tracks_problem is None
+        assert bridge.player._related_tracks.related_to(("beta", "two")) == {("alpha", "one")}
 
         # Turned off, the broken file is not read and the save goes through.
+        path.write_text("[related\n", encoding="utf-8")
         payload["repeat_rules"]["use_related_tracks"] = False
         assert patch_station_settings(client, {"playback": payload}).status_code == 200
         assert not bridge.player._state.rules.related_tracks.links
@@ -1105,6 +1137,15 @@ class TestRepeatSettings:
 
 
 class TestProfiles:
+    @pytest.fixture(autouse=True)
+    def valid_profile_defaults(self, bridge):
+        """Keep profile validation realistic despite the mock config's MagicMock values."""
+        cfg = bridge.player._cfg
+        cfg.djmix.beatmatch_max_stretch = 0.3
+        cfg.djmix.filter_sweep_floor_hz = 100.0
+        cfg.replaygain.target_db = -12.0
+        cfg.playback.crossfade_bass_cutoff_hz = 120.0
+
     def test_profiles_empty(self, client) -> None:
         resp = client.get("/api/profiles")
         assert resp.status_code == 200
@@ -1127,6 +1168,17 @@ class TestProfiles:
         assert resp.status_code == 200
         body = tc.get("/api/profiles").json()
         assert "Wakeup" in body["profiles"]
+
+    def test_profile_create_rejects_duplicate_name(self, bridge, tmp_path) -> None:
+        from fastapi.testclient import TestClient
+
+        point_index(bridge.player._cfg.index, tmp_path / "idx")
+        (tmp_path / "idx").mkdir()
+        tc = TestClient(create_app(bridge))
+        assert tc.post("/api/profiles", json={"name": "Wakeup"}).status_code == 200
+        duplicate = tc.post("/api/profiles", json={"name": "Wakeup"})
+        assert duplicate.status_code == 400
+        assert "Wakeup" in tc.get("/api/profiles").json()["profiles"]
 
     def test_profile_invalid_name_rejected(self, bridge, tmp_path) -> None:
         from fastapi.testclient import TestClient
@@ -1167,7 +1219,7 @@ class TestProfiles:
         resp = tc.post("/api/profiles/Quiet/apply")
         assert resp.status_code == 200
         body = resp.json()
-        assert "beat_sync_fx" in body["applied"]
+        assert "playback" in body["applied"]
         # Bridge set_playback_settings invoked on the mock cfg.
         assert bridge.player._cfg.playback.beat_sync_fx is False
         assert bridge.player._cfg.playback.key_sync_fx is False
@@ -1332,6 +1384,7 @@ class TestProfiles:
         assert tc.post("/api/profiles", json={"name": "Io"}).status_code == 200
         assert tc.get("/api/profiles").status_code == 200
         assert tc.post("/api/profiles/Io/apply").status_code == 200
+        assert tc.post("/api/profiles/apply-defaults").status_code == 200
         assert tc.delete("/api/profiles/Io").status_code == 200
         files = {"file": ("b.wav", wav_bytes(), "audio/wav")}
         assert tc.post("/api/liners/upload", files=files).status_code == 200
@@ -1339,11 +1392,12 @@ class TestProfiles:
         assert tc.delete("/api/liners/file/a.mp3").status_code == 200
 
         for name in (
-            "save",
+            "create",
+            "apply",
             "list_names",
-            "load",
+            "resolve",
             "delete",
-            "open_liner_file",
+            "resolve_liner_path",
             "delete_liner_file",
         ):
             assert name in offloaded, name
@@ -1952,7 +2006,7 @@ async def test_http_api_accessible_via_async_client() -> None:
 
 
 class TestLifespan:
-    def test_app_lifespan_starts_and_stops(self) -> None:
+    def test_app_lifespan_starts_and_stops(self, caplog) -> None:
         """Using TestClient as a context manager triggers lifespan startup/teardown."""
         from fastapi.testclient import TestClient
 
@@ -1961,9 +2015,10 @@ class TestLifespan:
         bridge = PlayerBridge(player=player, sim=sim)
         app = create_app(bridge)
 
-        with TestClient(app) as tc:
+        with caplog.at_level("INFO", logger="autodj.server"), TestClient(app) as tc:
             resp = tc.get("/api/status")
             assert resp.status_code == 200
+            assert "Startup: stations and background services started in" in caplog.text
 
     def test_api_accessible_during_lifespan(self) -> None:
         from fastapi.testclient import TestClient
@@ -2151,10 +2206,13 @@ class TestServeFunction:
 
     @pytest.mark.parametrize(
         ("stop", "expected"),
-        [("restart", True), ("ctrl-c", False), ("signal", False)],
+        [("restart", 75), ("update", 85), ("ctrl-c", None), ("signal", None)],
     )
     def test_a_stop_signal_wins_over_a_pending_restart(self, tmp_path, stop, expected) -> None:
-        """ADR-0016-10: Ctrl+C or SIGTERM during a restart's shutdown stops AutoDJ."""
+        """ADR-0016-10: Ctrl+C or SIGTERM during a restart's shutdown stops AutoDJ.
+
+        ADR-0016-18: an update request exits with the update status instead.
+        """
         import signal as signals
         from unittest.mock import MagicMock, patch
 
@@ -2170,6 +2228,8 @@ class TestServeFunction:
         def run() -> None:
             app = config.call_args.args[0]
             app.state.restart_requested = True
+            if stop == "update":
+                app.state.exit_status = 85
             if stop == "ctrl-c":
                 raise KeyboardInterrupt
 
@@ -2209,6 +2269,7 @@ class TestServeFunction:
         assert mock_uvicorn.call_args.kwargs["port"] == 8080
         assert "http://127.0.0.1:8080" in caplog.text
         assert "http://localhost:8080" not in caplog.text
+        assert "Startup: server app construction took" in caplog.text
         app = mock_uvicorn.call_args.args[0]
         with (
             patch("autodj.player.Player.run", player_run),
@@ -2386,6 +2447,7 @@ class TestServeFunction:
                 playback=SimpleNamespace(stereotool_preset="included"),
                 requests=RequestsConfig(enabled=True),
                 player_page=PlayerPageConfig(enabled=True),
+                station=StationConfig(output="stream"),
             ),
         )
         captured = self._serve_capturing_player(tmp_path, stations=(spec,), no_playback=True)
@@ -4934,7 +4996,11 @@ class TestHistoryEndpoint:
         assert data["page"] == 1
 
     def test_play_history_default_is_bounded_deque(self) -> None:
-        """New PlayerBridge instances start with a bounded deque (cap 500)."""
+        """New PlayerBridge instances start with bounded deques.
+
+        500 songs and live sets (cap 500), and beside them their own room
+        for the liners and other audio aired between them (#601).
+        """
         from collections import deque
 
         from autodj.server import PlayerBridge
@@ -4943,6 +5009,7 @@ class TestHistoryEndpoint:
         bridge = PlayerBridge(player=_make_player_mock(), sim=_make_sim_mock())
         assert isinstance(bridge._play_history, deque)
         assert bridge._play_history.maxlen == 500
+        assert bridge._aired_history.maxlen == 1500
 
     def test_pagination_with_deque_backing(self) -> None:
         """Ensure /api/history slicing works when history is a real deque
@@ -5086,6 +5153,32 @@ class TestBroadcastStateOnce:
             self._push(bridge, clients, failures)
             assert "works again" in caplog.text
         sent.assert_awaited_once()
+
+    def test_active_profile_identity_is_included_in_each_state_push(
+        self, bridge, monkeypatch
+    ) -> None:
+        from autodj.server import _broadcast_state_once, _BroadcastFailureLog
+
+        payloads = []
+
+        async def capture(_clients, _lock, payload):
+            payloads.append(json.loads(payload))
+
+        monkeypatch.setattr("autodj.server._broadcast_and_prune", capture)
+        active = ["Night"]
+        for value in ("Night", "Day"):
+            active[0] = value
+            asyncio.run(
+                _broadcast_state_once(
+                    bridge,
+                    {object()},
+                    asyncio.Lock(),
+                    _BroadcastFailureLog(),
+                    active_profile=lambda: active[0],
+                )
+            )
+
+        assert [payload["active_profile"] for payload in payloads] == ["Night", "Day"]
 
     def test_a_new_kind_of_failure_gets_its_own_traceback(self, bridge, caplog) -> None:
         import logging

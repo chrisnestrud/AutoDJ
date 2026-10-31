@@ -24,6 +24,7 @@ from autodj import hour_preview
 from autodj.breaks import SlotPlan, TransitionItem
 from autodj.hour_preview import (
     KEEP_SECONDS,
+    NOTHING_PLAYING,
     HourPreviews,
     Item,
     Point,
@@ -40,7 +41,7 @@ from autodj.hour_preview import (
     song_changes,
 )
 from autodj.identity_map import IdentityMap
-from autodj.mixbus import RenderedTrack
+from autodj.mixbus import MixBus, RenderedTrack
 from autodj.player import apply_repeat_windows
 from autodj.repeat_rules import PlayRecord
 from autodj.rotation_sim import (
@@ -111,6 +112,95 @@ def test_times_and_lengths_read_well() -> None:
     assert length_text(3600) == "1:00:00"
     assert length_text(3725) == "1:02:05"
     assert length_text(1) == "0:01"
+
+
+def test_future_targets_are_read_only_and_distinguish_repeated_occurrences(tmp_path):
+    """ADR-0004-22: future targets are read only and distinguish repeated occurrences."""
+    from autodj.live_queue import capture_voice_targets
+
+    source, power, _ = _station(tmp_path)
+    player = source.player
+    player.live_mixing = True
+    current, following = power[:2]
+    player._state.current_track = current
+    before = list(player._state.queue)
+    rows = tuple(
+        Item("song", NOW + i * 100, 100, "predicted", entry)
+        for i, entry in enumerate((current, following, following, following))
+    )
+    targets = capture_voice_targets(player, rows, now=NOW)
+    assert len(targets) == 2
+    assert len({target.target_id for target in targets}) == 2
+    assert targets[0].outgoing_id != targets[0].incoming_id
+    assert player._state.queue == before
+    assert not hasattr(following, "occurrence_id")
+
+
+def test_future_target_horizon_and_programme_boundaries(tmp_path):
+    """ADR-0004-27: eligibility stops at the horizon, programme boundaries and unknown duration."""
+    from autodj.live_queue import capture_voice_targets
+
+    source, power, _ = _station(tmp_path)
+    player = source.player
+    player.live_mixing = True
+    player._state.current_track = power[0]
+    rows = tuple(
+        Item("song", NOW + i * 240, 240, "predicted", entry) for i, entry in enumerate(power)
+    )
+    targets = capture_voice_targets(player, rows, now=NOW, boundary=NOW + 600)
+    assert len(targets) == 1 and targets[0].estimated_airtime == NOW + 480
+    assert len(capture_voice_targets(player, rows, now=NOW)) == 2
+    unknown = (*rows[:2], replace(rows[2], duration_unknown=True), *rows[3:])
+    assert not capture_voice_targets(player, unknown, now=NOW)
+
+
+def test_forecast_repeat_of_current_is_a_new_unconfirmed_occurrence(tmp_path):
+    from autodj.live_queue import capture_voice_targets
+
+    source, power, _ = _station(tmp_path)
+    player = source.player
+    player.live_mixing = True
+    player._state.current_track = power[0]
+    player._state.queue[:] = [power[1]]
+    rows = (
+        Item("song", NOW, 100, "on_air", power[0]),
+        Item("song", NOW + 100, 100, "queued", power[1]),
+        Item("song", NOW + 200, 100, "predicted", power[0]),
+        Item("song", NOW + 300, 100, "predicted", power[1]),
+    )
+    targets = capture_voice_targets(player, rows, now=NOW)
+    assert len(targets) == 2
+    assert all(target.selection == "predicted" for target in targets)
+    assert targets[0].incoming is not power[0]
+    assert targets[1].incoming is not power[1]
+
+
+def test_future_preview_fill_keeps_target_identity_and_transition_metadata(tmp_path, monkeypatch):
+    """ADR-0004-22: future preview fill keeps target identity and transition metadata."""
+    from autodj.player import Player
+
+    source, power, gold = _station(tmp_path)
+    _playing(source, gold[0], NOW - 50)
+    source.player.live_mixing = True
+    source.player._cfg.playback.transition_mode = "saved_points"
+    monkeypatch.setattr(
+        Player, "_transition_voice", lambda self, *args: ([(power[0], False)], "frozen", None)
+    )
+    captured = []
+    fill = []
+    first = build_preview(source, 15, now=NOW, budget=0, keep_going=fill.append)
+    assert first["filling"] and fill
+    fill[0].run(2)
+    view = fill[0].view(filling=True, on_items=captured.extend)
+    targets = view["voice_targets"]
+    assert targets
+    assert any(row.incoming_handoff and row.incoming_handoff.transition_items for row in captured)
+    assert all(source.player._voice_targets[row["target_id"]].transition_items for row in targets)
+    again = fill[0].view(filling=True)
+    assert [row["target_id"] for row in again["voice_targets"]] == [
+        row["target_id"] for row in targets
+    ]
+    assert not source.player._state.queue
 
 
 def test_preview_lrp_preference_breaks_only_a_best_choice_tie() -> None:
@@ -673,6 +763,88 @@ def test_the_dry_run_stops_at_its_limits(tmp_path: Path, monkeypatch) -> None:
     assert "time limit" in timed["stopped"]
 
 
+def _matching_station(root: Path) -> Any:
+    """Power, then a conditions step over Gold; most of the history is old plays."""
+    power = [song(n, f"Power {n}") for n in range(6)]
+    gold = [song(100 + n, f"Gold {n}", title=f"Gold song {n % 30}") for n in range(60)]
+    source = make_station(
+        root,
+        [*power, *gold],
+        liners=[liner(1), liner(2)],
+        categories=[{"id": "power", "name": "Power", "members": power}],
+        clockwheels=[
+            {
+                "name": "Main",
+                "resync_minutes": [],
+                "steps": [
+                    liner_step(),
+                    category_step("power"),
+                    {
+                        "type": "music",
+                        "selection": "least_recent",
+                        "enforce_rules": True,
+                        "conditions": [
+                            {"field": "artist", "operator": "contains", "value": "Gold"}
+                        ],
+                    },
+                ],
+            }
+        ],
+        active_clock="Main",
+        playback={"pick_mode": "clock", "repeat_rules": {"versions_as_one_song": True}},
+    )
+    source.ledger.played = {f"/music/old/{n:06d}.flac": NOW - 600 - n for n in range(3000)}
+    _playing(source, gold[0], NOW - 50)
+    return source
+
+
+def test_a_preview_starts_from_what_the_station_worked_out(tmp_path: Path, monkeypatch) -> None:
+    """ADR-0009-12: no pass over the whole library or history for each pick."""
+    from autodj import clockwheel, repeat_rules
+
+    counts = dict.fromkeys(("conditions", "keys", "paths"), 0)
+
+    def counting(name: str, original: Any) -> Any:
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            counts[name] += 1
+            return original(*args, **kwargs)
+
+        return counted
+
+    monkeypatch.setattr(
+        clockwheel, "condition_paths", counting("conditions", clockwheel.condition_paths)
+    )
+    monkeypatch.setattr(repeat_rules, "title_key", counting("keys", repeat_rules.title_key))
+    monkeypatch.setattr(clockwheel, "_normalized", counting("paths", clockwheel._normalized))
+    cold = _matching_station(tmp_path / "cold")
+    assert cold.player._state.rules.versions_as_one_song
+    first = build_preview(cold, 60, now=NOW)
+    # The station's own player is left as it was.
+    assert getattr(cold.player, "_clock_condition_cache", None) is None
+    assert cold.player._key_cache is None
+    assert counts["conditions"] >= 1 and counts["keys"] >= 60
+    played = len(cold.ledger.played)
+    # The history is normalized once, not once for each of the songs picked.
+    assert counts["paths"] < 4 * played
+
+    warm = _matching_station(tmp_path / "warm")
+    player = warm.player
+    context = player._pick_context(at=NOW)
+    for cursor in range(3):  # As a station on the air has: every step picked once.
+        player._clock_pick(context, cursor)
+    live_steps = dict(player._clock_condition_cache._paths)
+    live_keys = len(player._key_cache[1]._keys)
+    counts.update(dict.fromkeys(counts, 0))
+    again = build_preview(warm, 60, now=NOW)
+    assert counts["conditions"] == 0 and counts["keys"] == 0
+    assert counts["paths"] < 4 * played
+    assert player._clock_condition_cache._paths == live_steps
+    assert len(player._key_cache[1]._keys) == live_keys
+    # What the station had worked out picks the same songs.
+    assert len([item for item in first["items"] if item["kind"] == "song"]) > 8
+    assert again["items"] == first["items"]
+
+
 def test_a_scheduled_change_of_picking_reaches_the_prediction(tmp_path: Path) -> None:
     switch = _event(
         "Gold only",
@@ -1159,6 +1331,24 @@ def test_a_preview_is_kept_while_nothing_new_is_fixed(tmp_path: Path, monkeypatc
     assert int(refresh_ms[1]) / 1000 < KEEP_SECONDS
 
 
+def test_a_station_that_never_had_a_clockwheel_gets_a_preview(tmp_path: Path) -> None:
+    # A player sets its clockwheel steps only when it loads a clockwheel.
+    source, _power, gold = _station(
+        tmp_path, clockwheels=[], active_clock=None, playback={"pick_mode": "similarity"}
+    )
+    assert not hasattr(source.player, "_clock_steps")
+    previews = HourPreviews()
+    try:
+        idle = previews.submit(source, 60).result(timeout=30)
+        assert idle["reason"] == NOTHING_PLAYING
+        _playing(source, gold[0], time.time() - 30)
+        playing = previews.submit(source, 60, force=True).result(timeout=30)
+        assert playing["reason"] is None
+        assert playing["items"][0]["status"] == "on_air"
+    finally:
+        assert previews.shutdown(5.0)
+
+
 def test_cache_freshness_covers_handoff_rules_schedule_library_and_refresh(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1174,7 +1364,9 @@ def test_cache_freshness_covers_handoff_rules_schedule_library_and_refresh(
     )
     versions = [0]
     source.library.catalog.change_versions = lambda: {"entries": versions[0]}
-    source.player._cfg = SimpleNamespace(playback=SimpleNamespace(repeat_rules="one"))
+    source.player._cfg = SimpleNamespace(
+        playback=SimpleNamespace(repeat_rules="one", pick_mode="clock")
+    )
     previews = HourPreviews()
 
     previews.get(source, 60)
@@ -1217,6 +1409,58 @@ def test_cache_freshness_covers_handoff_rules_schedule_library_and_refresh(
     decided = replace(decided, items=(replace(intro, asset_id="intro-b", label="Year 2001"),))
     previews.get(source, 60)
     assert len(builds) == 11
+
+
+def test_a_kept_preview_survives_the_jitter_of_the_playing_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0009-03: the song change read from a playing bus jitters; only a real move rebuilds."""
+    source, _power, gold = _station(tmp_path)
+    player = source.player
+    # Started so that the next song change falls just before a half second.
+    started = NOW - 50 + 0.47
+    _playing(source, gold[0], started)
+    player.bus = object()
+    player._playing_render = _render(gold[0], 200, gold[1], 5)
+    player._pending_entry = gold[1]
+    player._pending_offset = round(5 * SR)
+    wall = [NOW]
+    real = hour_preview.read_station
+    monkeypatch.setattr(
+        hour_preview, "read_station", lambda *args, **kwargs: real(*args, now=wall[0], **kwargs)
+    )
+    builds: list[float] = []
+
+    def counting(*_args: Any, decided: hour_preview.Decided, **_kwargs: Any) -> dict[str, Any]:
+        builds.append(decided.handoff)
+        return {}
+
+    monkeypatch.setattr(hour_preview, "build_preview", counting)
+
+    def play(after: float, late: float) -> None:
+        # The bus reports its place once per block it renders, and a busy
+        # server renders a few blocks late, then catches up.
+        wall[0] = NOW + after
+        played = (wall[0] - started - late) * SR
+        player._playback_pos[0] = int(played) // MixBus.BLOCK * MixBus.BLOCK
+
+    previews = HourPreviews()
+    handoffs = []
+    for ask, late in enumerate((0.0, 0.06, 0.0, 0.1, 0.02)):
+        play(ask * 9 + 0.013 * ask, late)
+        handoffs.append(real(player, now=wall[0]).handoff)
+        previews.get(source, 60)
+    # Nothing changed on the air: the readings differ by a few blocks only,
+    # yet they straddle a half second.
+    assert max(handoffs) - min(handoffs) < 0.15
+    assert len({round(handoff) for handoff in handoffs}) == 2
+    assert len(builds) == 1
+    # A seek moves the song change: the preview is made again.
+    play(40, 0.0)
+    player._playback_pos[0] += round(2 * SR)
+    previews.get(source, 60)
+    assert len(builds) == 2
+    assert builds[1] == pytest.approx(builds[0] - 2, abs=0.15)
 
 
 def test_category_signature_does_not_hold_the_category_pick_lock(
@@ -2168,3 +2412,228 @@ def test_pending_time_check_replaces_automatic_liner_without_consuming_live_stat
     )
     assert checks._pending
     assert checks._aired_hour is None
+
+
+# -- a preview that fills in ------------------------------------------------------------
+
+
+def _slow_picks(monkeypatch, seconds: float = 0.03) -> None:
+    """Each predicted pick takes at least *seconds*, as on a slow server; slices go on at once."""
+    monkeypatch.setattr(hour_preview, "_PICK_PAUSE_S", seconds)
+    monkeypatch.setattr(hour_preview, "FILL_PAUSE_SECONDS", 0.0)
+
+
+def _filled(previews: HourPreviews, source: Any, minutes: int = 60) -> list[dict[str, Any]]:
+    """Each view the page would see, asking until the preview stops filling."""
+    views = [previews.submit(source, minutes).result(timeout=30)]
+    deadline = time.monotonic() + 30
+    while views[-1]["filling"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+        view = previews.submit(source, minutes).result(timeout=30)
+        if view is not views[-1]:
+            views.append(view)
+    return views
+
+
+def _rows(view: dict[str, Any]) -> list[tuple[Any, ...]]:
+    return [(row["status"], row["path"], row["starts_at"]) for row in view["items"]]
+
+
+def test_a_preview_past_its_time_limit_fills_in_as_one_long_run_would(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """ADR-0009-13."""
+    source, _power, gold = _station(tmp_path, varied=True)
+    _playing(source, gold[0], time.time() - 30)
+    _slow_picks(monkeypatch)
+    unlimited = HourPreviews(budget=60.0)
+    try:
+        whole = unlimited.submit(source, 60).result(timeout=60)
+    finally:
+        assert unlimited.shutdown(5.0)
+    assert whole["filling"] is None and whole["stopped"] is None
+    previews = HourPreviews(budget=0.1, fill_slice=0.1)
+    try:
+        views = _filled(previews, source)
+    finally:
+        assert previews.shutdown(5.0)
+    first, last = views[0], views[-1]
+    # The first answer says the rest is still coming, not that the prediction stopped.
+    assert first["stopped"] is None
+    assert first["filling"].startswith("Still working out the rest of the preview.")
+    assert "So far the list runs to" in first["filling"]
+    assert len(first["items"]) < len(whole["items"])
+    assert len(views) > 2
+    # Each later view is longer, and the last is the whole run's.
+    for before, after in itertools.pairwise(views):
+        assert _rows(after)[: len(before["items"])] == _rows(before)
+    assert last["filling"] is None and last["stopped"] is None
+    assert _rows(last) == _rows(whole)
+    # counts_text ends at a wall-clock time, which may move on a second between the two runs.
+    assert last["counts"] == whole["counts"]
+    # Nothing on the air changed.
+    assert source.ledger.writes == 0 and source.library.catalog.writes == 0
+
+
+def test_a_preview_that_cannot_fill_in_time_says_it_stopped(tmp_path: Path, monkeypatch) -> None:
+    """ADR-0009-13: once its work runs out, the preview says the prediction stopped early."""
+    source, _power, gold = _station(tmp_path)
+    _playing(source, gold[0], time.time() - 30)
+    _slow_picks(monkeypatch)
+    previews = HourPreviews(budget=0.1, fill=0.35, fill_slice=0.1)
+    try:
+        views = _filled(previews, source)
+    finally:
+        assert previews.shutdown(5.0)
+    assert views[0]["filling"] and views[0]["stopped"] is None
+    assert views[-1]["filling"] is None
+    assert views[-1]["stopped"] == (
+        "The prediction stopped early: it reached its time limit. "
+        "The list ends at the last song it picked."
+    )
+    assert not previews._filling
+
+
+def test_a_preview_stops_filling_when_something_new_is_fixed(tmp_path: Path, monkeypatch) -> None:
+    """ADR-0009-13: a new song, a forced refresh or the end of its keep stops the old one."""
+    source, _power, gold = _station(tmp_path)
+    _playing(source, gold[0], time.time() - 30)
+    _slow_picks(monkeypatch, 0.05)
+    monkeypatch.setattr(hour_preview, "FILL_PAUSE_SECONDS", 0.5)
+    previews = HourPreviews(budget=0.1, fill_slice=0.1)
+    try:
+        first = previews.submit(source, 60).result(timeout=30)
+        assert first["filling"]
+        filling = previews._filling[(source.station, 60)]
+        source.player._state.next_track = gold[5]
+        deadline = time.monotonic() + 10
+        while previews._filling and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not previews._filling and filling.fill.done
+        # The next ask makes a new preview, which fills in on its own.
+        again = previews.submit(source, 60).result(timeout=30)
+        assert again is not first and again["filling"]
+        replaced = previews._filling[(source.station, 60)]
+        forced = previews.submit(source, 60, force=True).result(timeout=30)
+        assert forced is not again and replaced.fill.done
+    finally:
+        assert previews.shutdown(5.0)
+
+    # Nobody asks again: once the keep ends, the worker still lets the dry run go.
+    monkeypatch.setattr(hour_preview, "FILL_IDLE_SECONDS", 0.0)
+    kept = HourPreviews(keep=0.3, budget=0.1, fill_slice=0.1)
+    try:
+        assert kept.submit(source, 30).result(timeout=30)["filling"]
+        filling = kept._filling[(source.station, 30)]
+        deadline = time.monotonic() + 10
+        while kept._filling and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not kept._filling and filling.fill.done
+    finally:
+        assert kept.shutdown(5.0)
+
+
+def test_a_preview_goes_on_filling_through_the_jitter_of_the_playing_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0009-13: a song change read a few blocks apart is not a new fixed song."""
+    source, _power, gold = _station(tmp_path)
+    player = source.player
+    # Started so that the next song change falls just before a half second.
+    started = int(time.time()) - 30 + 0.47
+    _playing(source, gold[0], started)
+    player.bus = object()
+    player._playing_render = _render(gold[0], 200, gold[1], 5)
+    player._pending_entry = gold[1]
+    player._pending_offset = round(5 * SR)
+    lateness = itertools.cycle((0.0, 0.1))
+    real = hour_preview.read_station
+
+    def playing(*args: Any, **kwargs: Any) -> hour_preview.Decided:
+        # Each read finds the bus a block or a few late, as on a busy server.
+        now = time.time()
+        played = (now - started - next(lateness)) * SR
+        player._playback_pos[0] = int(played) // MixBus.BLOCK * MixBus.BLOCK
+        return real(*args, now=now, **kwargs)
+
+    monkeypatch.setattr(hour_preview, "read_station", playing)
+    built: list[int] = []
+    build = hour_preview.build_preview
+
+    def counting(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        built.append(1)
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(hour_preview, "build_preview", counting)
+    _slow_picks(monkeypatch)
+    previews = HourPreviews(budget=0.1, fill_slice=0.1)
+    try:
+        views = _filled(previews, source)
+    finally:
+        assert previews.shutdown(5.0)
+    assert views[0]["filling"]
+    assert len(views) > 2
+    assert views[-1]["filling"] is None and views[-1]["stopped"] is None
+    assert len(built) == 1
+
+
+def test_filling_waits_for_the_page_and_never_holds_up_an_ask(tmp_path: Path, monkeypatch) -> None:
+    """ADR-0009-13: only a preview the page still asks for goes on, behind any ask."""
+    source, _power, gold = _station(tmp_path)
+    _playing(source, gold[0], time.time() - 30)
+    _slow_picks(monkeypatch)
+    previews = HourPreviews(waiting=1, budget=0.1, fill_slice=0.1)
+    try:
+        assert previews.submit(source, 60).result(timeout=30)["filling"]
+        filling = previews._filling[(source.station, 60)]
+        # The page stopped asking: no more work until it asks again.
+        monkeypatch.setattr(hour_preview, "FILL_IDLE_SECONDS", 0.0)
+        time.sleep(0.3)
+        worked = filling.fill.worked
+        time.sleep(0.3)
+        assert filling.fill.worked == worked and not filling.fill.done
+        # Asks are still taken while a preview fills; none waits behind its work.
+        other = previews.submit(source, 30)
+        assert other.result(timeout=30)["items"]
+        monkeypatch.setattr(hour_preview, "FILL_IDLE_SECONDS", 15.0)
+        views = _filled(previews, source)
+        assert views[-1]["filling"] is None
+    finally:
+        assert previews.shutdown(5.0)
+
+
+def test_filling_ends_within_the_keep_and_the_page_asks_often_enough() -> None:
+    """ADR-0009-13: the slices fit in KEEP_SECONDS; the filling page asks within the idle time."""
+    slices = -(
+        -(hour_preview.FILL_SECONDS - hour_preview.BUDGET_SECONDS)
+        // hour_preview.FILL_SLICE_SECONDS
+    )
+    wall = hour_preview.BUDGET_SECONDS + slices * (
+        hour_preview.FILL_SLICE_SECONDS + hour_preview.FILL_PAUSE_SECONDS
+    )
+    assert wall < KEEP_SECONDS
+    script = (Path(hour_preview.__file__).parent / "static/modules/hour-preview.js").read_text(
+        encoding="utf-8"
+    )
+    found = re.search(r"const FILLING_REFRESH_MS = (\d+);", script)
+    assert found is not None
+    assert int(found[1]) / 1000 < hour_preview.FILL_IDLE_SECONDS / 2
+
+
+def test_ineligible_future_row_remains_inspectable_with_reason(tmp_path):
+    """ADR-0004-27: unknown-duration music is inspectable but cannot be confirmed."""
+    from autodj.breaks_api import _voice_target_views
+    from autodj.live_queue import capture_voice_targets
+
+    source, power, _ = _station(tmp_path)
+    player = source.player
+    player.live_mixing = True
+    player._state.current_track = power[0]
+    rows = tuple(
+        Item("song", NOW + i * 60, 60, "predicted", entry) for i, entry in enumerate(power[:3])
+    )
+    capture_voice_targets(player, (*rows[:2], replace(rows[2], duration_unknown=True)), now=NOW)
+    targets = _voice_target_views(player)
+    assert len(targets) == 1
+    assert targets[0]["eligible"] is False
+    assert "duration" in targets[0]["reason"]

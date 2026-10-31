@@ -11,15 +11,17 @@ names and carry no slug.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
 import shutil
 import socket
 import sqlite3
+import subprocess  # nosec B404 -- nvidia-smi with a fixed argv, never a shell
 import sys
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
@@ -30,6 +32,7 @@ from autodj.config import is_loopback_bind
 from autodj.index_manifest import has_legacy_index
 from autodj.repeat_settings import removed_saved_repeat_keys
 from autodj.sqlite_utils import readonly_uri
+from autodj.terminal_text import format_text
 
 _connect = sqlite3.connect
 
@@ -110,7 +113,7 @@ def render_text(report: DoctorReport) -> str:
                 else check.detail
             )
             line += f" {detail}"
-        lines.append(line)
+        lines.append(format_text(line))
     return "\n".join(lines)
 
 
@@ -121,12 +124,25 @@ def _configuration_check(cfg: AutoDJConfig) -> DoctorCheck:
         "host": cfg.server.host,
         "port": cfg.server.port,
         "lan": cfg.server.lan,
-        "music_dir": str(cfg.library.music_dir) if cfg.library.music_dir is not None else None,
         "index_dir": str(cfg.index.index_dir),
+        "library_dir": str(cfg.index.library_dir),
+        "catalog_path": str(cfg.index.library_dir / "library.db"),
+        "dj_meta_path": str(cfg.index.library_dir / "dj_meta.db"),
+        "music_sources": "Available music comes from registered catalog folders; see music-path.",
         "model_dir": str(cfg.index.model_dir),
         "access_token": "<redacted>" if cfg.server.access_token else None,
         "huggingface_token": "<redacted>" if cfg.huggingface.token else None,
     }
+    if cfg.library.music_dir is not None:
+        effective["legacy_music_dir"] = {
+            "path": str(cfg.library.music_dir),
+            "purpose": "Base for relative Beets, playlist and DJ cue cache paths; "
+            "also checks for DJ cue exports, resolves legacy request exclusions "
+            "and supplies the base for explicit index migration. Does not register music folders.",
+            "cleanup": "Keep this setting while those uses need it. Otherwise, back up your "
+            "configuration and remove it manually. See docs/guides/operations/"
+            "catalog-migration.md for cleanup of old settings and comments.",
+        }
     return DoctorCheck(
         "configuration",
         CheckStatus.PASS,
@@ -231,6 +247,7 @@ def _beets_paths_check(cfg: AutoDJConfig) -> list[DoctorCheck]:
         "matched": check.matched,
         "relative_paths": check.relative,
         "music_dir": str(check.music_dir) if check.music_dir is not None else None,
+        "music_dir_purpose": "Base for relative Beets paths; does not register music folders.",
         "found_folder": check.found.as_posix() if check.found is not None else None,
         "example": check.example,
     }
@@ -246,8 +263,14 @@ def _beets_paths_check(cfg: AutoDJConfig) -> list[DoctorCheck]:
 def _music_paths_check(cfg: AutoDJConfig) -> DoctorCheck:
     """Check registered music folders; an empty library needs no configured root."""
     catalog_path = cfg.index.library_dir / "library.db"
+    empty = DoctorCheck(
+        "music-path",
+        CheckStatus.PASS,
+        "no music folders registered",
+        "Add music folders in Library to make music available. Setting music_dir does not add music.",
+    )
     if not catalog_path.is_file():
-        return DoctorCheck("music-path", CheckStatus.PASS, "no music folders registered")
+        return empty
     try:
         conn = _connect(readonly_uri(catalog_path), uri=True)
         with closing(conn):
@@ -256,7 +279,7 @@ def _music_paths_check(cfg: AutoDJConfig) -> DoctorCheck:
                 for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
             if "catalog_sources" not in tables:
-                return DoctorCheck("music-path", CheckStatus.PASS, "no music folders registered")
+                return empty
             roots = [
                 Path(str(row[0]))
                 for row in conn.execute(
@@ -271,7 +294,7 @@ def _music_paths_check(cfg: AutoDJConfig) -> DoctorCheck:
             f"The library catalog could not be read; see the index check ({exc}).",
         )
     if not roots:
-        return DoctorCheck("music-path", CheckStatus.PASS, "no music folders registered")
+        return empty
     unavailable = [str(root) for root in roots if not root.is_dir() or not os.access(root, os.R_OK)]
     if unavailable:
         return DoctorCheck(
@@ -451,13 +474,13 @@ def _module_available(name: str) -> bool:
 
 def _dependency_check() -> DoctorCheck:
     """Inspect optional audio modules and FFmpeg without importing or executing them."""
-    missing_modules = [name for name in ("soundfile", "sounddevice") if not _module_available(name)]
+    missing_modules = [name for name in ("soundfile",) if not _module_available(name)]
     ffmpeg = shutil.which("ffmpeg")
     if not missing_modules and ffmpeg:
         return DoctorCheck(
             "dependencies",
             CheckStatus.PASS,
-            "soundfile, sounddevice, and FFmpeg are available.",
+            "soundfile and FFmpeg are available.",
         )
     issues: list[str] = []
     details: list[str] = []
@@ -484,6 +507,25 @@ def _dependency_check() -> DoctorCheck:
     )
 
 
+def _speaker_checks(cfg: AutoDJConfig) -> list[DoctorCheck]:
+    """Check the optional sound-card package only for stations that use it."""
+    if cfg.station.output != "server" and not cfg.station.server_audio_too:
+        return []
+    available = _module_available("sounddevice")
+    return [
+        DoctorCheck(
+            "server-speakers",
+            CheckStatus.PASS if available else CheckStatus.WARN,
+            "sounddevice is available"
+            if available
+            else "server sound-card output needs sounddevice",
+            ""
+            if available
+            else "Rerun setup to install playback support, or install the play extra in the environment you manage.",
+        )
+    ]
+
+
 def _model_cache_check(cfg: AutoDJConfig) -> DoctorCheck:
     """Inspect the configured model cache without downloading or repairing it."""
     from autodj.model_identity import model_analysis_available
@@ -491,14 +533,31 @@ def _model_cache_check(cfg: AutoDJConfig) -> DoctorCheck:
     if not model_analysis_available():
         return DoctorCheck(
             "model-cache",
-            CheckStatus.WARN,
-            "local model analysis unavailable",
-            "Model analysis is disabled or its packages are not installed; "
-            "run `autodj setup --backend cpu` to enable it. Imported songs remain available.",
+            CheckStatus.PASS,
+            "local model analysis not in use",
+            "Model support is disabled or not installed; no local model cache is required.",
         )
     try:
+        path = cfg.index.library_dir / "library.db"
+        used = False
+        if path.is_file():
+            with closing(_connect(readonly_uri(path), uri=True)) as db:
+                used = (
+                    db.execute(
+                        "SELECT 1 FROM catalog_sources WHERE kind='music' AND advanced=1 LIMIT 1"
+                    ).fetchone()
+                    is not None
+                )
+        if not used:
+            return DoctorCheck(
+                "model-cache", CheckStatus.PASS, "no music folders use similarity analysis"
+            )
+        if cfg.model.manual_path is None:
+            location = _path_check("model-cache", cfg.index.model_dir, writable=True)
+            if location.status is CheckStatus.FAIL:
+                return location
         status = inspect_model_cache(cfg.model, cfg.index)
-    except (ImportError, OSError, RuntimeError, ValueError):
+    except (ImportError, OSError, RuntimeError, ValueError, sqlite3.Error):
         return DoctorCheck(
             "model-cache",
             CheckStatus.FAIL,
@@ -511,8 +570,131 @@ def _model_cache_check(cfg: AutoDJConfig) -> DoctorCheck:
         "model-cache",
         CheckStatus.WARN,
         str(status.path),
-        f"{status.reason}; run `autodj index` to download or validate the model",
-        "index",
+        f"{status.reason}; run `autodj download-model` to download or validate the model",
+        "download-model",
+    )
+
+
+def _nvidia_gpu_visible(dev: Path = Path("/dev")) -> bool:
+    """Whether an NVIDIA GPU is visible: a GPU's device file, or ``nvidia-smi -L`` naming one.
+
+    The NVIDIA Container Toolkit passes both into a container that asks for
+    the GPU.  Nothing is allocated on the GPU.
+    """
+    with contextlib.suppress(OSError):
+        if any(dev.glob("nvidia[0-9]*")):
+            return True
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return False
+    from autodj.updates import run_bounded
+
+    try:
+        done = run_bounded([smi, "-L"], timeout=5.0)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and "GPU" in done.stdout
+
+
+#: How long Doctor waits for PyTorch to say whether it can use the GPU.
+TORCH_PROBE_SECONDS = 20.0
+_TORCH_PROBE = "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 3)"
+
+
+def _torch_sees_cuda() -> bool | None:
+    """Whether PyTorch can use a CUDA GPU, asked in a child process with a time limit.
+
+    ``None`` when it did not answer in time.  Only the CUDA image asks.  The
+    child runs isolated (``-I``), so the working directory is not on its
+    path, with warnings off; its output is discarded.  A wedged driver
+    cannot stall Doctor, and any other failure counts as "cannot use it".
+    """
+    from autodj.updates import run_bounded
+
+    argv = [sys.executable, "-I", "-W", "ignore", "-c", _TORCH_PROBE]
+    try:
+        done = run_bounded(argv, timeout=TORCH_PROBE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception:  # any other failure means PyTorch cannot use the GPU
+        return False
+    return done.returncode == 0
+
+
+def _gpu_image_check(
+    *,
+    environ: Mapping[str, str] | None = None,
+    markers: Iterable[Path] | None = None,
+    gpu_visible: Callable[[], bool] | None = None,
+    torch_sees_cuda: Callable[[], bool | None] | None = None,
+) -> tuple[DoctorCheck, ...]:
+    """In a container, whether its image fits the NVIDIA GPU it sees; nothing elsewhere.
+
+    Only song analysis uses a GPU.  A CPU image that sees one is told about
+    the CUDA image and the GPU analysis worker; a CUDA image that sees none,
+    or whose PyTorch cannot use it, is told that analysis runs on the CPU.
+    A CPU image without a GPU, and any installation outside a container,
+    gets no line.
+    """
+    from autodj.updates import CONTAINER_MARKERS, IMAGE_VARIANT_ENV
+
+    environment = os.environ if environ is None else environ
+    if not any(marker.exists() for marker in (CONTAINER_MARKERS if markers is None else markers)):
+        return ()
+    cuda_image = (environment.get(IMAGE_VARIANT_ENV) or "").strip() == "cuda"
+    visible = (gpu_visible or _nvidia_gpu_visible)()
+    if not cuda_image:
+        if not visible:
+            return ()
+        return (
+            DoctorCheck(
+                "gpu-image",
+                CheckStatus.WARN,
+                "this CPU image sees an NVIDIA GPU it cannot use; for GPU song analysis, run "
+                "the -cuda image with compose.gpu.yaml (compose.gpu.podman.yaml on Podman), "
+                "or a GPU analysis worker",
+            ),
+        )
+    if not visible:
+        return (
+            DoctorCheck(
+                "gpu-image",
+                CheckStatus.WARN,
+                "this CUDA image sees no NVIDIA GPU, so song analysis falls back to the CPU",
+                "Action: install the NVIDIA Container Toolkit on the host (Docker Desktop on "
+                "Windows has GPU support built in), add compose.gpu.yaml to COMPOSE_FILE in "
+                ".env, then run `docker compose up -d`. With Podman, generate the toolkit's CDI "
+                "specification and use compose.gpu.podman.yaml and `podman compose up -d` "
+                "instead.",
+            ),
+        )
+    usable = (torch_sees_cuda or _torch_sees_cuda)()
+    if usable is None:
+        return (
+            DoctorCheck(
+                "gpu-image",
+                CheckStatus.WARN,
+                "this CUDA image sees an NVIDIA GPU, but the GPU check timed out, so song "
+                "analysis may fall back to the CPU",
+                f"PyTorch did not answer within {TORCH_PROBE_SECONDS:.0f} seconds. Action: run "
+                "`nvidia-smi` on the host to check that the GPU and its driver respond.",
+            ),
+        )
+    if usable:
+        return (
+            DoctorCheck(
+                "gpu-image", CheckStatus.PASS, "CUDA image; song analysis uses the NVIDIA GPU"
+            ),
+        )
+    return (
+        DoctorCheck(
+            "gpu-image",
+            CheckStatus.WARN,
+            "this CUDA image sees an NVIDIA GPU that PyTorch cannot use, so song analysis "
+            "falls back to the CPU",
+            "Action: the host's NVIDIA driver must support CUDA 13.2 (driver 580 or newer); "
+            "`nvidia-smi` on the host shows its version.",
+        ),
     )
 
 
@@ -805,16 +987,15 @@ def run_doctor(
     from autodj.stations import DEFAULT_SLUG
 
     default = station in (None, DEFAULT_SLUG)
-    checks: list[DoctorCheck] = [_configuration_check(cfg), _speech_check(cfg)]
+    checks: list[DoctorCheck] = [_configuration_check(cfg)]
     if default:
-        checks.append(_dmca_check(cfg))
+        checks += [_speech_check(cfg), _dmca_check(cfg)]
     checks += [
         _python_check(python_version),
         _music_paths_check(cfg),
         _beets_db_check(cfg),
         *_beets_paths_check(cfg),
         _path_check("index-path", cfg.index.index_dir, writable=True),
-        _path_check("model-path", cfg.index.model_dir, writable=True),
         _index_check(cfg),
     ]
     if default:
@@ -823,15 +1004,16 @@ def run_doctor(
         _dj_meta_database_check(cfg),
         _dependency_check(),
         _model_cache_check(cfg),
+        *_gpu_image_check(),
         _network_check(cfg),
         _update_check(cfg, network=check_updates),
     ]
     if default:
-        checks += [_stream_check(cfg), *_relay_checks(cfg)]
+        checks += [_stream_check(cfg), *_speaker_checks(cfg), *_relay_checks(cfg)]
     checks += [_related_artists_check(cfg), _related_tracks_check(cfg)]
     if default:
-        checks += [_time_checks_check(cfg), *_voice_pack_checks(cfg)]
-    checks += [_categories_check(cfg), _config_keys_check(cfg), *_restore_check(cfg)]
+        checks += [_time_checks_check(cfg), *_voice_pack_checks(cfg), _categories_check(cfg)]
+    checks += [_config_keys_check(cfg), *_restore_check(cfg)]
     if default:
         checks += [_recording_check(cfg), _liners_check(cfg)]
     for spec in cfg.stations:
@@ -896,9 +1078,11 @@ def _station_checks(cfg: AutoDJConfig, spec: StationSpec) -> list[DoctorCheck]:
     paths = StationPaths.for_station(own, spec.slug)
     checks = [
         _station_folder_check(paths),
+        _speech_check(own, paths),
         _saved_settings_check(own, paths),
         _dmca_check(own, paths),
         _stream_check(own),
+        *_speaker_checks(own),
         *_relay_checks(own, paths=paths),
         _time_checks_check(own, paths),
         *_voice_pack_checks(own, paths),
@@ -1127,6 +1311,15 @@ def _categories_check(cfg: AutoDJConfig, paths: StationPaths | None = None) -> D
         return DoctorCheck("categories", CheckStatus.PASS, "no categories saved")
     try:
         songs = _catalog_songs(cfg)
+        catalog_path = cfg.index.library_dir / "library.db"
+        if catalog_path.is_file():
+            with closing(_connect(readonly_uri(catalog_path), uri=True)) as db:
+                sources_by_id = {
+                    row[0]: dict(zip(("id", "path", "kind", "recursive"), row, strict=True))
+                    for row in db.execute("SELECT id, path, kind, recursive FROM catalog_sources")
+                }
+        else:
+            sources_by_id = {}
     except sqlite3.Error as exc:
         return DoctorCheck(
             "categories", CheckStatus.WARN, "the library could not be read", str(exc)
@@ -1137,6 +1330,7 @@ def _categories_check(cfg: AutoDJConfig, paths: StationPaths | None = None) -> D
         beets=beets_source(cfg),
         music_dir=cfg.library.music_dir,
         folder=playlists_folder(cfg),
+        sources_by_id=sources_by_id,
         remember_check=False,
     )
     cause = check.cause if check is not None else None
@@ -1284,7 +1478,7 @@ def _speech_check(
             f"{len(providers)} speech connections; no generated time-check set active",
             "Configured connections are not proof of live service readiness.",
         )
-    except (ValueError, OSError, KeyError, TypeError):
+    except (ValueError, OSError, KeyError, TypeError, AttributeError):
         return DoctorCheck(
             name, CheckStatus.FAIL, "Speech configuration or saved state could not be read"
         )

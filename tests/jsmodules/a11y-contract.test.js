@@ -1962,20 +1962,30 @@ describe("static accessibility contracts", () => {
 
   it("gives the Stream settings labelled controls and a silent count", () => {
     installDocument();
+    const profileTabs = document.querySelector('[role="tablist"][aria-labelledby="settings-profile-heading"]');
+    const stationTabs = document.querySelector('[role="tablist"][aria-labelledby="settings-station-heading"]');
+    const globalTabs = document.querySelector('[role="tablist"][aria-labelledby="settings-global-heading"]');
+    expect(profileTabs.hidden).toBe(false);
+    expect(stationTabs.hidden).toBe(false);
+    expect(globalTabs.hidden).toBe(false);
+    expect(profileTabs.querySelectorAll('[role="tab"]')).toHaveLength(4);
+    expect(stationTabs.querySelectorAll('[role="tab"]')).toHaveLength(4);
+    expect(globalTabs.querySelectorAll('[role="tab"]')).toHaveLength(4);
     const labelText = (id) => document.querySelector(`label[for="${id}"]`)
       ?.textContent.replace(/\s+/g, " ").trim();
     const describedBy = (element) => (element.getAttribute("aria-describedby") || "")
       .split(/\s+/).filter(Boolean).map((id) => document.getElementById(id));
 
-    // The Stream subtab's panel, under its heading; the fieldset and its
-    // tab stay hidden until the server reports stream mode.
+    // The Broadcasting settings panel keeps stream controls hidden until
+    // the server reports stream mode.
     const fieldset = document.querySelector("#stream-settings");
     expect(fieldset.tagName).toBe("FIELDSET");
     expect(fieldset.hidden).toBe(true);
     expect(fieldset.querySelector("legend").textContent.trim()).toBe("Stream");
-    expect(fieldset.parentElement.matches("#panel-settings > #spanel-stream")).toBe(true);
-    const panelHeading = fieldset.parentElement.querySelector(":scope > h3");
-    expect(panelHeading.textContent).toBe("Stream");
+    const streamPanel = fieldset.closest('[role="tabpanel"]');
+    expect(streamPanel.id).toBe("spanel-stream");
+    const panelHeading = streamPanel.querySelector(":scope > h3");
+    expect(panelHeading.textContent).toBe("Broadcasting");
     expect(panelHeading.nextElementSibling.id).toBe("public-page-form");
     expect(fieldset.previousElementSibling.id).toBe("public-page-form");
     expect(document.querySelector("#stab-stream").hidden).toBe(false);
@@ -2384,15 +2394,39 @@ describe("static accessibility contracts", () => {
     expect(dialog.contains(message)).toBe(true);
     expect(dialog.hasAttribute("role")).toBe(false);
     expect(dialog.hasAttribute("closedby")).toBe(false);
+    // Opened with show(), it tells assistive technology it is modal itself,
+    // and its backdrop keeps the page out of reach (#602).
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    const backdrop = document.getElementById("dialog-backdrop");
+    expect(backdrop.hidden).toBe(true);
+    expect(backdrop.childElementCount).toBe(0);
     const form = dialog.querySelector("form");
     expect(form.getAttribute("method")).toBe("dialog");
+    // Not read as a form landmark.
+    expect(form.getAttribute("role")).toBe("none");
+    // Cancel last: NVDA's reading of the dialog leaves its cursor on the
+    // last button, where Enter acts (#627).
     const buttons = [...form.querySelectorAll("button")];
     expect(buttons.map((button) => [button.id, button.getAttribute("type"), button.value]))
       .toEqual([
-        ["confirm-cancel", "submit", "cancel"],
         ["confirm-accept", "submit", "confirm"],
+        ["confirm-cancel", "submit", "cancel"],
       ]);
-    expect(buttons[0].textContent.trim()).toBe("Cancel");
+    expect(buttons[1].textContent.trim()).toBe("Cancel");
+  });
+
+  // #631: each dialog opens with show() and aria-modal, and NVDA's reading
+  // of it leaves its browse-mode cursor on the last button, where Enter
+  // acts, so the button that changes nothing comes last.
+  it("puts each dialog's safe button last", () => {
+    installDocument();
+    const lastButton = (element) => [...element.querySelectorAll("button")].at(-1)?.id;
+    expect(lastButton(document.getElementById("device-rename-dialog"))).toBe("device-rename-cancel");
+    expect(lastButton(document.getElementById("track-info-dialog"))).toBe("track-info-keep");
+    expect(lastButton(document.getElementById("clock-step-dialog"))).toBe("clock-cancel-edit");
+    for (const id of ["schedule-cancel", "categories-cancel", "intro-rules-cancel", "ads-spot-cancel", "ads-break-cancel"]) {
+      expect(lastButton(document.getElementById(id).closest("form")), id).toBe(id);
+    }
   });
 
   it("names every static dialog with its own level-one heading", () => {
@@ -2446,8 +2480,8 @@ describe("static accessibility contracts", () => {
   it("never nests a dialog inside a tab panel", () => {
     // A <dialog> inside a `[role="tabpanel"]` that is `hidden` on every
     // other tab is not rendered and is invisible to the accessibility
-    // tree, yet dialog.showModal() still makes the rest of the page
-    // inert -- a screen-reader user opening it from another tab is left
+    // tree, yet a modal dialog still keeps the rest of the page out of
+    // reach -- a screen-reader user opening it from another tab is left
     // with nothing to read.  Every dialog must live outside all panels.
     installDocument();
     const dialogs = [...document.querySelectorAll("dialog")];
@@ -3363,13 +3397,13 @@ describe("static accessibility contracts", () => {
     // The shortcut is listed with the others, in words.
     const keys = [...document.querySelectorAll("#hotkey-help-modal dt kbd")].map((kbd) => kbd.textContent);
     expect(keys).toContain("Alt+M");
-    // Settings > Live DJ remains available independently of station playout.
-    const tab = document.getElementById("stab-live");
-    expect(tab.hidden).toBe(false);
-    expect(tab.textContent).toBe("Live DJ");
-    const panel = document.getElementById(tab.dataset.panel);
-    expect(panel.getAttribute("aria-labelledby")).toBe("stab-live");
-    expect(panel.querySelector(":scope > h3").textContent).toBe("Live DJ");
+    // Live DJ settings are grouped in the Stations panel and remain
+    // independently hidden until the station can go live.
+    const panel = document.getElementById("spanel-live");
+    expect(panel.tagName).toBe("SECTION");
+    expect(panel.closest('[role="tabpanel"]').id).toBe("spanel-stream");
+    expect(panel.querySelector(":scope > h4").textContent).toBe("Live DJ");
+    expect(document.getElementById("live-settings").hidden).toBe(true);
     expect(panel.querySelector("[aria-live], [role=status], [role=alert]")).toBeNull();
     const labelText = (id) => document.querySelector(`label[for="${id}"]`)?.textContent.trim();
     for (const [id, label] of [
@@ -3666,9 +3700,32 @@ describe("station switcher and station context contracts (#70)", () => {
     const shared = document.getElementById("shared-context");
     expect(shared.hidden).toBe(true);
     expect(shared.textContent).toBe("");
-    for (const id of ["tab-library", "points-save", "stab-stations"]) {
+    for (const id of ["tab-library", "points-save", "stab-server"]) {
       expect(ids(document.getElementById(id), "aria-describedby"), id).toContain("shared-context");
     }
+  });
+
+  it("gives Log label a short native label and linked help naming the station ID", () => {
+    installDocument();
+    const panel = document.getElementById("spanel-stations");
+    const input = document.getElementById("station-log-label");
+    expect(panel.contains(input)).toBe(true);
+    expect(input.tagName).toBe("INPUT");
+    expect(input.type).toBe("text");
+    expect(input.hasAttribute("aria-label")).toBe(false);
+    expect(input.hasAttribute("placeholder")).toBe(false);
+    expect(input.maxLength).toBe(16);
+    expect(panel.querySelector('label[for="station-log-label"]').textContent.trim()).toBe("Log label");
+    expect(input.closest("fieldset").querySelector("legend").textContent.trim())
+      .toBe("Logs for the selected station");
+    expect(ids(input, "aria-describedby")).toEqual(["station-log-label-help"]);
+    const help = document.getElementById("station-log-label-help");
+    expect(help.classList.contains("setting-desc")).toBe(true);
+    expect(help.textContent.replace(/\s+/g, " ").trim())
+      .toBe("Shown at the start of this station's log lines: up to 16 letters, digits, hyphens, "
+        + "underscores or dots, different from other stations' labels and IDs. "
+        + "Leave empty to use the station ID, default.");
+    expect(help.contains(document.getElementById("station-log-label-id"))).toBe(true);
   });
 
   it("gives New station labelled native fields, one polite status and an error to link (#233)", () => {
@@ -3676,7 +3733,7 @@ describe("station switcher and station context contracts (#70)", () => {
     const panel = document.getElementById("spanel-stations");
     expect(panel.getAttribute("role")).toBe("tabpanel");
     expect(panel.getAttribute("aria-labelledby")).toBe("stab-stations");
-    expect(document.getElementById("spanel-live").parentElement).toBe(panel.parentElement);
+    expect(document.getElementById("spanel-live").closest('[role="tabpanel"]').id).toBe("spanel-stream");
     const table = document.getElementById("stations-table");
     expect(document.getElementById("stations-list").parentElement).toBe(table);
     expect(table.getAttribute("role")).toBe("grid");
@@ -3709,7 +3766,7 @@ describe("station switcher and station context contracts (#70)", () => {
     expect(panel.querySelector(".card-desc").textContent)
       .toMatch(/song cue points and Stereo Tool preset files/);
     expect(document.getElementById("station-create-source-help").textContent)
-      .toMatch(/never takes its relays, listener password, webhooks, recording folder, queue, history/);
+      .toMatch(/never takes its relays, listener password, webhooks, recording folder, log label, queue, history/);
     // Also copy is a fieldset hidden in the markup with its help inside it.
     const copies = document.getElementById("station-create-copies");
     expect(copies.tagName).toBe("FIELDSET");

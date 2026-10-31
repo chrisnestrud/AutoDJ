@@ -28,7 +28,7 @@ open paired page says "Cart 3, Station ID, playing" when a cart starts and "... 
 
 With focus on the cart wall, keys 1 to 9, 0, minus and equals play carts 1 to 12 on the page
 shown, and Page Up and Page Down change the page. The keys do nothing in text fields and
-dropdowns, and the **Enable keyboard shortcuts** checkbox (Settings, Display and keys) turns
+dropdowns, and the **Enable keyboard shortcuts** checkbox (Settings, Global, Browser preferences) turns
 them off. With NVDA, switch to focus mode first (NVDA+Space).
 
 Carts play through the voice liner path. In server audio and stream mode the server mixes them
@@ -37,9 +37,12 @@ browser playback the page that plays the cart plays it, as the voice liner Test 
 
 The server keeps the wall in `carts.json` in the station's folder and the uploads in its
 `carts/` folder. The file is versioned; one that cannot be read is moved aside as
-`carts.json.bad-<id>` and an empty wall loads. Backups include the wall and the uploads. Saving
-a profile records the name of the cart page shown, and applying the profile shows that page; a
-profile whose page has been renamed is refused.
+`carts.json.bad-<id>` and an empty wall loads. Backups include the wall and the uploads. A saved
+profile can override the name of the cart page shown using **Cart page** in
+**Settings**, **Profile**, **Announcements**, under **Carts**. Saving applies that changed group when
+the edited profile is still active; an inactive profile is only saved. **Activate** in the Profiles
+list resolves all eligible groups for the selected profile. A profile that refers to a renamed
+page cannot be activated.
 
 A cart can also have play dates; see [Liner and cart play dates](#liner-and-cart-play-dates).
 
@@ -75,16 +78,17 @@ on any day.
   liner list says the dates in words, such as "Plays until 26 December 2026", and adds "Skipped
   now: expired after 26 December 2026". **Test** never picks a skipped liner. A cart that plays
   the liner still plays it; give the cart its own dates.
-- **Carts:** set the dates in the cart editor. Outside them, pressing the cart, its key or a
-  scheduled Play cart event plays nothing and says why, such as "Cart 3, Promo was skipped: it
-  is expired after 26 December 2026", and the cart button ends with "expired" or "not playable
-  yet".
+- **Carts:** set the dates in the cart editor. Outside them, a scheduled Play cart event plays
+  nothing and says why, such as "Cart 3, Promo was skipped: it is expired after 26 December
+  2026". The cart button labels the date restriction as applying to scheduled play. A manual
+  button press, key press, or API play overrides the date restriction. Playback state and
+  availability checks still apply.
 
 A page left open past midnight follows the station's day: the liner list adds or drops "Skipped
-now", and the cart buttons and the editor's cart list add or drop "expired" and "not playable
-yet", in place. Only the words change, so focus stays where it is and nothing is announced. A
-refused date in the cart editor is shown under the editor and linked to its field, whether the
-page or the server refused it.
+now", and the cart buttons and the editor's cart list add or drop "scheduled: expired" and
+"scheduled: not playable yet", in place. Only the words change, so focus stays where it is and
+nothing is announced. A refused date in the cart editor is shown under the editor and linked to
+its field, whether the page or the server refused it.
 
 Liner dates are kept in `liner_dates.json` in the station's folder, by the ID Browse voice
 liners uses (the library ID of a registered liner, or the file name of one in the liner folder),

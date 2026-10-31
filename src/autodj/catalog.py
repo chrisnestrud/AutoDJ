@@ -86,10 +86,31 @@ def _user_tags(value: Any, fingerprint: str) -> list[str]:
     return sorted(name for name in _USER_TAGS if tags.get(name) == fingerprint)
 
 
+def _legacy_history_duration(row: Any) -> float | None:
+    """Return a legacy history row's normalized duration, or None if invalid."""
+    if not isinstance(row, dict):
+        return None
+    duration = LibraryCatalog._duration(row.get("duration"))
+    if (
+        not isinstance(row.get("title"), str)
+        or not isinstance(row.get("artist"), str)
+        or duration is None
+        or not LibraryCatalog._valid_played_at(row.get("played_at"))
+        or ("path" in row and not isinstance(row["path"], str))
+        or ("event_id" in row and (not isinstance(row["event_id"], str) or not row["event_id"]))
+        or ("station" in row and (not isinstance(row["station"], str) or not row["station"]))
+        or ("interrupted" in row and type(row["interrupted"]) is not bool)
+        or ("performances" in row and LibraryCatalog._count(row["performances"]) is None)
+    ):
+        return None
+    return duration
+
+
 _SCHEMA = """
     CREATE TABLE IF NOT EXISTS catalog_sources (
         id TEXT PRIMARY KEY, path TEXT NOT NULL, kind TEXT NOT NULL,
         recursive INTEGER NOT NULL, advanced INTEGER NOT NULL,
+        analysis TEXT NOT NULL DEFAULT 'similarity',
         UNIQUE(kind, path)
     );
     CREATE TABLE IF NOT EXISTS catalog_entries (
@@ -127,6 +148,16 @@ _SCHEMA = """
     CREATE TABLE IF NOT EXISTS catalog_vectors (
         entry_id TEXT PRIMARY KEY REFERENCES catalog_entries(id) ON DELETE CASCADE,
         vector BLOB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS catalog_audio_analysis (
+        entry_id TEXT PRIMARY KEY REFERENCES catalog_entries(id) ON DELETE CASCADE,
+        size INTEGER NOT NULL, fingerprint TEXT NOT NULL, version TEXT NOT NULL,
+        result TEXT NOT NULL
+    );
+    -- Records the latest scan found gone from a folder that is there; kept
+    -- until the files return or the user removes missing tracks (#589).
+    CREATE TABLE IF NOT EXISTS catalog_gone (
+        entry_id TEXT PRIMARY KEY REFERENCES catalog_entries(id) ON DELETE CASCADE
     );
 """
 
@@ -195,6 +226,23 @@ def _path(path: str | Path) -> str:
     value = os.path.abspath(os.path.expanduser(os.fspath(path)))
     value = os.path.normpath(value)
     return os.path.normcase(value) if os.name == "nt" else value
+
+
+def _source_analysis(
+    kind: str, analysis: str | None, advanced: bool | None, *, current: str | None = None
+) -> str | None:
+    """Resolve explicit modes and the legacy advanced flag in one place."""
+    if analysis is not None and analysis not in {"basic", "audio", "similarity"}:
+        raise ValueError("analysis must be 'basic', 'audio', or 'similarity'")
+    if kind == "liner":
+        return "basic"
+    if analysis is not None:
+        return analysis
+    if advanced is None:
+        return current
+    if current is not None and (current == "similarity") == bool(advanced):
+        return current
+    return "similarity" if advanced else "audio"
 
 
 def normalize_path(path: str | Path) -> str:
@@ -419,6 +467,24 @@ class LibraryCatalog:
         db = self._db()
         db.execute("BEGIN IMMEDIATE")
         try:
+            sources = {row[1] for row in db.execute("PRAGMA table_info(catalog_sources)")}
+            if "analysis" not in sources:
+                db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN analysis TEXT NOT NULL DEFAULT 'similarity'"
+                )
+                dj_analysis = db.execute(
+                    "SELECT value FROM catalog_settings WHERE key='dj_analysis'"
+                ).fetchone()
+                try:
+                    enabled = True if dj_analysis is None else json.loads(dj_analysis[0])
+                except (TypeError, json.JSONDecodeError):
+                    enabled = True
+                fallback = "basic" if enabled is False else "audio"
+                db.execute(
+                    "UPDATE catalog_sources SET analysis=CASE WHEN kind='liner' THEN 'basic' WHEN advanced THEN 'similarity' "
+                    "ELSE ? END",
+                    (fallback,),
+                )
             entries = {row[1] for row in db.execute("PRAGMA table_info(catalog_entries)")}
             if "allow_outro" not in entries:
                 db.execute(
@@ -510,27 +576,8 @@ class LibraryCatalog:
                 valid_rows = []
                 invalid = 0
                 for row in rows:
-                    if not isinstance(row, dict):
-                        invalid += 1
-                        continue
-                    duration = self._duration(row.get("duration"))
-                    if (
-                        not isinstance(row.get("title"), str)
-                        or not isinstance(row.get("artist"), str)
-                        or duration is None
-                        or not self._valid_played_at(row.get("played_at"))
-                        or ("path" in row and not isinstance(row["path"], str))
-                        or (
-                            "event_id" in row
-                            and (not isinstance(row["event_id"], str) or not row["event_id"])
-                        )
-                        or (
-                            "station" in row
-                            and (not isinstance(row["station"], str) or not row["station"])
-                        )
-                        or ("interrupted" in row and type(row["interrupted"]) is not bool)
-                        or ("performances" in row and self._count(row["performances"]) is None)
-                    ):
+                    duration = _legacy_history_duration(row)
+                    if duration is None:
                         invalid += 1
                         continue
                     valid_rows.append((row, duration))
@@ -821,10 +868,19 @@ class LibraryCatalog:
             return str(source["id"])
 
     def _add_source(
-        self, path: Path | str, kind: str, recursive: bool, advanced: bool, *, validate: bool = True
+        self,
+        path: Path | str,
+        kind: str,
+        recursive: bool,
+        advanced: bool,
+        *,
+        analysis: str | None = None,
+        validate: bool = True,
     ) -> dict:
         if kind not in {"music", "liner"}:
             raise ValueError("kind must be 'music' or 'liner'")
+        if analysis is not None and analysis not in {"basic", "audio", "similarity"}:
+            raise ValueError("analysis must be 'basic', 'audio', or 'similarity'")
         normalized = _path(path)
         if validate and not Path(normalized).is_dir():
             raise ValueError(f"source directory does not exist: {path}")
@@ -832,17 +888,26 @@ class LibraryCatalog:
         row = db.execute(
             "SELECT * FROM catalog_sources WHERE kind=? AND path=?", (kind, normalized)
         ).fetchone()
+        if (
+            analysis is None
+            and row is not None
+            and kind == "music"
+            and bool(row["advanced"]) == bool(advanced)
+        ):
+            analysis = row["analysis"]
+        analysis = _source_analysis(kind, analysis, advanced)
+        advanced = analysis == "similarity"
         if row:
             db.execute(
-                "UPDATE catalog_sources SET recursive=?, advanced=? WHERE id=?",
-                (int(recursive), int(advanced), row["id"]),
+                "UPDATE catalog_sources SET recursive=?, advanced=?, analysis=? WHERE id=?",
+                (int(recursive), int(advanced), analysis, row["id"]),
             )
             sid = row["id"]
         else:
             sid = uuid.uuid4().hex
             db.execute(
-                "INSERT INTO catalog_sources VALUES (?, ?, ?, ?, ?)",
-                (sid, normalized, kind, int(recursive), int(advanced)),
+                "INSERT INTO catalog_sources (id,path,kind,recursive,advanced,analysis) VALUES (?, ?, ?, ?, ?, ?)",
+                (sid, normalized, kind, int(recursive), int(advanced), analysis),
             )
         db.commit()
         return {
@@ -851,13 +916,20 @@ class LibraryCatalog:
             "kind": kind,
             "recursive": bool(recursive),
             "advanced": bool(advanced),
+            "analysis": analysis,
         }
 
     def add_source(
-        self, path: Path | str, kind: str = "music", recursive: bool = True, advanced: bool = True
+        self,
+        path: Path | str,
+        kind: str = "music",
+        recursive: bool = True,
+        advanced: bool = True,
+        *,
+        analysis: str | None = None,
     ) -> dict:
         with self._lock:
-            return self._add_source(path, kind, recursive, advanced)
+            return self._add_source(path, kind, recursive, advanced, analysis=analysis)
 
     def sources(self, kind: str | None = None) -> list[dict]:
         with self._lock:
@@ -873,18 +945,50 @@ class LibraryCatalog:
                     "kind": r["kind"],
                     "recursive": bool(r["recursive"]),
                     "advanced": bool(r["advanced"]),
+                    "analysis": r["analysis"],
                 }
                 for r in rows
             ]
 
-    def update_source(self, source_id: str, recursive: bool, advanced: bool) -> bool:
+    def update_source(
+        self,
+        source_id: str,
+        recursive: bool | None = None,
+        advanced: bool | None = None,
+        *,
+        analysis: str | None = None,
+    ) -> bool:
         with self._lock:
-            cur = self._db().execute(
-                "UPDATE catalog_sources SET recursive=?, advanced=? WHERE id=?",
-                (int(recursive), int(advanced), source_id),
-            )
-            self._db().commit()
-            return cur.rowcount > 0
+            db = self._db()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT kind,recursive,advanced,analysis FROM catalog_sources WHERE id=?",
+                    (source_id,),
+                ).fetchone()
+                if row is None:
+                    db.rollback()
+                    return False
+                resolved = _source_analysis(
+                    row["kind"], analysis, advanced, current=row["analysis"]
+                )
+                # A missing legacy flag means no request to alter analysis.
+                if resolved is None:
+                    resolved = row["analysis"]
+                db.execute(
+                    "UPDATE catalog_sources SET recursive=?, advanced=?, analysis=? WHERE id=?",
+                    (
+                        int(row["recursive"] if recursive is None else recursive),
+                        int(resolved == "similarity"),
+                        resolved,
+                        source_id,
+                    ),
+                )
+                db.commit()
+                return True
+            except BaseException:
+                db.rollback()
+                raise
 
     def remove_source(self, source_id: str) -> bool:
         with self._lock:
@@ -911,6 +1015,36 @@ class LibraryCatalog:
                 removed = cursor.rowcount
                 db.commit()
                 return removed
+            except BaseException:
+                db.rollback()
+                raise
+
+    def gone_paths(self) -> frozenset[str]:
+        """Paths of the records the latest scan found gone (see :meth:`save_gone`)."""
+        with self._lock:
+            rows = self._db().execute(
+                "SELECT e.path FROM catalog_gone g JOIN catalog_entries e ON e.id=g.entry_id"
+            )
+            return frozenset(row[0] for row in rows)
+
+    def save_gone(self, paths: Collection[str]) -> None:
+        """Save *paths* (normalized) as the records now gone, in place of the saved set.
+
+        A restarted server then leaves them out of the library before its
+        first scan.  The set changes no change counter: it is the library's
+        own reading of the folders, not a change to the records.
+        """
+        with self._lock:
+            db = self._db()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("DELETE FROM catalog_gone")
+                db.executemany(
+                    "INSERT OR IGNORE INTO catalog_gone "
+                    "SELECT id FROM catalog_entries WHERE path=?",
+                    ((path,) for path in paths),
+                )
+                db.commit()
             except BaseException:
                 db.rollback()
                 raise
@@ -1370,6 +1504,140 @@ class LibraryCatalog:
             if _under(normalized, source["path"], source["recursive"])
         ]
 
+    def analysis_for_path(self, path: str | Path) -> str:
+        """The strongest policy among matching music sources; liners always use basic."""
+        matches = self.sources_for_path(path)
+        if any(source["kind"] == "liner" for source in matches):
+            return "basic"
+        rank = {"basic": 0, "audio": 1, "similarity": 2}
+        return max(
+            (s["analysis"] for s in matches if s["kind"] == "music"),
+            key=lambda mode: rank[mode],
+            default="basic",
+        )
+
+    @staticmethod
+    def _audio_result(result: Any) -> dict:
+        from autodj.audio_analysis import AudioAnalysis
+
+        if isinstance(result, AudioAnalysis):
+            return result.model_dump(mode="json")
+        return AudioAnalysis.model_validate(result).model_dump(mode="json")
+
+    def _store_audio_analysis(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        entry: IndexEntry,
+        size: int,
+        fingerprint: str,
+        value: dict,
+    ) -> None:
+        """Store one validated feature result inside the caller's transaction."""
+        db.execute(
+            "INSERT INTO catalog_audio_analysis VALUES (?,?,?,?,?) "
+            "ON CONFLICT(entry_id) DO UPDATE SET size=excluded.size,"
+            "fingerprint=excluded.fingerprint,version=excluded.version,result=excluded.result",
+            (row["id"], size, fingerprint, value["version"], json.dumps(value)),
+        )
+        from autodj.indexer import _apply_analysis_metadata
+
+        _apply_analysis_metadata(entry, value, keep=_user_tags(row["user_tags"], fingerprint))
+        db.execute(
+            "UPDATE catalog_entries SET energy=?,key=?,mode=?,bpm=?,tempo_confidence=? WHERE id=?",
+            (
+                entry.energy,
+                entry.key,
+                entry.mode,
+                entry.bpm,
+                entry.tempo_confidence,
+                row["id"],
+            ),
+        )
+
+    def get_audio_analysis(self, path: str | Path) -> dict | None:
+        """Return current-version audio features only for the exact catalog file identity."""
+        normalized = _path(path)
+        with self._lock:
+            row = (
+                self._db()
+                .execute(
+                    "SELECT e.id,e.size,e.fingerprint,a.size AS cached_size,"
+                    "a.fingerprint AS cached_fingerprint,a.version,a.result "
+                    "FROM catalog_entries e JOIN catalog_audio_analysis a ON a.entry_id=e.id "
+                    "WHERE e.path=? AND e.kind='music'",
+                    (normalized,),
+                )
+                .fetchone()
+            )
+            if (
+                row is None
+                or row["size"] != row["cached_size"]
+                or row["fingerprint"] != row["cached_fingerprint"]
+            ):
+                return None
+            from autodj.audio_analysis import ANALYSIS_VERSION
+
+            if row["version"] != ANALYSIS_VERSION:
+                return None
+            try:
+                result = self._audio_result(json.loads(row["result"]))
+                if file_fingerprint(normalized) != (row["size"], row["fingerprint"]):
+                    return None
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return None
+            return result
+
+    def audio_analysed_paths(self) -> set[str]:
+        """Paths with a valid current-version feature cache matching catalog identity."""
+        from autodj.audio_analysis import ANALYSIS_VERSION
+
+        with self._lock:
+            return {
+                row[0]
+                for row in self._db().execute(
+                    "SELECT e.path FROM catalog_entries e JOIN catalog_audio_analysis a "
+                    "ON a.entry_id=e.id WHERE e.kind='music' AND e.size=a.size "
+                    "AND e.fingerprint=a.fingerprint AND a.version=?",
+                    (ANALYSIS_VERSION,),
+                )
+            }
+
+    def store_audio_analysis(
+        self, path: str | Path, size: int, fingerprint: str, result: Any
+    ) -> bool:
+        """Save reusable audio analysis if the catalog and file still have this identity."""
+        normalized = _path(path)
+        value = self._audio_result(result)
+        if not size or not fingerprint or file_fingerprint(normalized) != (size, fingerprint):
+            return False
+        with self._lock:
+            db = self._db()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT * FROM catalog_entries WHERE path=?", (normalized,)
+                ).fetchone()
+                if (
+                    row is None
+                    or row["kind"] != "music"
+                    or row["size"] != size
+                    or row["fingerprint"] != fingerprint
+                    or normalized in self._editing
+                    or file_fingerprint(normalized) != (size, fingerprint)
+                ):
+                    db.rollback()
+                    return False
+                self._store_audio_analysis(db, row, self._entry(row), size, fingerprint, value)
+                if file_fingerprint(normalized) != (size, fingerprint):
+                    db.rollback()
+                    return False
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return True
+
     def stored_entries(self) -> list[tuple[str, IndexEntry]]:
         """Every stored record as ``(kind, entry)``, missing files included, in one query."""
         with self._lock:
@@ -1501,6 +1769,7 @@ class LibraryCatalog:
         vector: np.ndarray | None,
         *,
         scan: dict | None = None,
+        audio_analysis: Any | None = None,
     ) -> bool:
         """Save a song's advanced analysis if it is still the file it was made from.
 
@@ -1533,6 +1802,9 @@ class LibraryCatalog:
         from autodj.indexer import FEATURE_DIM, _apply_analysis_metadata, source_mtime
 
         value = None if vector is None else np.asarray(vector, dtype=np.float32)
+        if audio_analysis is None and scan is not None:
+            audio_analysis = scan.get("audio_analysis")
+        audio_value = self._audio_result(audio_analysis) if audio_analysis is not None else None
         if value is not None and (value.shape != (FEATURE_DIM,) or not np.isfinite(value).all()):
             raise ValueError(f"vector must be a finite float32 array of shape ({FEATURE_DIM},)")
         if value is None and scan is None:
@@ -1643,6 +1915,8 @@ class LibraryCatalog:
                         "UPDATE catalog_entries SET energy=? WHERE id=?",
                         (scan["energy"], row["id"]),
                     )
+                if audio_value is not None:
+                    self._store_audio_analysis(db, row, entry, size, fingerprint, audio_value)
                 if file_fingerprint(normalized) != (size, fingerprint):
                     db.rollback()
                     return False

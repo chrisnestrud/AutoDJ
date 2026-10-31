@@ -1,5 +1,8 @@
 # AutoDJ
 
+[![CI status](https://github.com/blindndangerous/AutoDJ/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/blindndangerous/AutoDJ/actions/workflows/ci.yml)
+[![Test coverage on Codecov](https://codecov.io/gh/blindndangerous/AutoDJ/branch/master/graph/badge.svg)](https://codecov.io/gh/blindndangerous/AutoDJ)
+
 AutoDJ runs a music station from your own files. It can choose the next song by sound, follow a clockwheel and rotation categories, or play a queue you build. It also supports beatmatched sets with cues, tempo, key, and transition effects. You can listen in the browser, stream to a network player, or relay a station to Icecast or Shoutcast.
 
 Music stays on your computer or server. A new library starts empty, so you choose which folders AutoDJ can read. The web page handles most daily work: add music, build a clockwheel, set repeat rules, adjust sound, schedule events, and manage stations.
@@ -68,7 +71,7 @@ Start with [Contributing](CONTRIBUTING.md) and the [architecture decision index]
 
 ## Credits and licensing
 
-AutoDJ is copyright © 2026 blindndangerous, jage9, and contributors. It is licensed under [AGPL version 3 or later](LICENSE). If you change AutoDJ and offer it over a network, that licence requires you to offer the changed source. Releases up to and including 0.19.1 remain available under MIT. AutoDJ is provided as is, without warranty; use it at your own risk.
+AutoDJ is copyright © 2026 blindndangerous, jage9, chrisnestrud, and contributors. It is licensed under [AGPL version 3 or later](LICENSE). If you change AutoDJ and offer it over a network, that licence requires you to offer the changed source. AutoDJ is provided as is, without warranty; use it at your own risk.
 
 Third-party credits:
 
@@ -80,11 +83,8 @@ Third-party credits:
 
 ## Contributors
 
-- [blindndangerous](https://github.com/blindndangerous): project vision, library design, requirements, web UI direction, accessibility decisions, testing on a 10,000-track library, and release decisions.
-- [jage9](https://github.com/jage9): station playout, folder libraries, cue editing, clockwheel rotation, play history, Smooth and Stereo Tool processing, doctor and launcher repairs, Windows AMD and MuQ work, keyboard shortcuts, the accessibility audit, CI, and testing.
-- Claude (Anthropic): implementation across MuQ and librosa analysis, FAISS picking, audio mixing and effects, FastAPI and WebSocket controls, the web page, and tests.
-- Codex (OpenAI): reviews, automated verification, model research, and documentation corrections.
+- [blindndangerous](https://github.com/blindndangerous) leads the project and makes its design, accessibility and release decisions.
+- [jage9](https://github.com/jage9) built much of station playout, rotation and audio processing, and leads the accessibility audit and CI.
+- [chrisnestrud](https://github.com/chrisnestrud) built the speech studio, programme reviews and optional model analysis, and organized the documentation and architecture decision records.
 
-If you contribute, add your name and the work you contributed.
-
-AutoDJ and this documentation were developed with AI assistance. See [Contributing](CONTRIBUTING.md) to help.
+AutoDJ and its documentation were developed with AI assistance from Claude (Anthropic) and Codex (OpenAI). To contribute, see [Contributing](CONTRIBUTING.md).

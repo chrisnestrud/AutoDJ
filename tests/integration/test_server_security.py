@@ -382,6 +382,11 @@ def test_secured_route_categories_require_session(path: str) -> None:
         ("post", "/api/library/remove-missing", {"json": {}}),
         ("put", "/api/library/auto-rescan", {"json": {}}),
         ("patch", "/api/settings", {"json": {}}),
+        (
+            "patch",
+            "/api/settings",
+            {"json": {"revision": "x", "changes": {"station": {"log_label": "nor"}}}},
+        ),
     ],
 )
 def test_unsafe_route_categories_reject_before_parsing_body(
@@ -474,6 +479,9 @@ def test_tls_does_not_override_explicit_allowed_origin() -> None:
 def test_tampered_cookie_is_rejected() -> None:
     client = _security_client()
     assert _pair(client).status_code == 200
+    # Replace the session cookie rather than add a second one beside it: the
+    # client's send order for two same-named cookies is not part of the test.
+    client.cookies.clear()
     client.cookies.set(COOKIE_NAME, "tampered")
 
     assert client.get("/api/status").status_code == 401
@@ -594,11 +602,15 @@ def test_unhandled_route_error_gets_generic_request_id_and_redacted_audit(
 ) -> None:
     app = _security_app()
     exception_secret = "private-exception-secret"
+    cause_secret = "private-cause-secret"
     query_secret = "private-query-secret"
 
     @app.get("/api/explode")
     async def explode() -> None:
-        raise RuntimeError(exception_secret)
+        try:
+            raise KeyError(cause_secret)
+        except KeyError as exc:
+            raise RuntimeError(exception_secret) from exc
 
     client = TestClient(
         app,
@@ -607,7 +619,7 @@ def test_unhandled_route_error_gets_generic_request_id_and_redacted_audit(
     assert _pair(client).status_code == 200
     caplog.clear()
 
-    with caplog.at_level(logging.ERROR, logger="autodj.audit"):
+    with caplog.at_level(logging.ERROR):
         response = client.get(f"/api/explode?detail={query_secret}")
 
     assert response.status_code == 500
@@ -624,7 +636,19 @@ def test_unhandled_route_error_gets_generic_request_id_and_redacted_audit(
             "status": 500,
         }
     ]
+    # The traceback is logged once, with the request ID and route, without messages.
+    failures = [item for item in caplog.records if item.name == "autodj.security"]
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.ERROR
+    logged = failures[0].getMessage()
+    assert response.headers["X-Request-ID"] in logged
+    assert "/api/explode" in logged
+    assert "in explode" in logged
+    assert "builtins.KeyError (message not logged)" in logged
+    assert logged.rstrip().endswith("builtins.RuntimeError (message not logged)")
+    assert failures[0].exc_info is None
     assert exception_secret not in caplog.text
+    assert cause_secret not in caplog.text
     assert query_secret not in caplog.text
 
 
@@ -1075,17 +1099,22 @@ class TestProfileApplyBranches:
             "bpm_hi": 130,
             "harmonic_mode": "compatible",
         }
-        client.post("/api/profiles", json=body)
+        created = client.post("/api/profiles", json=body)
+        assert created.status_code == 200, created.text
         resp = client.post(f"/api/profiles/{body['name']}/apply")
         assert resp.status_code == 200
         applied = resp.json()["applied"]
         assert "bpm_range" in applied
-        assert "harmonic_mode" in applied
+        assert "djmix" in applied
+        settings = client.get("/api/settings").json()
+        assert settings["bpm_range"] == {"lo": 90.0, "hi": 130.0}
+        assert settings["djmix"]["harmonic_mode"] == "compatible"
         client.request("DELETE", f"/api/profiles/{body['name']}")
 
     def test_apply_with_preset_set(self, client) -> None:
-        body = {"name": "branchcov-preset", "preset": "chill"}
-        client.post("/api/profiles", json=body)
+        body = {"name": "branchcov-preset", "preset": "winddown"}
+        created = client.post("/api/profiles", json=body)
+        assert created.status_code == 200, created.text
         resp = client.post(f"/api/profiles/{body['name']}/apply")
         assert resp.status_code == 200
         assert "preset" in resp.json()["applied"]
@@ -1093,8 +1122,19 @@ class TestProfileApplyBranches:
 
     def test_apply_with_missing_preset_is_refused_and_changes_nothing(self, client) -> None:
         """A preset the config no longer has used to be dropped without a word."""
-        body = {"name": "branchcov-gone", "preset": "warmup", "bpm_lo": 90, "bpm_hi": 130}
-        client.post("/api/profiles", json=body)
+        body = {"name": "branchcov-gone", "preset": "winddown", "bpm_lo": 90, "bpm_hi": 130}
+        created = client.post("/api/profiles", json=body)
+        assert created.status_code == 200, created.text
+        station = client.app.state.stations.default
+        from autodj.profiles import ProfileSnapshot, ProfileStore
+
+        store = ProfileStore(station.paths.profiles)
+        store.save(
+            ProfileSnapshot(
+                name=body["name"],
+                settings={"preset": {"name": "warmup"}, "bpm_range": {"lo": 90.0, "hi": 130.0}},
+            )
+        )
         before = client.get("/api/status").json()["settings"]["bpm_range"]
 
         resp = client.post(f"/api/profiles/{body['name']}/apply")

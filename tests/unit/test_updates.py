@@ -301,12 +301,68 @@ def test_stable_compares_with_the_newest_release_tag(
 def test_master_after_a_release_is_ahead_of_it_on_the_stable_channel(tmp_path: Path) -> None:
     """ADR-0016-03: the same version number with commits after the tag."""
     result = updates.check_for_update(
-        _git_checkout(tmp_path),
-        UpdateSettings(channel="stable"),
+        _git_checkout(tmp_path, branch=None),
+        UpdateSettings(),
         runner=_ls_remote(tags=["v0.21.0"]),
     )
     assert result.status == "ahead"
     assert "after the latest release" in result.message
+
+
+@pytest.mark.parametrize("version", ["0.21.0", "0.22.0"])
+def test_development_on_a_saved_stable_channel_waits_for_the_next_release(
+    tmp_path: Path, version: str
+) -> None:
+    """ADR-0016-19: never a downgrade; the release that includes this commit is the update."""
+    waiting = updates.check_for_update(
+        _git_checkout(tmp_path, version=version),
+        UpdateSettings(channel="stable"),
+        runner=_ls_remote(tags=["v0.21.0"]),
+    )
+    assert waiting.status == "waiting-for-release"
+    assert waiting.target is None
+    assert waiting.message == (
+        "You'll move to Stable when the next release includes your version. "
+        f"Installed: {version}, commit {LOCAL_SHA[:7]}, on master. Latest release: v0.21.0."
+    )
+    released = updates.check_for_update(
+        _git_checkout(tmp_path, version="0.21.0"),
+        UpdateSettings(channel="stable"),
+        runner=_ls_remote(tags=["v0.21.0"], ancestor=True),
+    )
+    assert released.status == "available"
+    assert released.target == "v0.21.0"
+    # A newer release that does not include this commit does not count either.
+    later = updates.check_for_update(
+        _git_checkout(tmp_path, version="0.21.0"),
+        UpdateSettings(channel="stable"),
+        runner=_ls_remote(tags=["v0.22.0"], ancestor=False),
+    )
+    assert later.status == "waiting-for-release"
+
+
+def test_an_installation_without_git_asks_github_whether_the_release_includes_it(
+    tmp_path: Path,
+) -> None:
+    """ADR-0016-19: GitHub's compare view says whether the commit is behind the tag."""
+    asked: list[str] = []
+
+    def fetch(url: str, _headers: object, _timeout: float) -> str:
+        asked.append(url)
+        if url.endswith("/releases/latest"):
+            return json.dumps({"tag_name": "v0.21.0"})
+        return json.dumps({"status": status})
+
+    container = Installation(kind="container", version="0.21.0", commit="abcdef1", branch="master")
+    status = "ahead"
+    waiting = updates.check_for_update(
+        container, UpdateSettings(channel="stable"), fetch_text=fetch
+    )
+    assert waiting.status == "waiting-for-release"
+    assert asked[-1] == updates.REPOSITORY_API + "/compare/v0.21.0...abcdef1"
+    status = "behind"
+    assert updates.contained_in_release(container, "v0.21.0", fetch_text=fetch) is True
+    assert updates.contained_in_release(container, "nightly", fetch_text=fetch) is None
 
 
 @pytest.mark.parametrize(
@@ -520,7 +576,20 @@ def test_an_available_release_links_its_release_notes(tmp_path: Path) -> None:
     development = updates.check_for_update(
         _git_checkout(tmp_path), UpdateSettings(), runner=_ls_remote(master=MASTER_SHA)
     )
-    assert development.notes_url == updates.REPOSITORY_URL + "/blob/master/CHANGELOG.md"
+    # The changelog's Unreleased section stays empty between releases, so
+    # development links the commits between this one and master.
+    assert development.notes_url == (f"{updates.REPOSITORY_URL}/compare/{LOCAL_SHA}...master")
+    unknown = updates.check_for_update(
+        _git_checkout(tmp_path, commit=None), UpdateSettings(), runner=_ls_remote()
+    )
+    assert unknown.status == "unknown"
+    assert updates.release_notes_url("master", None) == updates.REPOSITORY_URL + "/commits/master"
+    assert updates.release_notes_url("master", "abc1234") == (
+        updates.REPOSITORY_URL + "/commits/master"
+    )
+    assert (
+        updates.release_notes_url("master", "x" * 40) == updates.REPOSITORY_URL + "/commits/master"
+    )
     assert updates.release_notes_url(None) is None
     assert updates.release_notes_url("v0.21.0; rm -rf /") is None
 
@@ -624,6 +693,154 @@ def test_a_container_on_another_channel_or_pinned_is_told_which_image_to_name() 
         f"{repository}:sha-1234567"
     )
     assert switch(None, "stable", development) == updates.IMAGE_REPOSITORY + ":dev"
+
+
+def test_a_cuda_image_reads_its_variant_and_a_cpu_image_has_none_to_lose(tmp_path: Path) -> None:
+    """ADR-0016-22: the Containerfile names the variant; anything else is unknown."""
+    marker = tmp_path / ".dockerenv"
+    marker.touch()
+
+    def variant(environ: dict[str, str]) -> str | None:
+        found = updates.detect_installation(
+            root=tmp_path / "no-checkout",
+            environ=environ,
+            markers=(marker,),
+            version="0.22.0",
+            working_dir=tmp_path,
+        )
+        return found.image_variant
+
+    assert variant({"AUTODJ_IMAGE_CHANNEL": "stable", "AUTODJ_IMAGE_VARIANT": "cuda"}) == "cuda"
+    assert variant({"AUTODJ_IMAGE_CHANNEL": "development", "AUTODJ_IMAGE_VARIANT": "cpu"}) == "cpu"
+    assert variant({"AUTODJ_IMAGE_VARIANT": "cuda"}) == "cuda"
+    assert variant({"AUTODJ_IMAGE_CHANNEL": "stable", "AUTODJ_IMAGE_VARIANT": "rocm"}) is None
+    assert variant({"AUTODJ_IMAGE_CHANNEL": "stable"}) is None
+
+
+def test_a_cuda_image_is_told_its_own_cuda_tag_and_a_cpu_image_never_is() -> None:
+    """ADR-0016-22: an update never swaps the CUDA image for the CPU one, or back."""
+    release = updates.UpdateCheck(
+        status="available",
+        channel="stable",
+        channel_source="installation",
+        message="Release v0.22.0 is available.",
+        latest="v0.22.0",
+        target="v0.22.0",
+    )
+    development = replace(release, channel="development", latest="1234567", target="master")
+    repository = "registry.example:5000/radio/autodj"
+
+    def switch(
+        image: str | None, channel: str, variant: str | None, result: updates.UpdateCheck
+    ) -> str | None:
+        container = Installation(
+            kind="container",
+            version="0.21.0",
+            image=image,
+            image_channel=channel,
+            image_variant=variant,
+        )
+        commands = updates.update_commands(container, result)
+        assert commands[-2:] == [
+            "docker compose pull && docker compose up -d",
+            "podman compose pull && podman compose up -d",
+        ]
+        prefix = "# In .env beside compose.yaml, set AUTODJ_IMAGE="
+        return commands[0].removeprefix(prefix) if commands[0].startswith(prefix) else None
+
+    # Pulling a moving CUDA tag on its own channel is enough.
+    assert switch(f"{repository}:stable-cuda", "stable", "cuda", release) is None
+    assert switch(f"{repository}:dev-cuda", "development", "cuda", development) is None
+    assert switch(None, "stable", "cuda", release) is None
+    assert switch(None, "development", "cuda", development) is None
+    # Pinned or on the other channel: the new tag keeps the suffix.
+    assert switch(f"{repository}:0.21.0-cuda", "stable", "cuda", release) == (
+        f"{repository}:0.22.0-cuda"
+    )
+    assert switch(f"{repository}@sha256:{'c' * 64}", "stable", "cuda", release) == (
+        f"{repository}:0.22.0-cuda"
+    )
+    assert switch(f"{repository}:stable-cuda", "stable", "cuda", development) == (
+        f"{repository}:dev-cuda"
+    )
+    assert switch(f"{repository}:dev-cuda", "development", "cuda", release) == (
+        f"{repository}:stable-cuda"
+    )
+    assert switch(f"{repository}:sha-abcdef0-cuda", "development", "cuda", development) == (
+        f"{repository}:sha-1234567-cuda"
+    )
+    assert switch(None, "stable", "cuda", development) == updates.IMAGE_REPOSITORY + ":dev-cuda"
+    # There is no latest-cuda; the CUDA image's moving release tag is stable-cuda.
+    assert switch(f"{repository}:latest", "stable", "cuda", release) == (
+        f"{repository}:stable-cuda"
+    )
+    # The image says what it is, whatever .env names: never the other variant's tag.
+    assert switch(f"{repository}:stable", "stable", "cuda", release) == (
+        f"{repository}:stable-cuda"
+    )
+    assert switch(f"{repository}:stable-cuda", "stable", "cpu", release) == f"{repository}:stable"
+    assert switch(f"{repository}:0.21.0-cuda", "stable", "cpu", release) == f"{repository}:0.22.0"
+    assert switch(f"{repository}:latest", "stable", "cpu", release) is None
+    assert switch(f"{repository}:dev", "development", "cpu", release) == f"{repository}:stable"
+    # An image that does not say its variant keeps its tag's.
+    assert switch(f"{repository}:0.21.0-cuda", "stable", None, release) == (
+        f"{repository}:0.22.0-cuda"
+    )
+    assert switch(f"{repository}:0.21.0", "stable", None, release) == f"{repository}:0.22.0"
+
+
+def test_a_pinned_cuda_tag_may_still_be_building_and_a_local_cuda_build_keeps_its_gpu() -> None:
+    """ADR-0016-22: the CUDA build is longer, and -f overrides COMPOSE_FILE."""
+    release = updates.UpdateCheck(
+        status="available",
+        channel="stable",
+        channel_source="installation",
+        message="Release v0.22.0 is available.",
+        latest="v0.22.0",
+        target="v0.22.0",
+    )
+    development = replace(release, channel="development", latest="1234567", target="master")
+    repository = "registry.example:5000/radio/autodj"
+
+    def notice(image: str, channel: str, variant: str, result: updates.UpdateCheck) -> list[str]:
+        container = Installation(
+            kind="container",
+            version="0.21.0",
+            image=image,
+            image_channel=channel,
+            image_variant=variant,
+        )
+        return updates.update_commands(container, result)[:-2]
+
+    building = "may still be building; if pull says manifest unknown, try again later"
+    pinned = notice(f"{repository}:0.21.0-cuda", "stable", "cuda", release)
+    assert pinned[0].endswith(f"={repository}:0.22.0-cuda")
+    assert pinned[1] == f"# The CUDA image 0.22.0-cuda {building}"
+    commit = notice(f"{repository}:sha-abcdef0-cuda", "development", "cuda", development)
+    assert commit[1] == f"# The CUDA image sha-1234567-cuda {building}"
+    # A moving tag pulls the previous image meanwhile, and the CPU image is not delayed.
+    assert len(notice(f"{repository}:dev-cuda", "development", "cuda", release)) == 1
+    assert len(notice(f"{repository}:stable-cuda", "stable", "cuda", development)) == 1
+    assert len(notice(f"{repository}:0.21.0", "stable", "cpu", release)) == 1
+
+    def local(variant: str | None) -> list[str]:
+        built = Installation(
+            kind="container", version="0.21.0", image="autodj:local", image_variant=variant
+        )
+        return updates.update_commands(built, release)[-2:]
+
+    build = "AUTODJ_COMMIT=$(git rev-parse --short HEAD)"
+    assert local("cuda") == [
+        f"{build} docker compose -f compose.yaml -f compose.gpu.yaml -f compose.build.yaml "
+        "up -d --build",
+        f"{build} podman compose -f compose.yaml -f compose.gpu.podman.yaml "
+        "-f compose.build.yaml up -d --build",
+    ]
+    for variant in ("cpu", None):
+        assert local(variant) == [
+            f"{build} docker compose -f compose.yaml -f compose.build.yaml up -d --build",
+            f"{build} podman compose -f compose.yaml -f compose.build.yaml up -d --build",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -775,3 +992,64 @@ def test_closing_a_checks_job_ends_exactly_the_processes_in_it() -> None:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Updating from the web page
+# ---------------------------------------------------------------------------
+
+
+def test_only_a_checkout_under_an_updating_launcher_can_update(tmp_path: Path) -> None:
+    """ADR-0016-11: other installations update the way they were installed."""
+    checkout = _git_checkout(tmp_path)
+    launched = {updates.SUPERVISOR_ENV: "1", updates.UPDATER_ENV: "launcher"}
+    support = updates.update_support(checkout, launched)
+    assert support.available is True
+    assert support.mechanism == "launcher"
+    # A launcher from before the web update restarts but cannot update.
+    older = updates.update_support(checkout, {updates.SUPERVISOR_ENV: "1"})
+    assert older.available is False
+    assert older.message == "Update it the way you installed it."
+    assert older.guide_url.endswith("backups-and-updates.md#update-a-source-checkout")
+    container = updates.update_support(Installation(kind="container", version="0.21.0"), launched)
+    assert container.available is False
+    assert container.guide_url.endswith("containers-and-windows.md#update-the-container")
+    package = updates.update_support(Installation(kind="package", version="0.21.0"), launched)
+    assert package.available is False
+    assert package.guide_url.endswith("backups-and-updates.md#update-a-wheel-installation")
+    assert support.to_dict()["available"] is True
+    assert updates.UPDATE_EXIT_CODE not in (0, updates.RESTART_EXIT_CODE)
+
+
+@pytest.mark.parametrize(
+    ("ancestor", "words"),
+    [(0, None), (1, "has moved away from 0.21.0"), (128, "cannot tell whether")],
+)
+def test_go_back_fits_only_while_the_checkout_came_from_that_release(
+    tmp_path: Path, ancestor: int, words: str | None
+) -> None:
+    """ADR-0016-20: a checkout moved by hand drops the offer, with one sentence.
+
+    Development that has passed a newer release still fits; a checkout at a
+    release does not.
+    """
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(command[1:])
+        if command[1:3] == ["merge-base", "--is-ancestor"]:
+            return _done(returncode=ancestor)
+        raise AssertionError(command)
+
+    reason = updates.go_back_moved(_git_checkout(tmp_path), LOCAL_SHA, "0.21.0", runner=run)
+    assert calls == [["merge-base", "--is-ancestor", LOCAL_SHA, "HEAD"]]
+    if words is None:
+        assert reason is None
+    else:
+        assert reason is not None and words in reason
+    released = _git_checkout(tmp_path, branch=None, tag="v0.22.0")
+    assert updates.go_back_moved(released, LOCAL_SHA, "0.21.0", runner=run) == (
+        "This checkout runs release v0.22.0 now, so going back to 0.21.0 is not offered."
+    )
+    package = Installation(kind="package", version="0.22.0")
+    assert "cannot tell" in (updates.go_back_moved(package, LOCAL_SHA, "0.21.0", runner=run) or "")

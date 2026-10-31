@@ -12,7 +12,7 @@ server stack.
 
 from __future__ import annotations
 
-import copy
+import itertools
 import logging
 import os
 import secrets
@@ -26,8 +26,10 @@ from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING, Any
 
 from autodj.audience import StreamAudience
+from autodj.history_kinds import INSERT_KINDS
+from autodj.history_pages import AIRED_ROWS, VIEW_ROWS, history_page
 from autodj.identity_map import attached
-from autodj.settings_bodies import PAGE_SAVED_BREAKS, PAGE_SAVED_REQUESTS
+from autodj.live_queue import proposed_occurrence, queue_occurrence
 
 if TYPE_CHECKING:
     from autodj.indexer import IndexEntry
@@ -44,6 +46,11 @@ class StreamSeekUnavailable(Exception):
 
 
 SEEK_TRACK_CHANGED = "The song on air has changed, so it was not moved."
+
+#: Song and live rows History keeps in memory, and the most either view shows.
+HISTORY_VIEW_ROWS = VIEW_ROWS
+#: Liners and other inserted rows kept beside them (#601).
+HISTORY_AIRED_ROWS = AIRED_ROWS
 
 
 class SeekTrackChanged(Exception):
@@ -221,49 +228,6 @@ class RequestSlot:
     clock_next: int | None = None
 
 
-def _request_settings(requests: Any) -> dict[str, Any]:
-    """The listener request settings the operator's card saves (#49), when the station has them."""
-    if requests is None:
-        return {}
-    return {
-        "requests_bridges_enabled": bool(requests.bridges_enabled),
-        "requests_max_bridges": int(requests.max_bridges),
-        "requests_bridge_cost_threshold": float(requests.bridge_cost_threshold),
-        "requests_no_smooth_spot": requests.no_smooth_spot,
-    }
-
-
-def _request_switches(requests: Any, page_saved: set[str]) -> dict[str, Any]:
-    """Whether the station takes requests and how they are approved, once the card saved them.
-
-    Until the Listener requests card has saved them for this station,
-    ``[requests]`` in config.toml stays in charge: no other save (volume,
-    EQ ...) writes them to ``web_state.json``.
-    """
-    if requests is None or PAGE_SAVED_REQUESTS not in page_saved:
-        return {}
-    return {
-        "requests_enabled": bool(requests.enabled),
-        "requests_approval": requests.approval,
-    }
-
-
-def _break_settings(breaks: Any, page_saved: set[str]) -> dict[str, Any]:
-    """The announcer break settings, once Settings, Breaks saved them for the station (#88).
-
-    Until then ``[breaks]`` in config.toml stays in charge, as for
-    :func:`_request_switches`.
-    """
-    if breaks is None or PAGE_SAVED_BREAKS not in page_saved:
-        return {}
-    return {
-        "breaks_enabled": bool(breaks.enabled),
-        "breaks_dj_placement": breaks.dj_placement,
-        "breaks_min_intro_seconds": float(breaks.min_intro_seconds),
-        "breaks_duck_db": None if breaks.duck_db is None else float(breaks.duck_db),
-    }
-
-
 @dataclass(frozen=True)
 class RequestInsert:
     """One request and its preceding bridge songs, committed together."""
@@ -402,11 +366,19 @@ class PlayerBridge(LibraryAccess):
     # (PAGE_SAVED_REQUESTS, PAGE_SAVED_BREAKS), or that web_state.json held
     # at start.  Only those are written to web_state.json; the others stay
     # config.toml's.
-    # The viewer keeps 500 rows; the catalog retains the full play log.
+    # The viewer keeps HISTORY_VIEW_ROWS songs and live sets, and beside
+    # them the liners and other audio aired between them (#601), each with
+    # its own room; the station database retains the full play log.
     _play_history: deque = field(
-        default_factory=lambda: deque(maxlen=500),
+        default_factory=lambda: deque(maxlen=HISTORY_VIEW_ROWS),
         init=False,
     )
+    _aired_history: deque = field(
+        default_factory=lambda: deque(maxlen=HISTORY_AIRED_ROWS),
+        init=False,
+    )
+    # Each kept row's place in airing order (``_seq``), merging the two.
+    _history_seq: Iterator[int] = field(default_factory=itertools.count, init=False)
     _history_started: bool = field(default=False, init=False)
     # Set by the server in server-mixed modes (``--server-audio`` and
     # ``--stream``); ``None`` in browser-driven mode, where the browser
@@ -556,6 +528,8 @@ class PlayerBridge(LibraryAccess):
         """
         self.liner_scheduler = scheduler
         self.player.liner_scheduler = scheduler
+        # The liners, time checks and carts it airs are listed in History.
+        scheduler.on_aired = self.record_aired
         from autodj.station_log import CURRENT_STATION, enter_station, station_scope, thread_name
 
         # Its thread works for this station, so its log lines name it.
@@ -719,15 +693,29 @@ class PlayerBridge(LibraryAccess):
             play, self._open_play = self._open_play, None
             if play is None or play[0] is not entry:
                 return
-            for index in range(len(self._play_history) - 1, -1, -1):
-                if self._play_history[index] is play[1]:
-                    del self._play_history[index]
-                    if (ledger := self._ledger()) is not None:
-                        ledger.interrupt_history(play[1]["event_id"])
-                    return
+            for rows in (self._play_history, self._aired_history):
+                for index in range(len(rows) - 1, -1, -1):
+                    if rows[index] is play[1]:
+                        del rows[index]
+                        if (ledger := self._ledger()) is not None:
+                            ledger.interrupt_history(play[1]["event_id"])
+                        return
+
+    def _keep_history_row(self, row: dict) -> None:
+        """Keep *row* in memory for History, in airing order (hold ``_history_lock``)."""
+        row["_seq"] = next(self._history_seq)
+        if row.get("kind") in INSERT_KINDS:
+            self._aired_history.append(row)
+        else:
+            self._play_history.append(row)
 
     def _append_history(self, entry: Any) -> dict:
-        """Record one play while holding ``_history_lock``; never trim the archive."""
+        """Record one play while holding ``_history_lock``; never trim the archive.
+
+        A show's standalone speech segment airs as a track but is not music:
+        its row is ``speech`` (#601), with no listener count, and it leaves
+        last-played times alone.
+        """
         # Stream mode counts its connected listeners; otherwise the one
         # listener is the person at this computer or browser.
         performances: int | None = self._audience.start_play() if self.stream_mode else 1
@@ -735,13 +723,27 @@ class PlayerBridge(LibraryAccess):
             # A relay's own listeners are invisible here: no count beats a
             # count that leaves them out.
             performances = None
-        row = _history_entry(entry, performances)
-        self._play_history.append(row)
+        speech = getattr(entry, "_prepared_clip", False) is True
+        row = _history_entry(entry, None if speech else performances)
+        if speech:
+            row["kind"] = "speech"
+        elif self._is_liner(entry):
+            row["track_kind"] = "liner"  # a liner file played as a track
+        self._keep_history_row(row)
         self._history_started = True
         if (ledger := self._ledger()) is not None:
             ledger.remember_history(row)
-            ledger.remember_play(entry.path)
+            if not speech:
+                ledger.remember_play(entry.path)
         return row
+
+    def _is_liner(self, entry: Any) -> bool:
+        """Whether *entry* is from a liner folder, from the player's cached liner paths."""
+        check = getattr(self.player, "_is_liner", None)
+        try:
+            return callable(check) and check(entry) is True
+        except Exception:
+            return False
 
     def listener_connected(self, client: tuple[str, str]) -> None:
         """Count a new stream connection from *client* (address, User-Agent).
@@ -769,6 +771,7 @@ class PlayerBridge(LibraryAccess):
 
         A live DJ's set (#48) also has ``kind`` ``"live"`` and ``ended_at``
         (``None`` while it is on the air); songs keep their usual fields.
+        The liners and other audio aired between them (#601) are left out.
         """
         keys = ("event_id", "path", "title", "artist", "duration", "played_at")
         with self._history_lock:
@@ -781,6 +784,59 @@ class PlayerBridge(LibraryAccess):
                 )
                 for row in self._play_history
             ]
+
+    def history_page(
+        self, page: int, per_page: int, *, liners: bool = False, anchor: str | None = None
+    ) -> dict:
+        """One page of History (see :func:`autodj.history_pages.history_page`)."""
+        with self._history_lock:
+            return history_page(
+                self._play_history,
+                self._aired_history,
+                page=page,
+                per_page=per_page,
+                liners=liners,
+                anchor=anchor,
+            )
+
+    def record_aired(
+        self,
+        kind: str,
+        *,
+        title: str,
+        artist: str = "",
+        path: str | None = None,
+        duration: float = 0.0,
+    ) -> None:
+        """Add audio that aired over or between the songs to History (#601).
+
+        A liner, ad, matched intro, time check and so on, as *kind* (one of
+        :data:`~autodj.history_kinds.INSERT_KINDS`).  It is not a song
+        play: last-played times and the repeat rules do not count it, and
+        it has no listener count.  Quick and touches no disk, so it is safe
+        on the mix-bus thread.
+
+        Raises:
+            ValueError: *kind* is not an inserted kind.
+        """
+        if kind not in INSERT_KINDS:
+            raise ValueError(f"not a kind of inserted audio: {kind!r}")
+        row = {
+            "event_id": secrets.token_hex(16),
+            "path": str(path) if path else None,
+            "title": title or "",
+            "artist": artist or "",
+            "duration": max(0.0, float(duration or 0.0)),
+            "played_at": datetime.now(UTC).isoformat(),
+            "performances": None,
+            "kind": kind,
+        }
+        with self._history_lock:
+            self._keep_history_row(row)
+            # As for a song: the history loaded at start never replaces it.
+            self._history_started = True
+            if (ledger := self._ledger()) is not None:
+                ledger.remember_history(row)
 
     # ------------------------------------------------------------------
     # Controls
@@ -1527,8 +1583,22 @@ class PlayerBridge(LibraryAccess):
                 "latency_seconds": master.latency_seconds
                 if master is not None and processing in {"smooth", "stereotool"}
                 else 0.0,
+                # 20 ms blocks of silence the mix bus held for audio that was
+                # not ready, since it started (the held-silence warnings).
+                "held_blocks": self._held_blocks(),
             },
         }
+
+    def _held_blocks(self) -> int:
+        """The mix bus's held-silence block count, or 0 without a mix bus.
+
+        Only a real bus is read: the status must stay JSON whatever stands in
+        for the player, and a stand-in's attribute would not be a count.
+        """
+        from autodj.mixbus import MixBus
+
+        bus = getattr(self.player, "bus", None)
+        return int(bus.held_blocks) if isinstance(bus, MixBus) else 0
 
     def _next_transition_fx(self, current: Any, upcoming: Any) -> str | None:
         """The effect for the crossfade from *current* into *upcoming*.
@@ -1587,12 +1657,19 @@ class PlayerBridge(LibraryAccess):
     @contextmanager
     def _queue_mutation_lock(self) -> Iterator[bool]:
         """Hold the live bus boundary, when present, then the queue lock."""
+        from autodj.live_queue import occurrence_proposals
+
         state = self.player._state
         if getattr(self.player, "live_mixing", False):
-            with self.player.live_queue_guard(), state.queue_lock:
+            with (
+                self.player._clock_selection_lock,
+                self.player.live_queue_guard(),
+                state.queue_lock,
+                occurrence_proposals(self.player),
+            ):
                 yield True
         else:
-            with state.queue_lock:
+            with state.queue_lock, occurrence_proposals(self.player):
                 yield False
 
     def _plan_live_queue_edit(
@@ -1692,7 +1769,11 @@ class PlayerBridge(LibraryAccess):
         if entry is None:
             return False
         return self.play_next_entry(
-            entry, now, voice_action=voice_action, voice_revision=voice_revision
+            entry,
+            now,
+            voice_action=voice_action,
+            voice_revision=voice_revision,
+            new_placement=True,
         )
 
     def play_next_entry(
@@ -1702,9 +1783,13 @@ class PlayerBridge(LibraryAccess):
         *,
         voice_action: str | None = None,
         voice_revision: str | None = None,
+        new_placement: bool = False,
     ) -> bool:
         """Queue this exact owned occurrence, preserving prepared-edition identity."""
         if now and (self.stream_mode or self._bus_mode()):
+            if new_placement:
+                entry = queue_occurrence(entry)
+
             # Play now on the mix bus: render *entry* from its start and fade
             # the playing track out.  queued_next is left alone so the track
             # does not also play a second time later, and anything queued
@@ -1722,6 +1807,8 @@ class PlayerBridge(LibraryAccess):
                 play()
             return True
         with self._queue_mutation_lock() as live:
+            if new_placement or not getattr(entry, "occurrence_id", None):
+                entry = proposed_occurrence(self.player, entry, "play_next")
             state = self.player._state
             decision = (
                 self._plan_live_queue_edit(
@@ -1771,7 +1858,7 @@ class PlayerBridge(LibraryAccess):
             self.player.play_now(chosen, pick_mode="seed")
             return True
         with self.player._state.queue_lock:
-            self.player._state.queued_next = chosen
+            self.player._state.queued_next = queue_occurrence(chosen)
         self.skip()
         return True
 
@@ -1852,6 +1939,7 @@ class PlayerBridge(LibraryAccess):
         if entry is None:
             return False
         with self._queue_mutation_lock() as live:
+            entry = proposed_occurrence(self.player, entry, "queue_add")
             state = self.player._state
             decision = (
                 self._plan_live_queue_edit(
@@ -2150,8 +2238,11 @@ class PlayerBridge(LibraryAccess):
                 # Each queued item is its own copy, so the request's marks and
                 # bridges belong to it alone, never to a same-path song the
                 # operator queued.
-                request = copy.copy(entry)
-                bridges = [copy.copy(song) for song in plan.bridges]
+                request = proposed_occurrence(self.player, entry, "request")
+                bridges = [
+                    proposed_occurrence(self.player, song, f"request_bridge:{index}")
+                    for index, song in enumerate(plan.bridges)
+                ]
                 proposed = [*state.queue[:position], *bridges, request, *state.queue[position:]]
                 decision = (
                     self._plan_live_queue_edit(
@@ -2234,7 +2325,14 @@ class PlayerBridge(LibraryAccess):
                 return found
         return UTC
 
-    def queue_insert_if(self, entry: IndexEntry, position: int, view: QueueView) -> bool:
+    def queue_insert_if(
+        self,
+        entry: IndexEntry,
+        position: int,
+        view: QueueView,
+        *,
+        raise_voice_conflict: bool = False,
+    ) -> bool:
         """Put *entry* at *position* of the user queue if the queue still matches *view*.
 
         For callers that worked out the place from *view* with no lock held
@@ -2258,11 +2356,15 @@ class PlayerBridge(LibraryAccess):
                 self._sync_next_for_prefetch()
                 self._accept_live_queue_edit(decision)
         except VoiceQueueConflict:
+            if raise_voice_conflict:
+                raise
             # This internal show feed has no operator choice; leave the queue untouched.
             return False
         return True
 
-    def queue_remove_if(self, position: int, view: QueueView) -> bool:
+    def queue_remove_if(
+        self, position: int, view: QueueView, *, raise_voice_conflict: bool = False
+    ) -> bool:
         """Remove the user queue's item at *position* if the queue still matches *view*."""
         state = self.player._state
         from autodj.live_queue import VoiceQueueConflict
@@ -2281,6 +2383,8 @@ class PlayerBridge(LibraryAccess):
                 self._sync_next_for_prefetch()
                 self._accept_live_queue_edit(decision)
         except VoiceQueueConflict:
+            if raise_voice_conflict:
+                raise
             # Internal show cleanup has no operator choice; keep its entry queued for retry.
             return False
         return True
@@ -2511,7 +2615,9 @@ class PlayerBridge(LibraryAccess):
             if self._history_started:
                 return
             self._play_history.clear()
-            self._play_history.extend(ledger.recent_history())
+            self._aired_history.clear()
+            for row in ledger.recent_history(HISTORY_VIEW_ROWS, inserts=HISTORY_AIRED_ROWS):
+                self._keep_history_row(row)
         try:
             self.player.restore_repeat_history(ledger)
         except Exception:

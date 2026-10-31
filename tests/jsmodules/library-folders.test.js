@@ -22,7 +22,8 @@ function mount() {
     <p id="track-info-empty">Choose a track</p><dl id="track-info-details" hidden></dl>
     <section id="panel-library" hidden>
       <input id="source-folder-path"><select id="source-folder-kind"><option value="music">Music</option><option value="liner">Liner</option></select>
-      <input id="source-folder-recursive" type="checkbox" checked><input id="source-folder-advanced" type="checkbox" checked>
+      <input id="source-folder-recursive" type="checkbox" checked><select id="source-folder-analysis"><option value="basic">Basic</option><option value="audio" selected>Audio</option></select>
+      <p id="source-folder-analysis-help"></p>
       <input id="source-folder-override-tags" type="checkbox" aria-describedby="source-folder-override-tags-help"><p id="source-folder-override-tags-help">Rescan refreshes populated file tags. Hand-edited BPM and key values and cue points are retained.</p><button id="source-folder-add"></button><button id="source-folder-rescan"></button>
       <p id="source-folders-status"></p><p id="source-folders-progress"></p><table id="source-folders-table"><caption>Registered music and voice liner folders</caption><tbody id="source-folders"></tbody></table>
     </section>
@@ -85,6 +86,128 @@ describe("clock folder and points controls", () => {
     const html = readFileSync(join(process.cwd(), "src", "autodj", "static", "index.html"), "utf8");
     expect(html).toContain('id="source-folder-override-tags" type="checkbox" aria-describedby="source-folder-override-tags-help"');
     expect(html).toContain('id="source-folder-override-tags-help">Rescan refreshes populated file tags. Hand-edited BPM and key values and cue points are retained.</p>');
+  });
+
+  // ADR-0012-08: capability changes preserve the saved choice.
+  it("offers similarity only when available and preserves unavailable existing folders", async () => {
+    const html = readFileSync(join(process.cwd(), "src/autodj/static/index.html"), "utf8");
+    const page = document.createElement("template");
+    page.innerHTML = html;
+    expect(page.content.querySelector("#source-folder-analysis-help").textContent).toContain("Basic");
+    document.getElementById("panel-library").hidden = false;
+    const request = vi.fn(async () => ({
+      similarity_available: false,
+      folders: [{ id: "old", path: "M:/old", kind: "music", recursive: false, analysis: "similarity" }],
+    }));
+    installLibraryFolders({ document, request });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect([...document.getElementById("source-folder-analysis").options].map(({ value }) => value)).toEqual(["basic", "audio"]);
+    expect(document.getElementById("source-folder-analysis-help").textContent).not.toContain("MuQ");
+    const existing = document.querySelector('#source-folders select[data-field="analysis"]');
+    expect(existing.value).toBe("similarity");
+    expect(existing.getAttribute("aria-label")).toBe("Analysis for M:/old");
+    expect(existing.selectedOptions[0].textContent).toBe("Audio + similarity (unavailable)");
+    expect(existing.selectedOptions[0].disabled).toBe(true);
+  });
+
+  it("announces the shared analysis limit from Settings while Library tools is hidden", async () => {
+    const html = readFileSync(join(process.cwd(), "src/autodj/static/index.html"), "utf8");
+    const page = document.createElement("template");
+    page.innerHTML = html;
+    const settings = page.content.querySelector("#panel-settings").cloneNode(true);
+    settings.hidden = false;
+    settings.querySelector("#spanel-stations").hidden = false;
+    document.body.append(settings);
+    document.body.insertAdjacentHTML("beforeend", '<p id="sr-status" role="status" aria-live="polite"></p><div id="status-toast-box" hidden><div id="status-toast" aria-hidden="true" hidden></div></div>');
+    expect(document.getElementById("panel-library").hidden).toBe(true);
+    let finish;
+    let failSave = false;
+    const request = vi.fn((url, options) => {
+      if (url === "/api/library/advanced-length" && !options) return Promise.resolve({ minutes: 20 });
+      if (options?.method === "PUT") {
+        if (failSave) return Promise.reject(Object.assign(new Error("Server unavailable"), { status: 503 }));
+        return new Promise((resolve) => { finish = resolve; });
+      }
+      return Promise.resolve({ folders: [] });
+    });
+    installLibraryFolders({ document, request });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(document.getElementById("advanced-length").value).toBe("20");
+
+    const input = document.getElementById("advanced-length");
+    input.value = "30";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector("#spanel-server [data-settings-save]").click();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(document.querySelector("#spanel-server .settings-save-status").textContent).toBe("Saving changes…");
+    finish({ minutes: 30 });
+    await vi.waitFor(() => expect(document.querySelector("#spanel-server .settings-save-status").textContent)
+      .toContain("Songs longer than 30 minutes get audio analysis only."));
+
+    failSave = true;
+    input.value = "40";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector("#spanel-server [data-settings-save]").click();
+    await vi.waitFor(() => expect(document.querySelector("#spanel-server .settings-save-status").textContent)
+      .toContain("Server unavailable"));
+  });
+
+  it("reconciles existing folder choices as similarity availability changes without losing focus", async () => {
+    document.getElementById("panel-library").hidden = false;
+    let available = false;
+    const folders = [
+      { id: "basic", path: "M:/basic", kind: "music", recursive: false, analysis: "basic" },
+      { id: "similarity", path: "M:/similarity", kind: "music", recursive: false, analysis: "similarity" },
+    ];
+    const request = vi.fn(async () => ({ similarity_available: available, folders }));
+    const controls = installLibraryFolders({ document, request });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const basic = document.querySelector('tr[data-id="basic"] select');
+    const similarity = document.querySelector('tr[data-id="similarity"] select');
+    basic.focus();
+    expect(basic.querySelector('option[value="similarity"]')).toBeNull();
+    expect(similarity.selectedOptions[0].disabled).toBe(true);
+
+    available = true;
+    await controls.refresh();
+    expect(document.querySelector('tr[data-id="basic"] select')).toBe(basic);
+    expect(basic.querySelector('option[value="similarity"]').disabled).toBe(false);
+    expect(similarity.selectedOptions[0].disabled).toBe(false);
+    expect(document.activeElement).toBe(basic);
+
+    available = false;
+    await controls.refresh();
+    expect(document.querySelector('tr[data-id="basic"] select')).toBe(basic);
+    expect(basic.querySelector('option[value="similarity"]')).toBeNull();
+    expect(similarity.value).toBe("similarity");
+    expect(similarity.selectedOptions[0].disabled).toBe(true);
+    expect(similarity.selectedOptions[0].textContent).toContain("unavailable");
+    expect(document.activeElement).toBe(basic);
+
+    available = true;
+    await controls.refresh();
+    expect(document.querySelector('tr[data-id="basic"] select')).toBe(basic);
+    expect(basic.querySelector('option[value="similarity"]').disabled).toBe(false);
+    expect(similarity.selectedOptions[0].disabled).toBe(false);
+    expect(document.activeElement).toBe(basic);
+  });
+
+  it("sends the selected analysis mode for a new music folder", async () => {
+    document.getElementById("panel-library").hidden = false;
+    const request = vi.fn(async (url, options) => options?.method === "POST" ? {} : {
+      similarity_available: true, folders: [],
+    });
+    installLibraryFolders({ document, request });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const analysis = document.getElementById("source-folder-analysis");
+    expect([...analysis.options].map(({ value }) => value)).toEqual(["basic", "audio", "similarity"]);
+    expect(document.getElementById("source-folder-analysis-help").textContent).toContain("MuQ");
+    analysis.value = "similarity";
+    document.getElementById("source-folder-path").value = "M:/new";
+    document.getElementById("source-folder-add").click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(JSON.parse(request.mock.calls.find(([, options]) => options?.method === "POST")[1].body))
+      .toEqual({ path: "M:/new", kind: "music", recursive: true, analysis: "similarity" });
   });
 
   it("parses seconds and MM:SS while preserving empty points", () => {
@@ -175,7 +298,7 @@ describe("clock folder and points controls", () => {
     expect(status.textContent).toBe("");
     running = false;
     await controls.refresh();
-    await vi.waitFor(() => expect(status.textContent).toBe("2 tracks ready; 1 with advanced analysis."));
+    await vi.waitFor(() => expect(status.textContent).toBe("2 tracks ready; 1 with similarity analysis."));
     const changes = [];
     const observer = new window.MutationObserver((records) => changes.push(...records));
     observer.observe(status, { childList: true, characterData: true, subtree: true });
@@ -195,7 +318,7 @@ describe("clock folder and points controls", () => {
     expect(status.textContent).toBe("");
     job = { running: true, phase: "recovering analysis", done: 0, total: 3 };
     await controls.refresh();
-    await vi.waitFor(() => expect(status.textContent).toBe("2 tracks ready; 1 with advanced analysis."));
+    await vi.waitFor(() => expect(status.textContent).toBe("2 tracks ready; 1 with similarity analysis."));
     expect(document.getElementById("source-folders-progress").textContent).toBe("Recovering analysis: 0 of 3");
   });
 
@@ -216,7 +339,7 @@ describe("clock folder and points controls", () => {
     await controls.refresh();
     const progress = document.getElementById("source-folders-progress");
     const list = document.getElementById("source-folders-errors");
-    expect(progress.textContent).toBe("Import finished with 2 errors; the list follows. 1,204 tracks ready; 1,100 with advanced analysis.");
+    expect(progress.textContent).toBe("Import finished with 2 errors; the list follows. 1,204 tracks ready; 1,100 with similarity analysis.");
     expect(progress.textContent).not.toContain("a.flac");
     expect(list.tagName).toBe("DETAILS");
     expect(list.hidden).toBe(false);
@@ -231,7 +354,7 @@ describe("clock folder and points controls", () => {
     await controls.refresh();
     expect(list.hidden).toBe(true);
     expect(list.open).toBe(false);
-    expect(progress.textContent).toBe("1,204 tracks ready; 1,100 with advanced analysis.");
+    expect(progress.textContent).toBe("1,204 tracks ready; 1,100 with similarity analysis.");
     controls.destroy();
   });
 
@@ -306,11 +429,11 @@ describe("clock folder and points controls", () => {
 
   it("keeps checkbox focus and blocks another toggle while saving, then keeps the checkbox (#330)", async () => {
     document.getElementById("panel-library").hidden = false;
-    let folders = [{ id: "abc", path: "M:/", kind: "music", recursive: false, advanced: false }];
+    let folders = [{ id: "abc", path: "M:/", kind: "music", recursive: false, analysis: "basic" }];
     let finish;
     const request = vi.fn((url, options) => options?.method === "PATCH"
       ? new Promise((resolve) => { finish = resolve; })
-      : Promise.resolve({ folders }));
+      : Promise.resolve({ similarity_available: true, folders }));
     const controls = installLibraryFolders({ document, request });
     await new Promise((resolve) => setTimeout(resolve, 0));
     const checkbox = document.querySelector('[data-field="recursive"]');
@@ -342,11 +465,11 @@ describe("clock folder and points controls", () => {
     expect(checkbox.classList.contains("is-pending")).toBe(false);
     expect(document.activeElement).toBe(checkbox);
     // Another page's change is set on it in place.
-    folders = [{ ...folders[0], recursive: false, advanced: true }];
+    folders = [{ ...folders[0], recursive: false, analysis: "similarity" }];
     await controls.refresh();
     expect(document.querySelector('[data-field="recursive"]')).toBe(checkbox);
     expect(checkbox.checked).toBe(false);
-    expect(document.querySelector('[data-field="advanced"]').checked).toBe(true);
+    expect(document.querySelector('[data-field="analysis"]').value).toBe("similarity");
     expect(document.activeElement).toBe(checkbox);
     expect(left).toEqual([]);
   });
@@ -413,9 +536,9 @@ describe("clock folder and points controls", () => {
     expect(document.getElementById("source-folders-status").textContent).toContain("save failed");
   });
 
-  it("reaches both folder checkboxes with Space in separate grid cells", async () => {
+  it("saves the folder analysis selector", async () => {
     document.getElementById("panel-library").hidden = false;
-    const request = vi.fn(async () => ({ folders: [{ id: "abc", path: "M:/", kind: "music", recursive: false, advanced: false }] }));
+    const request = vi.fn(async () => ({ similarity_available: true, folders: [{ id: "abc", path: "M:/", kind: "music", recursive: false, analysis: "basic" }] }));
     installLibraryFolders({ document, request });
     await new Promise((resolve) => setTimeout(resolve, 0));
     const row = document.querySelector("#source-folders tr[data-id=abc]");
@@ -425,10 +548,10 @@ describe("clock folder and points controls", () => {
     recursive.focus();
     recursive.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
     await vi.waitFor(() => expect(request).toHaveBeenCalledWith("/api/library/folders/abc", expect.objectContaining({ body: JSON.stringify({ recursive: true }) })));
-    const advanced = cells[3];
-    advanced.focus();
-    advanced.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
-    await vi.waitFor(() => expect(request).toHaveBeenCalledWith("/api/library/folders/abc", expect.objectContaining({ body: JSON.stringify({ advanced: true }) })));
+    const analysis = cells[3].querySelector("select");
+    analysis.value = "similarity";
+    analysis.dispatchEvent(new Event("change", { bubbles: true }));
+    await vi.waitFor(() => expect(request).toHaveBeenCalledWith("/api/library/folders/abc", expect.objectContaining({ body: JSON.stringify({ analysis: "similarity" }) })));
   });
   it("keeps folder-control focus across unchanged polls and restores focus if a folder disappears", async () => {
     document.getElementById("panel-library").hidden = false;
@@ -920,6 +1043,44 @@ describe("clock folder and points controls", () => {
     expect(document.activeElement).toBe(opener);
   });
 
+  // #631: show() and aria-modal, not showModal(), so NVDA keeps its place on
+  // the page; Keep editing last; Escape keeps editing, focus straight back.
+  it("opens with show() and aria-modal, Keep editing last, and Escape keeps editing", async () => {
+    const request = trackRequest();
+    const controls = installLibraryFolders({ document, request });
+    await controls.openEditor("M:/one.flac");
+    document.querySelector('[data-point="intro"]').value = "0:10";
+    const dialog = document.getElementById("track-info-dialog");
+    const shown = [];
+    dialog.show = () => { shown.push("show"); dialog.open = true; };
+    const opener = document.createElement("button");
+    opener.textContent = "Track info for Two";
+    document.getElementById("panel-now").append(opener);
+    opener.focus();
+    const switching = controls.openEditor("M:/two.flac", "music", opener);
+    expect(shown).toEqual(["show"]);
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect([...dialog.querySelectorAll("button")].map((button) => button.id))
+      .toEqual(["track-info-save", "track-info-discard", "track-info-keep"]);
+    const key = (name, init = {}) => {
+      const event = new KeyboardEvent("keydown", { key: name, bubbles: true, cancelable: true, ...init });
+      document.activeElement.dispatchEvent(event);
+      return event;
+    };
+    document.getElementById("track-info-keep").focus();
+    expect(key("Tab").defaultPrevented).toBe(true);
+    expect(document.activeElement.id).toBe("track-info-save");
+    expect(key("Tab", { shiftKey: true }).defaultPrevented).toBe(true);
+    expect(document.activeElement.id).toBe("track-info-keep");
+    expect(key("Escape").defaultPrevented).toBe(true);
+    await switching;
+    expect(dialog.open).toBe(false);
+    expect(dialog.returnValue).toBe("keep");
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[data-point="intro"]').value).toBe("0:10");
+    expect(document.activeElement).toBe(opener);
+  });
+
   it("holds Keep editing while a save is in flight", async () => {
     let finish;
     const request = vi.fn((url, options) => options?.method === "POST"
@@ -946,7 +1107,9 @@ describe("clock folder and points controls", () => {
     expect(document.getElementById("track-info-dialog").returnValue).toBe("save");
   });
 
-  it("says Saving… in its own line, and lets go of focus before Save and Discard close it", async () => {
+  // #631: focus never rests on the page body; it goes straight from the
+  // dialog's button back to the control that asked.
+  it("says Saving… in its own line, and keeps focus in the dialog until Save and Discard close it", async () => {
     let finish;
     const request = vi.fn((url, options) => options?.method === "POST"
       ? new Promise((resolve) => { finish = resolve; })
@@ -984,7 +1147,7 @@ describe("clock folder and points controls", () => {
     document.getElementById("track-info-discard").focus();
     document.getElementById("track-info-discard").click();
     await discarding;
-    expect(focusInDialogAtClose).toEqual([false, false]);
+    expect(focusInDialogAtClose).toEqual([true, true]);
   });
 
   it("leaves focus somewhere steady when a switch stops short", async () => {

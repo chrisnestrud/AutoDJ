@@ -1,8 +1,6 @@
-// Library tools, Longest song for advanced analysis (#391).  Longer songs
-// are imported and play like any other, with the basic analysis only; the
-// advanced analysis is slow and memory-heavy on an hour-long mix.  0
-// analyses every length.
-import { sayIfStillPending } from "./live-region.js";
+// Shared-library similarity limit. Longer songs retain their selected audio
+// preparation; 0 permits model analysis at every length.
+import { registerSettingsGroup } from "./settings-drafts.js";
 
 const MAX_ADVANCED_MINUTES = 600;
 
@@ -10,23 +8,19 @@ const MAX_ADVANCED_MINUTES = 600;
 export function advancedLengthProblem(text) {
   const value = String(text ?? "").trim();
   if (!/^\d+$/.test(value) || Number(value) > MAX_ADVANCED_MINUTES) {
-    return `Enter a whole number of minutes from 0 to ${MAX_ADVANCED_MINUTES}; 0 analyses every length.`;
+    return `Enter a whole number of minutes from 0 to ${MAX_ADVANCED_MINUTES}; 0 means no limit.`;
   }
   return null;
 }
 
-// *say(message, error)* writes the Library tools status region; *isCurrent()*
-// is false once the session has ended or the panel was cleared.  Returns
-// null when the page has no such field.
-export function installAdvancedLength({ document: doc, request, say, isCurrent = () => true }) {
+// *isCurrent()* is false when the session has ended or the panel was cleared.
+export function installAdvancedLength({ document: doc, request, isCurrent = () => true }) {
   const input = doc.getElementById("advanced-length");
-  const save = doc.getElementById("advanced-length-save");
   const help = doc.getElementById("advanced-length-help");
   const error = doc.getElementById("advanced-length-error");
-  if (!input || !save || !error) return null;
+  if (!input || !error) return null;
   const helpId = help?.id || "";
   let loaded = 0;
-  let saving = false;
 
   function clearError() {
     input.removeAttribute("aria-invalid");
@@ -54,52 +48,37 @@ export function installAdvancedLength({ document: doc, request, say, isCurrent =
     const ticket = ++loaded;
     try {
       const value = await request("/api/library/advanced-length");
-      if (ticket === loaded && isCurrent() && !saving) show(value);
+      if (ticket === loaded && isCurrent()) draft.accept({ minutes: Number(value?.minutes) });
     } catch {
       // The field keeps what it shows; Save reports any problem.
     }
   }
 
   input.addEventListener("input", () => {
-    if (input.getAttribute("aria-invalid") && !advancedLengthProblem(input.value)) clearError();
+    if (!error.hidden && !advancedLengthProblem(input.value)) clearError();
   });
-
-  save.addEventListener("click", async () => {
-    if (!isCurrent() || saving) return;
-    const problem = advancedLengthProblem(input.value);
-    if (problem) { showError(problem); return; }
-    clearError();
-    loaded += 1;
-    // No aria-disabled while saving: NVDA would call the pressed button
-    // unavailable (#331).  aria-busy says it is busy; a slow reply says so.
-    saving = true;
-    save.classList.add("is-pending");
-    save.setAttribute("aria-busy", "true");
-    const stopPending = sayIfStillPending(say, "Saving the advanced analysis length…");
-    try {
-      const value = await request("/api/library/advanced-length", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ minutes: Number(input.value.trim()) }),
-      });
-      if (!isCurrent()) return;
-      show(value);
-      const minutes = Number(input.value);
-      say(minutes === 0
-        ? "Saved. Advanced analysis takes songs of every length."
-        : `Saved. Songs longer than ${minutes} minutes get basic analysis only.`);
-    } catch (err) {
-      if (!isCurrent()) return;
-      if (err?.status === 422 || err?.status === 400) showError(advancedLengthProblem("x"));
-      else say(`Could not save the advanced analysis length: ${err?.message || "error"}`, true);
-    } finally {
-      stopPending();
-      saving = false;
-      save.classList.remove("is-pending");
-      save.removeAttribute("aria-busy");
-    }
+  const groupPanel = input.closest('[role="tabpanel"]') || doc.getElementById("panel-library") || input.parentElement;
+  const draft = registerSettingsGroup({
+    panel: groupPanel,
+    scope: "server",
+    controls: [input],
+    read: () => ({ minutes: Number(input.value) }),
+    write: (value) => show(value),
+    validate: () => {
+      const problem = advancedLengthProblem(input.value);
+      if (problem) { showError(problem); return false; }
+      clearError();
+      return true;
+    },
+    describe: (value) => value.minutes === 0
+      ? "Similarity analysis has no length limit."
+      : `Songs longer than ${value.minutes} minutes get audio analysis only.`,
+    commit: (value) => request("/api/library/advanced-length", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ minutes: value.minutes }),
+    }),
   });
-
   clearError();
   return {
     load,

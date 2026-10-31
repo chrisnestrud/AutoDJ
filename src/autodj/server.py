@@ -144,6 +144,7 @@ from autodj.station_log import (
     CURRENT_STATION,
     DEFAULT_SLUG,
     install_log_prefix,
+    set_log_labels,
     station_thread,
 )
 from autodj.station_name import listener_name
@@ -407,6 +408,7 @@ async def _broadcast_state_once(
     recording_status: Callable[[], dict[str, object]] | None = None,
     station_list: Callable[[], list[dict[str, Any]]] | None = None,
     live_state: Callable[[], dict[str, Any]] | None = None,
+    active_profile: Callable[[], str | None] | None = None,
 ) -> None:
     """Push the player state to every WebSocket client, if any are connected.
 
@@ -431,6 +433,8 @@ async def _broadcast_state_once(
             state["stations"] = station_list()
         if live_state is not None:
             state.update(live_state())
+        if active_profile is not None:
+            state["active_profile"] = active_profile()
         payload = json.dumps(state)
         await _broadcast_and_prune(clients, clients_lock, payload)
     except Exception as exc:
@@ -630,6 +634,7 @@ class LibraryFolderBody(BaseModel):
     kind: Literal["music", "liner"] = "music"
     recursive: bool = True
     advanced: bool = True
+    analysis: Literal["basic", "audio", "similarity"] | None = None
 
 
 class LibraryFolderUpdateBody(BaseModel):
@@ -638,6 +643,7 @@ class LibraryFolderUpdateBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     recursive: bool | None = None
     advanced: bool | None = None
+    analysis: Literal["basic", "audio", "similarity"] | None = None
 
 
 class LibraryRescanBody(BaseModel):
@@ -653,13 +659,6 @@ class LibraryAutoRescanBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     hours: StrictInt = Field(ge=0, le=168)
     minutes: StrictInt = Field(ge=0, le=59)
-
-
-class LibraryDjAnalysisBody(BaseModel):
-    """Whether library scans find beats and song structure."""
-
-    model_config = ConfigDict(extra="forbid")
-    enabled: StrictBool
 
 
 class LibraryMusicFadeBody(BaseModel):
@@ -1008,6 +1007,7 @@ def create_app(
     cfg = services.cfg
     shared = services
     stations = StationRegistry(default_station, extra_stations)
+    set_log_labels(stations.log_labels())
     station_timezone = cfg.station.timezone or system_timezone()
     station_create_lock = asyncio.Lock()
     stations.stop_timeout_s = _SHUTDOWN_TIMEOUT_S
@@ -1038,13 +1038,19 @@ def create_app(
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         """FastAPI lifespan: start and stop the station and the shared library."""
+        started = time.perf_counter()
         library = SharedLibrary(shared.library, stations)
         await stations.start_all()
         await library.start()
         STARTUP_COMPLETE.set()
+        logger.info(
+            "Startup: stations and background services started in %.2f s (audio readiness logged separately)",
+            time.perf_counter() - started,
+        )
         try:
             yield
         finally:
+            stations.begin_shutdown()
             logger.info("Shutting down...")
             # The scan winds down while the rest stops; the library waits for
             # it before the DJ-meta cache closes.
@@ -1250,10 +1256,12 @@ def create_app(
     # serve() asks for the first code when no browser is paired yet.
     app.state.request_pairing_code = request_pairing_code
     # Request bodies the middleware caps before any route parses them.
+    from autodj.certificates_api import BODY_LIMITS, install_certificates_api
     from autodj.prepared_editions import MAX_UPLOAD_BYTES as EDITION_UPLOAD_BYTES
     from autodj.updates_api import ROUTES as UPDATE_ROUTES
 
     body_limits: dict[str, Callable[[], int]] = {
+        **BODY_LIMITS,
         **{path: (lambda: SPEECH_BODY_LIMIT) for path in WRITE_ROUTES},
         "/api/stations": lambda: 4096,
         "/api/pair": lambda: PAIRING_BODY_MAX_BYTES,
@@ -1321,6 +1329,7 @@ def create_app(
             return machine_token_store[0]
 
     app.state.machine_tokens = machine_tokens
+    install_certificates_api(app, cfg, https=secure_cookie)
     app.add_middleware(
         SecurityMiddleware,
         policy=policy,
@@ -1968,6 +1977,16 @@ def create_app(
 
         return {"stations": stations.summaries(), "time_format": timefmt.time_format}
 
+    def label_refusal(slug: str) -> str | None:
+        """Why a new station may not use *slug*: another station logs as it."""
+        for other, label in stations.log_labels().items():
+            if label.casefold() == slug:
+                return (
+                    f"Station ID {slug} is the log label of station {other}. "
+                    "Choose another ID, or change that station's log label first."
+                )
+        return None
+
     @app.post("/api/stations", status_code=201)
     async def api_station_create(body: CreateStationBody) -> dict[str, Any]:
         """Publish a validated definition and register a stopped station."""
@@ -1987,6 +2006,8 @@ def create_app(
                 raise HTTPException(status_code=409, detail=f"Station {body.slug} already exists")
             if body.source is not None and body.source not in stations.slugs():
                 raise HTTPException(status_code=404, detail="The source station was not found")
+            if (refusal := label_refusal(body.slug)) is not None:
+                raise HTTPException(status_code=409, detail=refusal)
             if len(root.stations) >= MAX_STATIONS:
                 raise HTTPException(
                     status_code=409, detail=f"At most {MAX_STATIONS} other stations are allowed"
@@ -2013,7 +2034,12 @@ def create_app(
                     duplicate_table, root, body.source, body.slug, body.name, body.autostart
                 )
                 spec = replace(_build_station(body.slug, table, root), defined_in="web")
-                _check_station_conflicts(root, (*root.stations, spec))
+                # Saved labels, the default's included: the root's copy of it can be older.
+                _check_station_conflicts(
+                    root,
+                    (*root.stations, spec),
+                    log_labels={**stations.log_labels(), spec.slug: spec.cfg.station.log_label},
+                )
             except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             clock = None
@@ -2053,7 +2079,12 @@ def create_app(
                 if stations._closing:
                     raise StationControlError("The server is shutting down")
                 extra = _extra_station(root, spec, shared.sim, library, station_timezone)
-                stations.add(extra)
+                # A label saved while the station was staged may have taken its ID.
+                # Saving a label holds this lock, and sees the station once it is added.
+                with stations.configuration_lock:
+                    if (refusal := label_refusal(body.slug)) is not None:
+                        raise StationControlError(refusal)
+                    stations.add(extra)
                 root.stations += (spec,)
             except Exception as exc:
                 try:
@@ -2218,17 +2249,37 @@ def create_app(
         # Every station's preset: the running ones' and the stopped ones' saved
         # choice, read off the event loop (web_state.json may be on a NAS).
         in_use = await asyncio.to_thread(stations.stereo_tool_presets)
+
+        def remove() -> None:
+            from contextlib import ExitStack
+
+            from autodj.profile_settings import profile_settings
+            from autodj.stereotool_presets import INCLUDED
+
+            with ExitStack() as references:
+                for slug in sorted(stations.slugs()):
+                    try:
+                        station = stations.editable(slug)
+                    except StationControlError as exc:
+                        # Its saved references cannot change now, and nothing
+                        # would update them later: refuse, deleting nothing.
+                        raise StationControlError(
+                            f"{stations.get(slug).name}: {exc}; try again in a moment"
+                        ) from exc
+                    manager = profile_settings(station)
+                    references.enter_context(manager.changing_reference("preset", name, INCLUDED))
+                delete_preset(
+                    cfg.index.shared_dir, name, active=[preset for _station, preset in in_use]
+                )
+
         try:
-            await asyncio.to_thread(
-                delete_preset,
-                cfg.index.shared_dir,
-                name,
-                active=[preset for _station, preset in in_use],
-            )
+            await asyncio.to_thread(remove)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except StationControlError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except PresetInUseError as exc:
             users = [station for station, preset in in_use if preset == exc.args[0]]
             where = f" on {', '.join(users)}" if len(stations.slugs()) > 1 and users else ""
@@ -2276,6 +2327,7 @@ def create_app(
                 body.kind,
                 body.recursive,
                 body.advanced if body.kind == "music" else False,
+                analysis=body.analysis,
             )
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2319,17 +2371,15 @@ def create_app(
     @app.patch("/api/library/folders/{source_id}")
     async def api_library_update_folder(source_id: str, body: LibraryFolderUpdateBody) -> dict:
         library = _catalog_library()
-        source = next((s for s in library.catalog.sources() if s["id"] == source_id), None)
-        if source is None:
-            raise HTTPException(status_code=404, detail="Folder not registered")
-        recursive = source["recursive"] if body.recursive is None else body.recursive
-        advanced = source["advanced"] if body.advanced is None else body.advanced
-        await asyncio.to_thread(
+        updated = await asyncio.to_thread(
             library.catalog.update_source,
             source_id,
-            recursive,
-            advanced if source["kind"] == "music" else False,
+            recursive=body.recursive,
+            advanced=body.advanced,
+            analysis=body.analysis,
         )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Folder not registered")
         library.start_scan({source_id})
         return await asyncio.to_thread(library.snapshot)
 
@@ -2400,15 +2450,6 @@ def create_app(
             )
         await asyncio.to_thread(library.set_auto_rescan_minutes, total)
         return {"hours": body.hours, "minutes": body.minutes}
-
-    @app.get("/api/library/dj-analysis")
-    async def api_library_dj_analysis() -> dict[str, bool]:
-        return {"enabled": await asyncio.to_thread(_catalog_library().dj_analysis_enabled)}
-
-    @app.put("/api/library/dj-analysis")
-    async def api_library_set_dj_analysis(body: LibraryDjAnalysisBody) -> dict[str, bool]:
-        await asyncio.to_thread(_catalog_library().set_dj_analysis_enabled, body.enabled)
-        return {"enabled": body.enabled}
 
     @app.get("/api/library/music-fade")
     async def api_library_music_fade() -> dict[str, int]:
@@ -2874,6 +2915,9 @@ def _connection_limit(cfg: Any) -> int:
 
 def _station_broadcast(station: StationRuntime) -> Callable[[], Coroutine[Any, Any, None]]:
     """The loop that pushes *station*'s state to its WebSocket clients once a second."""
+    from autodj.profile_settings import profile_settings
+
+    profiles = profile_settings(station)
 
     async def broadcast() -> None:  # pragma: no cover — long-running task
         failures = _BroadcastFailureLog()
@@ -2898,6 +2942,7 @@ def _station_broadcast(station: StationRuntime) -> Callable[[], Coroutine[Any, A
                 recorder.status if recorder is not None else None,
                 station.station_list,
                 station.live_state,
+                lambda: profiles.active,
             )
 
     return broadcast
@@ -3016,6 +3061,7 @@ def _extra_station(
             stream_path="/stream.mp3" if slug == DEFAULT_SLUG else f"/{slug}.mp3",
         )
         player.on_track_started = bridge.on_track_started
+        player.on_item_aired = bridge.record_aired
         bridge.load_persistent_state()
         player.configure_clock()
         # The mastering process and the player thread start from here; a
@@ -3156,11 +3202,13 @@ def serve(
     stream: bool | None = None,
     lan_configured_hosts: list[str] | None = None,
     library: LibraryManager | None = None,
-) -> bool:
+) -> int | None:
     """Start the Player thread and the FastAPI/uvicorn web server.
 
-    This function blocks until uvicorn is stopped (Ctrl+C), and returns
-    whether it stopped because Settings, Updates asked for a restart.
+    This function blocks until uvicorn is stopped (Ctrl+C), and returns the
+    exit status Settings, Updates asked for (RESTART_EXIT_CODE for Restart,
+    UPDATE_EXIT_CODE for Update), or ``None`` when nothing was asked or a
+    stop signal won.
 
     Args:
         cfg: Full :class:`~autodj.config.AutoDJConfig` instance.
@@ -3183,6 +3231,7 @@ def serve(
     a :class:`~autodj.tls.CertificateReloader` then loads renewed files into
     the running server.
     """
+    started = time.perf_counter()
     from dataclasses import replace
 
     import faiss
@@ -3238,6 +3287,7 @@ def serve(
         extra_stations=extra_stations,
     )
 
+    logger.info("Startup: server app construction took %.2f s", time.perf_counter() - started)
     startup_policy: SecurityPolicy = app.state.security_policy
     startup_registry: DeviceRegistry | None = app.state.device_registry
     # Starting with no paired browser counts as asking for a code; once one
@@ -3360,6 +3410,7 @@ def serve(
             """Build uvicorn's context and reload renewed certificate files into it."""
             context = default_factory()
             reloader = CertificateReloader(context, certfile, keyfile)
+            app.state.certificate_reloader = reloader
             reloader.start()
             reloaders.append(reloader)
             return context
@@ -3381,6 +3432,19 @@ def serve(
         server.should_exit = True
 
     app.state.server_exit = _server_exit
+    from autodj.update_contract import health_for
+
+    # Where the checkout's launcher asks a new version whether it is up,
+    # after Update (autodj.checkout_update).
+    # The Host header is one the server's own policy accepts, even when
+    # loopback is not among its allowed hosts; None offers no Update.
+    app.state.health_probe = health_for(
+        host,
+        port,
+        https=secure_cookie,
+        host_allowed=startup_policy.host_allowed,
+        allowed_hosts=startup_policy.config.effective_allowed_hosts(),
+    )
     interrupted = False
     try:
         server.run()
@@ -3397,4 +3461,9 @@ def serve(
     if not server.started:
         # What uvicorn.run does when the server could not start (port in use).
         sys.exit(3)
-    return bool(getattr(app.state, "restart_requested", False)) and not interrupted
+    if not getattr(app.state, "restart_requested", False) or interrupted:
+        return None
+    from autodj.updates import RESTART_EXIT_CODE
+
+    status = getattr(app.state, "exit_status", None)
+    return status if isinstance(status, int) else RESTART_EXIT_CODE

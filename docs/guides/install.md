@@ -154,22 +154,25 @@ Some things to know:
 - Shared server settings, such as HTTPS certificates, go in `config.toml` or
   `config.local.toml` beside `compose.yaml`. Give paths inside that folder as relative paths,
   such as `ssl_certfile = "certs/fullchain.pem"`. Restart with `docker compose restart autodj` after a change.
-  Set a station's **Playback output** in **Settings**, **Stations**.
-- The image includes FFmpeg, and its analysis runs on the processor.
+  Set a station's **Playback output** in **Settings**, **Station**, **Stations**.
+- The image includes FFmpeg, and its analysis runs on the processor. On a computer with an
+  NVIDIA graphics card, the `-cuda` image can analyse on the card instead; see
+  [Use an NVIDIA GPU](operations/containers-and-windows.md#use-an-nvidia-gpu).
 - The music folder is mounted read-only, so AutoDJ cannot write tag edits into your files.
 - To use a [beets](https://beets.io/) library, set `AUTODJ_BEETS_PATH` to the folder that holds
   beets' `library.db`, and set `beets_db = "/beets/library.db"` in the `[library]` section of
   `config.local.toml`. Beets' stored music paths must match the folder AutoDJ sees, `/music`
-  in Docker. AutoDJ reports a mismatch. For relative paths, it suggests and uses a registered
-  folder when `music_dir` is unset or missing and only one folder matches.
-- Stereo Tool is not in the image. Download it from Settings, Sound; it is saved in the index
+  in the default Docker mount. For relative paths, set `music_dir = "/music"` as the Beets base.
+  This does not register music: add `/music` in Library. Categories and clock conditions can
+  infer a missing base in limited cases; see [Beets paths](operations/categories.md#beets-paths-and-music_dir).
+- Stereo Tool is not in the image. Download it from Settings, Global, Server; it is saved in the index
   folder.
 - To get a new pairing code later, run
   `docker compose exec autodj autodj devices pairing-code`.
 
 ### A NAS without a graphics card
 
-For faster analysis, create a token in **Settings**, **Analysis workers** and run
+For faster analysis, create a token in **Settings**, **Global**, **Analysis workers** and run
 `autodj worker` on a GPU computer. See [Using a GPU machine](../operations.md#using-a-gpu-machine).
 
 ## Use AutoDJ from other devices
@@ -185,7 +188,7 @@ AutoDJ prints its network addresses. While no browser is paired, it also prints 
 1. On the other device, open one of the addresses.
 2. Type the pairing code. That browser stays paired; it does not need the code again.
 3. For the next device, get a new code: run `autodj devices pairing-code`, or press **Show
-   pairing code** in Settings, **Profiles and access** on a browser that is already paired.
+   pairing code** in Settings, **Global**, **Server** on a browser that is already paired.
 
 Each code pairs one device and changes every five minutes. To keep LAN mode on, add this to
 `config.toml` and restart AutoDJ:
@@ -195,7 +198,7 @@ Each code pairs one device and changes every five minutes. To keep LAN mode on, 
 lan = true
 ```
 
-**Profiles and access** has **Rename**, **Revoke**, and **Sign out this browser**.
+**Browser access** in **Settings**, **Global**, **Server** has **Rename**, **Revoke**, and **Sign out this browser**.
 
 If another device cannot connect, check the firewall on the AutoDJ computer. Windows may show a
 Windows Security prompt the first time; allow access on private networks. On Linux, open the
@@ -227,8 +230,11 @@ has the steps.
 
 ## Update AutoDJ
 
-Back up first with `autodj backup`. Follow [Back up and update AutoDJ](backups-and-updates.md)
-for source, wheel, and Docker updates.
+A source checkout started with `./autodj serve` or `.\autodj.cmd serve` updates from
+**Settings**, **Global**, **Update and restart** with **Update AutoDJ**, which makes the backup itself; see
+[Update from the page](backups-and-updates.md#update-from-the-page). Otherwise back up first with
+`autodj backup` and follow [Back up and update AutoDJ](backups-and-updates.md) for source, wheel,
+and Docker updates.
 
 ## Release artifacts
 

@@ -49,7 +49,7 @@
 //         its help, 24 px targets, a described button, a visible reason
 //         where the browser cannot choose a device, and a change said
 //         staged without moving focus or announcing a save;
-//       - Settings > Analysis workers, Machine tokens: the Station choice
+//       - Settings > General > Server, Machine tokens: the Station choice
 //         is hidden until Token use is an announcer, then shows as a
 //         named select with linked help and 24 px targets, focus staying
 //         on Token use; it is measured in every theme mode (axe-core and
@@ -442,7 +442,7 @@ const TIME_CHECKS = {
 };
 const timeCheckPages = new WeakSet();
 
-// Settings > Analysis workers (#554) with two stood-in workers, one too old
+// Settings > General > Server, Analysis workers (#554), with two stood-in workers, one too old
 // to apply settings, and a refusal notice, so the worker settings, their
 // state lines and Dismiss are measured on a server with no worker.  A
 // pairing code is stood in for too; Pair a worker shows it with its
@@ -677,8 +677,9 @@ async function standInForSchedule(page) {
 }
 
 // Settings > Updates (#552): an update available, with its release notes,
-// the commands and Restart, which the audit server (no launcher loop) would
-// not offer.  Long command lines test reflow at 320 px.
+// Update, Go back, a failed last update with its recovery commands, and
+// Restart, which the audit server (no launcher loop) would not offer.  Long
+// command lines test reflow at 320 px.
 const UPDATES = {
   installation: { kind: "git", version: "0.21.0", commit: "0db0a92", branch: null, tag: "v0.21.0" },
   settings: { check: true, channel: null },
@@ -689,12 +690,23 @@ const UPDATES = {
     checked_at: 1792740000,
     notes_url: "https://github.com/blindndangerous/AutoDJ/releases/tag/v0.22.0",
   },
-  commands: [
-    "git fetch --tags origin", "git switch --detach v0.22.0", "./autodj setup",
-    "./autodj doctor --no-fix",
-    'uv pip install "autodj[all] @ https://github.com/blindndangerous/AutoDJ/releases/download/v0.22.0/autodj-0.22.0-py3-none-any.whl"',
-  ],
   restart: { available: true, mode: "launcher", message: "The AutoDJ launcher starts AutoDJ again." },
+  update: {
+    available: true, mechanism: "launcher", message: "The AutoDJ launcher updates this checkout.",
+    guide_url: "https://github.com/blindndangerous/AutoDJ/blob/master/docs/guides/backups-and-updates.md#update-a-source-checkout",
+  },
+  go_back: { available: true, tag: "v0.20.0", version: "0.20.0", date: "2026-10-01", message: "" },
+  last_update: {
+    id: "abcdef12", action: "update", outcome: "rolled-back", finished_at: 1792740000,
+    message: "The update failed, so AutoDJ went back to 0.21.0. The new version needs a library "
+      + "migration, which AutoDJ does not run by itself. To migrate, stop AutoDJ and run these "
+      + "commands in the AutoDJ folder.",
+    commands: [
+      "git switch --detach v0.22.0", "./autodj setup", "./autodj migrate-index",
+      "./autodj migrate-index --apply",
+      "./autodj --config /srv/night-owl-radio/configuration/with/a/long/unbroken/path/config.toml doctor --no-fix",
+    ],
+  },
 };
 const updatesPages = new WeakSet();
 
@@ -704,33 +716,158 @@ async function standInForUpdates(page) {
   await page.route("**/api/updates", (route) => (route.request().method() === "GET"
     ? route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(UPDATES) })
     : route.continue()));
-  // Restart is only ever cancelled here; a press that got through is refused.
-  await page.route("**/api/server/restart", (route) => route.fulfill({
-    status: 409, contentType: "application/json", body: JSON.stringify({ detail: "Audit" }),
-  }));
+  // Restart, Update and Go back are refused here, so a confirmed press
+  // restarts or updates nothing.
+  for (const action of ["restart", "update", "go-back"]) {
+    await page.route(`**/api/server/${action}`, (route) => route.fulfill({
+      status: 409, contentType: "application/json", body: JSON.stringify({ detail: "Audit" }),
+    }));
+  }
 }
 
-// Restart opens the shared confirmation on Cancel; Escape closes it and puts
-// focus back on Restart, with nothing sent.
-async function openRestartConfirm(page, visit) {
-  const restart = page.locator("#updates-restart");
-  await restart.waitFor({ state: "visible" });
-  await page.locator("#updates-how").waitFor({ state: "visible" });
-  await restart.focus();
+// Every focus change on the page from now on, as "out:<from>><to>" and
+// "in:<to>"; "body" is focus going nowhere.
+function watchFocus(page) {
+  return page.evaluate(() => {
+    const name = (element) => (!element || element === document.body ? "body" : element.id || element.tagName);
+    window.__autodjFocusTrail = [];
+    if (window.__autodjFocusWatched) return;
+    window.__autodjFocusWatched = true;
+    document.addEventListener("focusout", (event) => window.__autodjFocusTrail
+      .push(`out:${name(event.target)}>${name(event.relatedTarget)}`), true);
+    document.addEventListener("focusin", (event) => window.__autodjFocusTrail
+      .push(`in:${name(event.target)}`), true);
+  });
+}
+
+// Close the open confirmation with *keys* and check focus went straight
+// from the dialog's button back to the button *id* that opened it: never
+// through the page body, where NVDA read "Skip to main content" first
+// (#602).  The browser fires close a task after the dialog closes, and the
+// page may return focus in that close handler, so the trail is read after
+// it; the next button's focus is then not taken back by a late close.
+async function closeUpdatesConfirm(page, id, keys, how) {
+  const dialog = page.locator("#confirm-dialog");
+  // Measuring the open dialog may have moved focus; start from Cancel.
+  await page.locator("#confirm-cancel").focus();
+  await watchFocus(page);
+  const start = await page.evaluate(() => `open ${document.getElementById("confirm-dialog").open}, active ${document.activeElement?.id || document.activeElement?.tagName}`);
+  await page.evaluate(() => {
+    const confirm = document.getElementById("confirm-dialog");
+    window.__autodjConfirmClosed = new Promise((resolve) => {
+      confirm.addEventListener("close", () => setTimeout(resolve, 0), { once: true });
+    });
+  });
+  for (const key of keys) await page.keyboard.press(key);
+  await dialog.waitFor({ state: "hidden" });
+  await page.evaluate(() => Promise.race([
+    window.__autodjConfirmClosed,
+    new Promise((resolve) => { setTimeout(resolve, 5000); }),
+  ]));
+  const trail = await page.evaluate(() => ({ trail: window.__autodjFocusTrail, active: document.activeElement?.id }));
+  const closing = trail.trail.slice(trail.trail.findLastIndex((step) => step.startsWith("out:confirm-")));
+  const straight = [`out:confirm-cancel>${id}`, `out:confirm-accept>${id}`]
+    .includes(closing[0]) && closing.length === 2 && closing[1] === `in:${id}`;
+  if (trail.active !== id || !straight) {
+    throw new Error(`${how} did not put focus straight back on ${id}: ${trail.trail.join(", ")} (${start})`);
+  }
+}
+
+// The open confirmation keeps the page out of reach without showModal()
+// (#602, #627): marked aria-modal, not :modal, the form out of the tree,
+// Cancel last; the backdrop covers the page and a click on it changes
+// nothing; Tab and Shift+Tab go round the dialog's two buttons; a page
+// control clicked directly does nothing.
+async function updatesConfirmShape(page, name) {
+  const shape = await page.evaluate(() => {
+    const dialog = document.getElementById("confirm-dialog");
+    // Two corners of the window, away from the dialog.
+    const hits = [[5, 5], [window.innerWidth - 5, window.innerHeight - 5]]
+      .map(([x, y]) => document.elementFromPoint(x, y)?.id || "page");
+    return {
+      ariaModal: dialog.getAttribute("aria-modal"),
+      modal: dialog.matches(":modal"),
+      formRole: dialog.querySelector("form").getAttribute("role"),
+      buttons: [...dialog.querySelectorAll("button")].map((button) => button.id).join(","),
+      coveredBy: [...new Set(hits)].join(","),
+    };
+  });
+  const expected = { ariaModal: "true", modal: false, formRole: "none",
+    buttons: "confirm-accept,confirm-cancel", coveredBy: "dialog-backdrop" };
+  if (JSON.stringify(shape) !== JSON.stringify(expected)) {
+    throw new Error(`${name}'s confirmation is not as expected: ${JSON.stringify(shape)}`);
+  }
+  await page.locator("#dialog-backdrop").click({ position: { x: 5, y: 5 } });
+  await page.locator("#confirm-cancel").focus();
+  const stops = [];
+  for (const key of ["Tab", "Tab", "Shift+Tab"]) {
+    await page.keyboard.press(key);
+    stops.push(await page.evaluate(() => document.activeElement?.id));
+  }
+  // A page control activated directly, as a screen reader that ignores
+  // aria-modal does, must not act: the Now Playing tab stays unselected.
+  const pageClick = await page.evaluate(() => {
+    document.getElementById("tab-now").click();
+    return {
+      selected: document.getElementById("tab-now").getAttribute("aria-selected"),
+      active: document.activeElement?.id,
+    };
+  });
+  const open = await page.locator("#confirm-dialog").evaluate((dialog) => dialog.open);
+  if (!open || stops.join(",") !== "confirm-accept,confirm-cancel,confirm-accept"
+      || pageClick.selected !== "false" || pageClick.active !== "confirm-cancel") {
+    throw new Error(`${name}'s confirmation let go: open ${open}, Tab stops ${stops.join(",")}, `
+      + `Now Playing tab clicked: ${JSON.stringify(pageClick)}`);
+  }
+}
+
+async function reopenUpdatesConfirm(page, id) {
+  await page.locator(`#${id}`).focus();
+  await page.keyboard.press("Enter");
+  await page.locator("#confirm-dialog").waitFor({ state: "visible" });
+}
+
+// Update, Go back and Restart open the shared confirmation on Cancel;
+// Escape closes it and puts focus straight back on the button, with
+// nothing sent.
+async function openUpdatesConfirm(page, visit, id, name, words) {
+  const button = page.locator(`#${id}`);
+  await button.waitFor({ state: "visible" });
+  await button.focus();
+  await watchFocus(page);
   await page.keyboard.press("Enter");
   const dialog = page.locator("#confirm-dialog");
   await dialog.waitFor({ state: "visible" });
-  const focused = await page.evaluate(() => document.activeElement?.id);
-  if (focused !== "confirm-cancel") {
-    throw new Error(`Restart's confirmation opened with focus on ${focused}, not Cancel`);
+  // Focus goes straight from the button to Cancel: the browser does not
+  // focus the confirm button, the first one, on the way.
+  const opened = await page.evaluate(() => ({ trail: window.__autodjFocusTrail, active: document.activeElement?.id }));
+  if (opened.active !== "confirm-cancel"
+      || opened.trail.join(",") !== `out:${id}>confirm-cancel,in:confirm-cancel`) {
+    throw new Error(`${name}'s confirmation opened with focus on ${opened.active}, not straight on Cancel: `
+      + opened.trail.join(", "));
   }
   const message = await page.locator("#confirm-message").textContent();
-  if (!/off the air/.test(message || "")) throw new Error(`Restart's confirmation says: ${message}`);
-  await visit("settings/updates/restart");
-  await page.keyboard.press("Escape");
-  await dialog.waitFor({ state: "hidden" });
-  const back = await page.evaluate(() => document.activeElement?.id);
-  if (back !== "updates-restart") throw new Error(`Escape left focus on ${back}, not Restart`);
+  if (!words.test(message || "")) throw new Error(`${name}'s confirmation says: ${message}`);
+  await visit(`settings/updates/${name.toLowerCase().replace(" ", "-")}`);
+  await updatesConfirmShape(page, name);
+  await closeUpdatesConfirm(page, id, ["Escape"], `${name}: Escape`);
+}
+
+// Restart is also closed with Cancel, and confirmed and refused; Restart is
+// before Cancel, so Shift+Tab reaches it.
+async function openRestartConfirm(page, visit) {
+  await page.locator("#updates-how").waitFor({ state: "visible" });
+  await openUpdatesConfirm(page, visit, "updates-update", "Update", /off the air/);
+  await openUpdatesConfirm(
+    page, visit, "updates-go-back-button", "Go back", /made since 2026-10-01 are lost/,
+  );
+  await openUpdatesConfirm(page, visit, "updates-restart", "Restart", /off the air/);
+  await reopenUpdatesConfirm(page, "updates-restart");
+  await closeUpdatesConfirm(page, "updates-restart", ["Enter"], "Restart: Cancel");
+  await reopenUpdatesConfirm(page, "updates-restart");
+  await closeUpdatesConfirm(page, "updates-restart", ["Shift+Tab", "Enter"], "Restart: refused");
+  // The refusal's status message would cover what is measured next.
+  await showToast(page, "");
 }
 
 const hourFitPages = new WeakSet();
@@ -761,15 +898,23 @@ async function openHourFit(page, visit) {
 
 // Schedule: a hard event's Wait up to seconds refused in the browser, the
 // field marked invalid and focused, the error shown and linked.  Nothing
-// is saved; Cancel and Discard close the modal.
+// is saved; Cancel and Discard close the editor.  The editor opens with
+// show() and aria-modal, not showModal() (#631), with the backdrop over
+// the page.
 async function inspectEditorModal(page, formId, visit, target) {
   const dialog = page.locator(`#${formId}-dialog`);
   await dialog.waitFor({ state: "visible" });
   const name = await dialog.evaluate((element) => {
     const heading = document.getElementById(element.getAttribute("aria-labelledby"));
-    return { open: element.open, modal: element.matches(":modal"), labelled: Boolean(heading && element.contains(heading) && heading.textContent.trim()) };
+    return {
+      open: element.open, modal: element.matches(":modal"), ariaModal: element.getAttribute("aria-modal"),
+      backdrop: document.getElementById("dialog-backdrop")?.hidden === false,
+      labelled: Boolean(heading && element.contains(heading) && heading.textContent.trim()),
+    };
   });
-  if (!name.open || !name.modal || !name.labelled) throw new Error(`${formId} is not an accessible native modal`);
+  if (!name.open || name.modal || name.ariaModal !== "true" || !name.backdrop || !name.labelled) {
+    throw new Error(`${formId} is not an accessible dialog kept modal without showModal(): ${JSON.stringify(name)}`);
+  }
   const viewport = page.viewportSize() || { width: 1280, height: 800 };
   await page.setViewportSize({ width: 320, height: 640 });
   await settle(page);
@@ -830,7 +975,7 @@ async function openPackDatesError(page, visit) {
   await page.locator("#tc-not-after").fill("2026-12-01");
   await page.locator("#tc-dates-save").click();
   await page.locator("#tc-dates-error").waitFor({ state: "visible" });
-  await visit("settings/time-checks/dates-error");
+  await visit("settings/announcements/dates-error");
   await page.locator("#tc-not-after").fill("2026-12-31");
 }
 
@@ -1305,7 +1450,7 @@ async function openLiveDjError(page, visit) {
   await page.locator("#live-dj-save").click();
   await page.locator("#live-dj-error").waitFor({ state: "visible", timeout: 5000 });
   await settle(page);
-  await visit("settings/live/dj-error");
+  await visit("settings/stream/dj-error");
   await page.locator("#live-dj-cancel").click();
 }
 
@@ -1495,7 +1640,7 @@ async function speechStudioProblems(page) {
   try {
     await page.goto(BASE, { waitUntil: "networkidle", timeout: 20000 });
     await page.locator("#tab-settings").click();
-    await page.locator("#stab-liners").click();
+    await clickSubtabUnprompted(page, "stab-announcements");
     await page.locator("#speech-studio").evaluate((element) => { element.open = true; });
     const name = page.locator("#speech-results").getByLabel("Liner name");
     await name.fill("Morning station ID");
@@ -1677,28 +1822,30 @@ async function eachTarget(page, measure) {
       }
       continue;
     }
-    const ids = await page.$$eval("#settings-tabs [role='tab']:not([hidden])",
-      (tabs) => tabs.map((tab) => tab.id));
-    for (const id of ids) {
-      // Reset fixture drafts only if they still differ when the click runs.
-      await page.locator('[data-settings-discard]:visible').evaluateAll((buttons) => {
-        for (const button of buttons) if (button.getAttribute("aria-disabled") !== "true") button.click();
-      });
-      await clickSubtabUnprompted(page, id);
-      await page.waitForTimeout(150);
-      await openEveryCard(page);
-      await visit(`settings/${id.replace(/^stab-/, "")}`);
-      if (id === "stab-picking") {
-        await openRotationTest(page, visit);
-        await openRepeatHoursError(page, visit);
-        await openHourFit(page, visit);
+    for (const kind of ["profile", "station", "server", "browser"]) {
+      const ids = await page.$$eval("#settings-tabs [role='tab']",
+        (tabs, wanted) => tabs.filter((tab) => tab.dataset.settingsKind === wanted).map((tab) => tab.id), kind);
+      for (const id of ids) {
+        // Reset fixture drafts only if they still differ when the click runs.
+        await page.locator('[data-settings-discard]:visible').evaluateAll((buttons) => {
+          for (const button of buttons) if (button.getAttribute("aria-disabled") !== "true") button.click();
+        });
+        await clickSubtabUnprompted(page, id);
+        await page.waitForTimeout(150);
+        await openEveryCard(page);
+        await visit(`settings/${id.replace(/^stab-/, "")}`);
+        if (id === "stab-picking") {
+          await openRotationTest(page, visit);
+          await openRepeatHoursError(page, visit);
+          await openHourFit(page, visit);
+        }
+        if (id === "stab-schedule") await openScheduleWaitError(page, visit);
+        if (id === "stab-announcements") await openPackDatesError(page, visit);
+        if (id === "stab-stations") await openStationCreateError(page, visit);
+        if (id === "stab-stream") await openLiveDjError(page, visit);
+        if (id === "stab-workers") await openWorkerStates(page, visit);
+        if (id === "stab-updates") await openRestartConfirm(page, visit);
       }
-      if (id === "stab-schedule") await openScheduleWaitError(page, visit);
-      if (id === "stab-time-checks") await openPackDatesError(page, visit);
-      if (id === "stab-stations") await openStationCreateError(page, visit);
-      if (id === "stab-live") await openLiveDjError(page, visit);
-      if (id === "stab-workers") await openWorkerStates(page, visit);
-      if (id === "stab-updates") await openRestartConfirm(page, visit);
     }
   }
 }
@@ -2074,7 +2221,11 @@ async function footerLinkProblems(page) {
 function startOf(target) {
   const [view, sub] = target.split("/");
   // Only Settings targets name a subtab; "track-info/tags" is a state.
-  return view === "settings" && sub ? `#stab-${sub}` : `#tab-${view}`;
+  const owner = {
+    transitions: "mixing", djmix: "mixing", liners: "announcements",
+    "time-checks": "announcements", breaks: "announcements", live: "stream",
+  }[sub] || sub;
+  return view === "settings" && sub ? `#stab-${owner}` : `#tab-${view}`;
 }
 
 async function themeContext(browser, mode) {
@@ -2203,17 +2354,26 @@ async function recordConfirmOpeners(page) {
   if (confirmOpenerPages.has(page)) return;
   confirmOpenerPages.add(page);
   await page.addInitScript(() => {
-    const show = window.HTMLDialogElement.prototype.showModal;
-    window.HTMLDialogElement.prototype.showModal = function showModal(...args) {
-      if (this.id === "confirm-dialog") window.__autodjConfirmOpenedFrom = new Error("confirm opened").stack;
-      return show.apply(this, args);
-    };
+    // show() since #630; showModal() over another modal dialog.
+    for (const method of ["show", "showModal"]) {
+      const open = window.HTMLDialogElement.prototype[method];
+      window.HTMLDialogElement.prototype[method] = function noteOpener(...args) {
+        if (this.id === "confirm-dialog") window.__autodjConfirmOpenedFrom = new Error("confirm opened").stack;
+        return open.apply(this, args);
+      };
+    }
   });
 }
 
 // Click a Settings subtab; an unexpected confirmation fails with the
 // dirty parts the draft module reports, instead of a 30 s timeout.
 async function clickSubtabUnprompted(page, id) {
+  const tabIds = {
+    "stab-transitions": "stab-mixing", "stab-djmix": "stab-mixing",
+    "stab-liners": "stab-announcements", "stab-time-checks": "stab-announcements",
+    "stab-breaks": "stab-announcements", "stab-live": "stab-stream",
+  };
+  id = tabIds[id] || id;
   // The page's own module instance, by the URL app.js loads it from.
   const unexpected = () => page.evaluate(async (drafts) => {
     if (!document.getElementById("confirm-dialog")?.open) return null;
@@ -2405,7 +2565,7 @@ async function toastBehaviourProblems(page) {
 }
 
 // The preview output device setting, in whatever this engine supports.
-// Settings > Analysis workers with an announcer token chosen: the Station
+// Settings > General > Server with an announcer token chosen: the Station
 // choice shows (#88).  Back to the default choice with `false`.
 // New station by keyboard: a refused create marks, links and focuses
 // Station ID and says nothing else; a stood-in create says it once and
@@ -2413,7 +2573,7 @@ async function toastBehaviourProblems(page) {
 async function stationCreateProblems(page) {
   await page.goto(BASE, { waitUntil: "networkidle", timeout: 20000 });
   await page.locator("#tab-settings").click();
-  await page.locator("#stab-stations").click();
+  await clickSubtabUnprompted(page, "stab-stations");
   await page.locator("#station-create-name").waitFor({ state: "visible" });
   const problems = [];
   const state = () => page.evaluate(() => {
@@ -2478,7 +2638,7 @@ async function chooseAnnouncer(page, announcer = true) {
 async function tokenScopeProblems(page) {
   await page.goto(BASE, { waitUntil: "networkidle", timeout: 20000 });
   await page.locator("#tab-settings").click();
-  await page.locator("#stab-workers").click();
+  await clickSubtabUnprompted(page, "stab-workers");
   const scope = page.locator("#token-scope");
   await scope.waitFor({ state: "visible" });
   const problems = [];
@@ -2900,7 +3060,7 @@ async function stationSwitcherProblems(page) {
 async function previewOutputProblems(page) {
   await page.goto(BASE, { waitUntil: "networkidle", timeout: 20000 });
   await page.locator("#tab-settings").click();
-  await page.locator("#stab-sound").click();
+  await clickSubtabUnprompted(page, "stab-display");
   const select = page.locator("#preview-device");
   await select.waitFor({ state: "visible" });
   // Let the device list load.

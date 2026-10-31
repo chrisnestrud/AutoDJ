@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import heapq
 import ntpath
@@ -187,6 +188,12 @@ def least_recent(
     )
 
 
+def _preferred_entry(entries: Sequence[Any], path: str | None) -> Any | None:
+    if path is None:
+        return None
+    return next((entry for entry in entries if _normalized(entry.path) == _normalized(path)), None)
+
+
 def _least_recent(
     entries: Sequence[Any],
     played: Callable[[str], Any],
@@ -200,59 +207,93 @@ def _least_recent(
     if not entries:
         raise ValueError("entries must not be empty")
     chooser = rng if rng is not None else random
-    song_played = versions.last_played(played) if versions else None
     song_order: dict[str, int] = {}
-    if versions:
-        songs = list(dict.fromkeys(versions.song(entry.path) for entry in entries))
+    # Count versions as one song only when some song has another version.
+    by_song = bool(versions)
+    if by_song:
+        assert versions is not None
+        song_of = versions.song
+        songs = list(dict.fromkeys([song_of(entry.path) for entry in entries]))
         chooser.shuffle(songs)
-        preferred_song = (
-            next(
-                (
-                    versions.song(entry.path)
-                    for entry in entries
-                    if _normalized(entry.path) == _normalized(preferred_path)
-                ),
-                None,
-            )
-            if preferred_path is not None
-            else None
-        )
+        preferred = _preferred_entry(entries, preferred_path)
+        preferred_song = versions.song(preferred.path) if preferred is not None else None
         if preferred_song is not None:
             songs.remove(preferred_song)
             songs.insert(0, preferred_song)
         song_order = {song: index for index, song in enumerate(songs)}
 
+    # The latest play of any version of each song (SongVersions.last_played),
+    # worked out once per song rather than once per version.
+    song_ages: dict[str, Any] = {}
+
     def age(entry: Any) -> tuple[Any, ...]:
         # Never played sorts first, then the oldest play.
-        stamp = played(entry.path)
-        if song_played is None:
+        path = entry.path
+        stamp = played(path)
+        if not by_song:
             return (stamp is not None, stamp)
         assert versions is not None
-        song = song_played(entry.path)
+        group = versions.versions(path)
+        song = group[0]
+        if song in song_ages:
+            latest = song_ages[song]
+        elif len(group) == 1:
+            latest = song_ages[song] = stamp
+        else:
+            stamps = [when for version in group if (when := played(version)) is not None]
+            latest = song_ages[song] = max(stamps) if stamps else None
         # Break equal song ages before considering versions, so extra copies add no odds.
-        return (
-            song is not None,
-            song,
-            song_order[versions.song(entry.path)],
-            stamp is not None,
-            stamp,
-        )
+        return (latest is not None, latest, song_order[song], stamp is not None, stamp)
 
     if allowed is not None or fit is not None:
         ordered = list(entries)
         chooser.shuffle(ordered)
-        heap = [
-            (
-                *age(entry),
-                0
-                if preferred_path is not None
-                and _normalized(entry.path) == _normalized(preferred_path)
-                else 1,
-                index,
-                entry,
-            )
-            for index, entry in enumerate(ordered)
-        ]
+        wanted = _normalized(preferred_path) if preferred_path is not None else None
+        # Each entry's age, its preference and its shuffled place, as age()
+        # gives them, built in one loop: a pick ages every song a step
+        # matches, often thousands.
+        heap: list[tuple[Any, ...]] = []
+        add = heap.append
+        if by_song:
+            assert versions is not None
+            versions_of = versions.versions
+            for index, entry in enumerate(ordered):
+                path = entry.path
+                stamp = played(path)
+                group = versions_of(path)
+                song = group[0]
+                if song in song_ages:
+                    latest = song_ages[song]
+                elif len(group) == 1:
+                    latest = song_ages[song] = stamp
+                else:
+                    stamps = [when for version in group if (when := played(version)) is not None]
+                    latest = song_ages[song] = max(stamps) if stamps else None
+                add(
+                    (
+                        latest is not None,
+                        latest,
+                        song_order[song],
+                        stamp is not None,
+                        stamp,
+                        0 if wanted is not None and _normalized(path) == wanted else 1,
+                        index,
+                        entry,
+                    )
+                )
+        else:
+            for index, entry in enumerate(ordered):
+                path = entry.path
+                stamp = played(path)
+                add(
+                    (
+                        stamp is not None,
+                        stamp,
+                        0 if wanted is not None and _normalized(path) == wanted else 1,
+                        index,
+                        entry,
+                    )
+                )
         heapq.heapify(heap)
         fitting: list[Any] = []
         fitted_songs: set[str] = set()
@@ -276,17 +317,9 @@ def _least_recent(
     ages = [age(entry) for entry in entries]
     oldest = min(ages)
     candidates = [entry for entry, when in zip(entries, ages, strict=True) if when == oldest]
-    if preferred_path is not None:
-        preferred = next(
-            (
-                entry
-                for entry in candidates
-                if _normalized(entry.path) == _normalized(preferred_path)
-            ),
-            None,
-        )
-        if preferred is not None:
-            return preferred
+    preferred = _preferred_entry(candidates, preferred_path)
+    if preferred is not None:
+        return preferred
     return chooser.choice(candidates)
 
 
@@ -334,47 +367,23 @@ def condition_paths(
     beets: Mapping[str, Mapping[str, Any]] | None = None,
     categories: Mapping[str, tuple[str, AbstractSet[str]]] | None = None,
     now: float | None = None,
+    *,
+    terms: ConditionTerms | None = None,
 ) -> set[str]:
     """The paths of *entries* that pass a conditions slot's Match all or Match any.
 
     *now* is the wall-clock time a relative date condition (within the last
-    N days) is judged at, the current time when not given.
+    N days) is judged at, the current time when not given.  *terms*, built
+    from these *entries*, *beets*, *categories* and *now*, keeps what each
+    condition matched for the next slot that has it.
     """
-    from autodj.catalog import normalize_path
-    from autodj.clock_conditions import condition_matcher
-
+    if terms is None:
+        terms = ConditionTerms(entries, beets, categories, now)
     found_paths: set[str] | None = None
     for condition in slot.conditions:
-        if condition["field"] == "folder":
-            matched = _slot_entries(
-                ClockSlot(folder=condition["folder"], recursive=condition["recursive"]), entries
-            )
-            if condition.get("operator") == "is_not":
-                paths = {item.path for item in matched}
-                matched = [entry for entry in entries if entry.path not in paths]
-        elif condition["field"] == "category":
-            if not categories or condition["category"] not in categories:
-                matched = []
-            else:
-                _, members = categories[condition["category"]]
-                matched = [
-                    entry
-                    for entry in entries
-                    if (entry.path in members) == (condition.get("operator") != "is_not")
-                ]
-        elif condition["field"] == "beets" and beets:
-            test = condition_matcher(condition)
-            matched = [
-                entry
-                for entry in entries
-                if test(entry, beets.get(normalize_path(entry.path)), now)
-            ]
-        else:
-            test = condition_matcher(condition)
-            matched = [entry for entry in entries if test(entry, None, now)]
-        paths = {entry.path for entry in matched}
+        paths = terms.matched(condition)
         if found_paths is None:
-            found_paths = paths
+            found_paths = set(paths)
         elif slot.match == "all":
             found_paths &= paths
         else:
@@ -382,6 +391,120 @@ def condition_paths(
         if slot.match == "all" and not found_paths:
             break  # Nothing can pass every condition now.
     return found_paths or set()
+
+
+# The Beets values of the last large pool matched: the entries and the
+# Beets mapping, by identity, and each entry's values in pool order.  Only
+# one is kept: an older library snapshot and its Beets values are let go as
+# soon as a pick matches the new ones.  Replaced whole, never changed in
+# place, so any thread may read it.
+_BEETS_ROWS: tuple[tuple[Sequence[Any], Mapping[str, Any], tuple[Any, ...]], ...] = ()
+_BEETS_ROWS_KEPT = 1
+# A pool smaller than this is looked up again rather than kept.
+_BEETS_ROWS_MIN = 1024
+
+
+def _beets_rows(entries: Sequence[Any], beets: Mapping[str, Mapping[str, Any]]) -> tuple[Any, ...]:
+    """Each of *entries*' Beets values (or ``None``), in order.
+
+    Beets values are keyed by the catalog's spelling of each path, which
+    takes a few microseconds to work out.  A large pool is looked up once
+    for as long as the library's entries and the Beets values stay the
+    same, instead of for each Beets condition of each conditions step.
+    """
+    from autodj.catalog import normalize_path
+
+    global _BEETS_ROWS
+    for kept_entries, kept_beets, rows in _BEETS_ROWS:
+        if kept_entries is entries and kept_beets is beets:
+            return rows
+    rows = tuple(beets.get(normalize_path(entry.path)) for entry in entries)
+    if len(entries) >= _BEETS_ROWS_MIN:
+        _BEETS_ROWS = ((entries, beets, rows), *_BEETS_ROWS[: _BEETS_ROWS_KEPT - 1])
+    return rows
+
+
+class ConditionTerms:
+    """What each condition matches in one pool of entries, worked out once per condition.
+
+    Conditions steps often share a condition, such as one category or one
+    Beets value.  Each is matched against the whole pool once, as a set of
+    paths: a category condition by set operations on its songs, and a
+    value condition by judging each distinct value once rather than each
+    song.  The answers are those of testing every entry.
+    """
+
+    def __init__(
+        self,
+        entries: Sequence[Any],
+        beets: Mapping[str, Mapping[str, Any]] | None = None,
+        categories: Mapping[str, tuple[str, AbstractSet[str]]] | None = None,
+        now: float | None = None,
+    ) -> None:
+        self.entries = entries
+        self._beets = beets
+        self._categories = categories
+        self._now = now
+        self._every: frozenset[str] | None = None
+        self._found: dict[str, frozenset[str]] = {}
+
+    def copy(self) -> ConditionTerms:
+        """Terms of their own, starting with the conditions matched so far."""
+        twin = copy.copy(self)
+        twin._found = dict(self._found)
+        return twin
+
+    def matched(self, condition: Mapping[str, Any]) -> frozenset[str]:
+        """The paths of the pool that pass *condition*, worked out the first time."""
+        key = repr(sorted(condition.items()))
+        found = self._found.get(key)
+        if found is None:
+            found = self._found[key] = frozenset(self._match(condition))
+        return found
+
+    def _paths(self) -> frozenset[str]:
+        if self._every is None:
+            self._every = frozenset(entry.path for entry in self.entries)
+        return self._every
+
+    def _match(self, condition: Mapping[str, Any]) -> AbstractSet[str]:
+        from autodj.clock_conditions import condition_value_test
+
+        entries = self.entries
+        negated = condition.get("operator") == "is_not"
+        if condition["field"] == "folder":
+            matched = _slot_entries(
+                ClockSlot(folder=condition["folder"], recursive=condition["recursive"]), entries
+            )
+            paths = {item.path for item in matched}
+            if negated:
+                return {entry.path for entry in entries if entry.path not in paths}
+            return paths
+        if condition["field"] == "category":
+            categories = self._categories
+            if not categories or condition["category"] not in categories:
+                return set()
+            _, members = categories[condition["category"]]
+            every = self._paths()
+            return every.difference(members) if negated else every.intersection(members)
+        value_of, judge = condition_value_test(condition)
+        beets = self._beets
+        rows = _beets_rows(entries, beets) if condition["field"] == "beets" and beets else None
+        now = self._now
+        judged: dict[tuple[type, Any], bool] = {}
+        found: set[str] = set()
+        for index, entry in enumerate(entries):
+            raw = value_of(entry, rows[index] if rows is not None else None)
+            try:
+                key = (raw.__class__, raw)
+                passes = judged.get(key)
+                if passes is None:
+                    passes = judged[key] = judge(raw, now)
+            except TypeError:  # A value that cannot be a key, such as a list.
+                passes = judge(raw, now)
+            if passes:
+                found.add(entry.path)
+        return found
 
 
 class ConditionPaths:
@@ -394,7 +517,8 @@ class ConditionPaths:
     are compared by value because the category index returns a new mapping per pick.
     When a step has a relative date condition (within the last N days), *now*,
     the time of the pick, is part of the key too, to the hour the condition
-    moves by (:func:`autodj.clock_conditions.relative_date_now`).
+    moves by (:func:`autodj.clock_conditions.relative_date_now`).  Steps that
+    share a condition match it once (:class:`ConditionTerms`).
     """
 
     def __init__(
@@ -411,6 +535,7 @@ class ConditionPaths:
         self._relative = any(uses_relative_dates(slot.conditions) for slot in slots)
         self._now = self._hour(now)
         self._paths: dict[int, frozenset[str]] = {}
+        self._terms: dict[str, ConditionTerms] = {}
 
     def _hour(self, now: float | None) -> int | None:
         return relative_date_now(now) if self._relative else None
@@ -437,15 +562,38 @@ class ConditionPaths:
             and self._hour(now) == self._now
         )
 
+    def copy_for(self, slots: Sequence[ClockSlot]) -> ConditionPaths | None:
+        """A cache of its own for equal *slots*, starting with the steps worked out so far.
+
+        A dry run loads its own slots from the same clockwheel; this lets it
+        start from the live player's results instead of matching the whole
+        library again.  ``None`` when the slots differ.  Steps or conditions
+        either cache works out later stay in that cache.
+        """
+        if list(slots) != list(self._key[0]):
+            return None
+        twin = copy.copy(self)
+        twin._key = (slots, *self._key[1:])
+        twin._paths = dict(self._paths)
+        twin._terms = {kind: terms.copy() for kind, terms in self._terms.items()}
+        return twin
+
     def paths(self, index: int) -> frozenset[str]:
         """The paths step *index* matches, worked out the first time it is asked for."""
         found = self._paths.get(index)
         if found is None:
             slots, entries, liners, beets = self._key
             slot = slots[index]
-            pool = liners if slot.kind == "liner" else entries
+            kind = "liner" if slot.kind == "liner" else "music"
+            terms = self._terms.get(kind)
+            if terms is None:
+                terms = self._terms[kind] = ConditionTerms(
+                    liners if kind == "liner" else entries, beets, self._categories, self._now
+                )
             found = self._paths[index] = frozenset(
-                condition_paths(slot, pool, beets, self._categories, self._now)
+                condition_paths(
+                    slot, terms.entries, beets, self._categories, self._now, terms=terms
+                )
             )
         return found
 
@@ -497,6 +645,7 @@ def pick_slot(
     versions: SongVersions | None = None,
     fit: Callable[[Sequence[Any]], Any] | None = None,
     preferred_path: str | None = None,
+    preferred_for_step: Callable[[int], str | None] | None = None,
 ) -> ClockPick:
     """Scan one clock cycle and select its next eligible music entry.
 
@@ -542,6 +691,11 @@ def pick_slot(
         slot: ClockSlot, matches: Sequence[Any], label: str
     ) -> tuple[Any | None, str | None]:
         nonlocal played
+        preference = (
+            preferred_for_step(index)
+            if preferred_for_step is not None and slot.kind != "liner"
+            else preferred_path
+        )
         if not matches:
             return None, f"{label}: no matching entries"
         if slot.selection == "least_recent":
@@ -559,27 +713,48 @@ def pick_slot(
                 allowed=allowed if slot.enforce_rules else None,
                 versions=versions,
                 fit=fit,
-                preferred_path=preferred_path,
+                preferred_path=preference,
             )
         else:
             candidates = [entry for entry in matches if not slot.enforce_rules or allowed(entry)]
+            preferred = _preferred_entry(candidates, preference)
             if not candidates:
                 selected = None
-            elif versions:
-                if fit is None:
-                    selected = versions.choice(candidates, chooser)
-                else:
+            elif fit is None:
+                selected = (
+                    preferred
+                    if preferred is not None
+                    else (
+                        versions.choice(candidates, chooser)
+                        if versions
+                        else chooser.choice(candidates)
+                    )
+                )
+            else:
+                if versions:
                     songs: dict[str, list[Any]] = {}
                     for entry in candidates:
                         songs.setdefault(versions.song(entry.path), []).append(entry)
-                    sampled = chooser.sample(list(songs), min(FIT_CANDIDATES, len(songs)))
-                    selected = fit([chooser.choice(songs[song]) for song in sampled])
-            else:
-                selected = (
-                    fit(chooser.sample(candidates, min(FIT_CANDIDATES, len(candidates))))
-                    if fit is not None
-                    else chooser.choice(candidates)
-                )
+                    sampled_songs = chooser.sample(list(songs), min(FIT_CANDIDATES, len(songs)))
+                    sampled = [chooser.choice(songs[song]) for song in sampled_songs]
+                else:
+                    sampled = chooser.sample(candidates, min(FIT_CANDIDATES, len(candidates)))
+                if preferred is not None:
+                    # Keep the remembered version first so an equally good fit stays put.
+                    sampled = [
+                        preferred,
+                        *(
+                            entry
+                            for entry in sampled
+                            if (
+                                versions.song(entry.path) != versions.song(preferred.path)
+                                if versions
+                                else entry is not preferred
+                            )
+                        ),
+                    ]
+                    sampled = sampled[:FIT_CANDIDATES]
+                selected = fit(sampled)
         if selected is None:
             return (
                 None,

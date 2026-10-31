@@ -22,8 +22,89 @@ is pending; the detailed interaction and release-sampling rules remain here.
 
 AutoDJ uses automated checks and requires a screen-reader sample before release to catch accessibility regressions. The results apply only to the paths that the checks exercise. They do not certify the whole application.
 
-Each modal dialog starts with an H1 title referenced by its `aria-labelledby`.
+Each dialog starts with an H1 title referenced by its `aria-labelledby`.
 Verify level-one heading navigation inside the dialog as well as its initial field focus.
+
+## Confirmations with NVDA
+
+The shared confirmation (Clear queue, Delete profile, Restart AutoDJ and the
+rest, in `modules/confirm-dialog.js`) opens with `show()` and `aria-modal="true"`,
+not `showModal()`. A backdrop keeps the page out of reach, Cancel is its last
+button, and its form is not exposed as a landmark. Behind a `showModal()` dialog
+the browser hides the page from assistive technology, so NVDA lost its place on
+the page and read "Skip to main content" as the dialog closed
+([#602](https://github.com/blindndangerous/AutoDJ/issues/602)). This also
+resolves D14 from the 0.18.0 sample for these dialogs. NVDA reads a new dialog
+through and leaves its cursor on the last button, so Enter pressed the confirm
+button when it came last
+([#627](https://github.com/blindndangerous/AutoDJ/issues/627)). The page is not
+made inert or `aria-hidden`, which would hide it from NVDA again, so a screen reader
+can still read it behind the dialog. A click, press, Enter, Space, submission or typed
+input aimed at the page while the dialog is open is stopped before the page sees it,
+so a screen reader that ignores `aria-modal` (TalkBack, Narrator) cannot activate a
+page control under the confirmation. Opened over another modal dialog, such as an
+editor's discard question, the confirmation is modal and lets go of focus before it
+closes, as other modal dialogs do (#385); the expectations below do not apply.
+
+Expected with NVDA in browse mode, in Chrome and Firefox:
+
+- Opening reads the title, the message and both buttons, with focus on Cancel.
+- Enter straight after opening cancels.
+- Tab and Shift+Tab move only between the two buttons. A click outside the
+  dialog, or a page control activated from the screen reader's own cursor,
+  does nothing and leaves focus on Cancel.
+- Escape or Cancel returns focus to the control that opened the dialog. NVDA
+  reads that control twice, first as the line at its browse-mode cursor (for
+  example "button Restart AutoDJ"), then as the focus ("Restart AutoDJ button").
+  It never reads "Skip to main content" or another line from the top of the page.
+
+To check, open a confirmation by keyboard, for example Restart AutoDJ in
+**Settings**, **Updates** or Clear queue in **Queue & Search**. Listen to the
+opening speech, then press Enter and confirm that nothing happened. Open it again
+and close it with Escape, then again with Cancel; the first thing read each time
+must be the control that opened it. Record the revision, browser and NVDA
+versions, and whether a person listened, as for any sample. The record of the
+first check is in
+[ADR 0011](adr/0011-verify-accessibility-with-browser-and-speech-evidence.md#amendment-2026-10-28-the-confirmation-opens-without-showmodal).
+
+## Other dialogs with NVDA
+
+Every other dialog the page opens works the same way, through
+`modules/dialog-guard.js`
+([#631](https://github.com/blindndangerous/AutoDJ/issues/631)): `show()` and
+`aria-modal="true"`, a backdrop, Tab and Shift+Tab kept in the dialog, Escape
+firing its cancel event, the button that changes nothing last, and focus going
+straight back to the control that opened it. A dialog opened from another, such
+as Browse… in an editor or the discard question over an editor, sits above it,
+and only the top one keeps the keys. Check each with NVDA in browse mode, in
+Chrome and Firefox:
+
+- **Browse…**: in **Library tools**, **Music folders and Voice liner folders**,
+  press Browse… after **Folder path**. Select this folder comes before Cancel.
+  Enter straight after NVDA reads the dialog must not choose a folder or change
+  the field. Escape and Cancel return to Browse…. Also try Browse… on a
+  clockwheel's track step and on a folder condition, where it opens over an
+  editor.
+- **Track info, unsaved changes**: in **Track info**, change a cue point, then
+  press Track info on another song in **Queue & Search**. The buttons are
+  Save, Discard and Keep editing, in that order. Escape keeps
+  editing and returns to the control that asked.
+- **Rename a paired device**: in **Settings**, **Profiles and access**,
+  **Browser access**, press Rename on a device. Save comes before Cancel.
+  Escape and Cancel return to Rename; a save returns to it too.
+- **Editors**: Add event in **Settings**, **Schedule**; Add spot and Add ad
+  break in **Ads**; Add category, a clockwheel's New step, and Add intro rule in
+  **Library tools**. Escape on an unchanged editor returns to the button that
+  opened it; on a changed one it asks before discarding.
+- **Keyboard shortcuts**: press `?` or the **Keyboard shortcuts** button. Tab
+  stays on Close; Escape, Close or `?` return to where focus was.
+- **Pairing**: open the page in a browser that is not paired. Tab goes round
+  the two fields and Pair browser; Escape does not close it.
+
+For each, closing must read the control focus returns to, never "Skip to main
+content" or another line from the top of the page. NVDA reads that control
+twice, as for a confirmation. Record the results under `ADR-0011-09` in
+[ADR 0011](adr/0011-verify-accessibility-with-browser-and-speech-evidence.md).
 
 ## Disposable SSO browser audit
 
@@ -282,16 +363,23 @@ The visual audit (`npm run audit:visual`, part of `audit:ci`) loads every view a
 
 Checkboxes and radio buttons are a deliberate exception to the authored control-boundary rule. In the default color mode they keep the browser and operating system's native appearance; AutoDJ does not replace that appearance or draw a custom border. The forced-colors rules may apply system colors such as `CanvasText` and `Highlight`, but they do not disable the native appearance. Test both checked and unchecked states during release sampling when a sampled flow contains these controls.
 
-Settings > Stations is audited again with a refused New station request from a stood-in server.
+Settings > Station > Stations is audited again with a refused New station request from a stood-in server.
 The error must appear beside Station ID, link to that field, and move focus there. Each browser
 must keep a refused create silent apart from the focused field. A stood-in successful create
 must announce once in the panel's status region and move focus to Switch. The audit never
 creates a station; the stand-in answers every create request.
 
-Settings > Updates is shown with a stood-in update: its release notes link, the update commands
-(a long unbroken wheel address included, for reflow) and Restart AutoDJ. Enter on Restart must open
-the confirmation with focus on Cancel and a message that says the stream goes off the air, and
-Escape must close it with focus back on Restart. The audit never restarts the server.
+Settings > Updates is shown with a stood-in update: its release notes link, Update AutoDJ, Go
+back, a failed last update with its recovery commands (a long unbroken path included, for reflow)
+and Restart AutoDJ. Enter on Update, Go back and Restart must each open the confirmation with focus
+moving straight to Cancel, not through the confirm button, and a message that says the stream goes off the air or, for Go back, what is lost since
+the backup's date. Each open confirmation must be marked `aria-modal` without being modal, with its
+form out of the accessibility tree and Cancel as its last button; its backdrop must cover the page
+and ignore a click, Tab and Shift+Tab must stay on its two buttons, and a click sent straight to
+the Now Playing tab must leave it unselected and focus on Cancel. Escape must close it, and
+for Restart Cancel and a refused Restart must too, each moving focus straight from the dialog's
+button back to the button that opened it, never through the page body. The audit never restarts
+or updates the server.
 
 ## Announcement contract
 
@@ -395,7 +483,7 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   their captions and column headers (table navigation reads each cell with its column and row),
   the session lengths as a list, Refresh statistics, Show and Days to keep each said once, and
   nothing said while the tables are being read.
-- DMCA mode (on in Settings > Song picking): the "DMCA mode is on" line under the feed links read as
+- DMCA mode (on in Settings > Station > Broadcasting): the "DMCA mode is on" line under the feed links read as
   plain text; Show the next song publicly read as unavailable with its reason, pressing it saying
   the reason once and leaving it unticked; and queueing a song over a limit from Search or
   Library opening the confirm dialog with the limit in words and focus on Cancel, Queue anyway
@@ -425,7 +513,7 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   or Pause and the queue buttons read by their names alone, without the station; `c` and
   Shift+C; Listen here still playing the station it started on, with its "Playing ..." line;
   and a stopped station's "Off air" said once, with Start reachable on Now Playing.
-- Settings, Stations (#233): browse the station list and read New station fields with their short
+- Settings, Station, Stations (#233): browse the station list and read New station fields with their short
   labels. Station ID includes its format hint. Choosing a copy reveals Also copy as a group of
   three checkboxes; choosing AutoDJ defaults hides that group and its help. A refused ID or name
   is read once with focus on its field. Create station says "Created <name>, off air." once and
@@ -454,8 +542,8 @@ Before every release, each flow below must be sampled with either NVDA and Firef
 - Library tools, folder table: arrow onto each checkbox and hear its name and checked state;
   toggle it once, keep focus while saving and after the next poll, and confirm only one save.
   After a failed save, check that the saved value is restored and focus stays on the checkbox.
-  Search and History action cells are read as buttons named by the row's song, with the column
-  heading said once, by NVDA; returning from Track info leaves arrow navigation working.
+  Search and History action cells focus their buttons and announce the button role without
+  repeating the track name; returning from Track info leaves arrow navigation working.
 - Queue & Search, browsing: Tab to Type, Folder, Search text and Search; one result grid with
   arrows, Home and End, and Enter or Space activating each action; the track count said once per
   search and page, with focus staying on Previous or Next (or moving to the other when a page ends);
@@ -510,9 +598,40 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   word-expanded alternatives, Fixed or Predicted said in the
   Status column; Refresh preview saying the summary once with focus staying on it; nothing said
   by the 30-second refresh or a song change, with the reading position kept; and Shift+H saying
-  the summary from another tab; a new span under Show said once with its summary; and a failed
-  automatic refresh said once, not on every retry.
+  the summary from another tab; a new span under Show said once with its summary; a failed
+  automatic refresh said once, not on every retry; and, on a server slow enough that the preview
+  fills in (or with `BUDGET_SECONDS` lowered in a development checkout), Refresh preview ending with "Still
+  working out the rest of the preview", the new rows joining without speech or a moved reading
+  position, and "Hour preview finished" said once.
 
 For that release, record the date, exact screen reader and browser versions, flows sampled, results, and defects found. Keep this record with the release evidence so readers can find any limits or unresolved defects.
 
 Do not claim support or verified behavior for NVDA, JAWS, VoiceOver, screen readers generally, or assistive technology generally unless the exact screen-reader/browser pairing and flow named in the claim were tested and recorded. Results from one pairing or flow do not transfer to another.
+
+
+## Confirmed future voice targets (#524)
+
+Run `node tests/playwright/voice_target_audit.mjs` for the focused Chromium audit.
+It serves production markup, styles and the voice tracker with deterministic API
+fixtures. It checks Tab to Song change, arrow selection, Tab/Enter confirmation,
+refresh focus, reachable Record, 24-pixel target sizing, and axe WCAG 2.2 AA tags
+in both themes. The JSON report is `.codex-tmp/voice-target-browser.json`.
+This establishes browser interaction evidence, not live audio or NVDA speech.
+
+For the Windows NVDA review in Chrome and Firefox, record versions and the exact
+candidate revision. Check these flows with the real station:
+
+1. Select a repeated song occurrence; hear both titles and its ordinal. Confirm
+   songs without starting recording. Read Selection separately from Estimated airtime.
+2. Record with Alt+R, inspect another target, and refresh. Confirm the take remains
+   bound to its starting occurrence. Disappear a target while its transition selector
+   has focus; focus must move directly to Song change, never the page body.
+3. Resolve each shared conflict choice. Cancel is last; each action has one status
+   announcement. Passive estimates stay quiet and focused native controls stay put.
+4. Reject an upload through a concurrent edit. Retain and listen to the take, then
+   explicitly retry or select another occurrence and listen before booking.
+5. Cancel before and during promotion. Check sibling speech and music continuity.
+   Pause, expire, stop/restart, and take over/return; dropped speech must not replay.
+
+Capture NVDA speech, keyboard focus and actual heard joins separately. Do not
+infer an aired take from an estimate or a previous run's lost temporary booking.

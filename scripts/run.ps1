@@ -22,6 +22,8 @@ function Get-ManualInstallMessage([string]$tool) {
 }
 
 try {
+    # Only the launcher marks the starts an update watches.
+    Remove-Item -LiteralPath 'Env:AUTODJ_UPDATE_WATCH' -ErrorAction SilentlyContinue
     Update-ProcessPath
     $projectRoot = Split-Path -Parent $PSScriptRoot
     $statePath = Join-Path $projectRoot '.uv\setup.json'
@@ -81,7 +83,12 @@ try {
         }
     }
     if (-not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
-        & uv run --no-project --python 3.14 (Join-Path $PSScriptRoot 'run.py') @args
+        $versionPath = Join-Path $projectRoot '.python-version'
+        $pythonVersion = "$(Get-Content -LiteralPath $versionPath -TotalCount 1)".Trim()
+        if (-not $pythonVersion) {
+            throw "$versionPath is empty; it must name a Python version such as 3.14."
+        }
+        & uv run --no-project --python $pythonVersion (Join-Path $PSScriptRoot 'run.py') @args
     } else {
         & $runtimePython (Join-Path $PSScriptRoot 'run.py') @args
     }

@@ -13,9 +13,8 @@ uses the voice liner duck depth, ``over`` leaves the music alone and
 ``replace`` fades it out.  The song keeps playing silently under a
 replacing cart and fades back in when the cart ends.
 
-A slot may have play dates (:mod:`autodj.clip_dates`): before its "not
-before" day or after its "do not play after" day, in the station time zone,
-the cart is skipped with the reason in words, whether pressed or scheduled.
+A slot may have play dates (:mod:`autodj.clip_dates`) that restrict scheduled
+play in the station time zone; a manual press overrides them.
 """
 
 from __future__ import annotations
@@ -43,6 +42,7 @@ from autodj.liner_files import (
     LinerConflictError,
     LinerTooLargeError,
     open_liner_file,
+    resolve_liner_path,
     store_liner_upload,
     validate_liner_name,
 )
@@ -90,7 +90,7 @@ class CartSlot(BaseModel):
     mode: Literal["duck", "over", "replace"] = "duck"
     # Seconds; measured by the server when the slot is saved.
     duration: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    # Play dates, both included; outside them the cart is skipped.
+    # Play dates, both included; they restrict scheduled plays.
     not_before: Date | None = None
     not_after: Date | None = None
 
@@ -322,20 +322,7 @@ class StationCarts:
 
     def liner_file(self, clip: str) -> Path:
         """The file behind liner *clip*, found the way ``/api/liners/file`` finds it."""
-        library = self.bridge.library
-        record = library.record_for_id(clip) if library is not None else None
-        if (
-            record is not None
-            and record.get("kind") == "liner"
-            and library.entry_for_path(record["path"]) is not None
-        ):
-            path = Path(record["path"])
-            if path.is_symlink() or not path.is_file():
-                raise FileNotFoundError(clip)
-            return path
-        folder = self.liner_folder()
-        open_liner_file(folder, clip).file.close()
-        return folder / clip
+        return resolve_liner_path(self.bridge.library, self.liner_folder(), clip)[0]
 
     def decode(self, assigned: CartSlot) -> np.ndarray:
         """Decode the audio the cart plays (blocking)."""
@@ -388,7 +375,7 @@ class StationCarts:
         )
         return True
 
-    async def play(self, page: int, slot: int) -> dict[str, Any]:
+    async def play(self, page: int, slot: int, *, scheduled: bool = False) -> dict[str, Any]:
         """Play the cart in *slot* on *page*.
 
         Raises:
@@ -396,10 +383,11 @@ class StationCarts:
                 decode, or the server mix cannot air it now.
         """
         assigned = self.store.slot(page, slot)
-        dates = assigned.dates()
-        refusal = None if dates.empty else dates.refusal(station_today(self.bridge.player._cfg))
-        if refusal is not None:
-            raise CartError(409, f"Cart {slot}, {assigned.name} was skipped: it is {refusal}")
+        if scheduled:
+            dates = assigned.dates()
+            refusal = None if dates.empty else dates.refusal(station_today(self.bridge.player._cfg))
+            if refusal is not None:
+                raise CartError(409, f"Cart {slot}, {assigned.name} was skipped: it is {refusal}")
         scheduler = self.bridge.liner_scheduler
         if scheduler is not None and (reason := self.not_on_air()) is not None:
             raise CartError(409, reason)
@@ -409,7 +397,9 @@ class StationCarts:
             logger.warning("Cart %s on page %s could not be decoded", slot, page, exc_info=True)
             raise CartError(404, f"The clip for cart {slot} is missing or unreadable") from exc
         if scheduler is not None:
-            await asyncio.to_thread(scheduler.play_cart, audio, self.duck_db(assigned.mode))
+            await asyncio.to_thread(
+                scheduler.play_cart, audio, self.duck_db(assigned.mode), title=assigned.name
+            )
         await self.finish("end")
         label = f"Cart {slot}, {assigned.name}"
         seconds = len(audio) / SAMPLE_RATE
@@ -481,7 +471,7 @@ class StationCarts:
     async def _scheduled(self, params: dict[str, str]) -> None:
         if self.bridge.liner_scheduler is None:
             raise ValueError("Scheduled carts need server audio or stream mode")
-        await self.play(int(params["page"]), int(params["slot"]))
+        await self.play(int(params["page"]), int(params["slot"]), scheduled=True)
 
 
 def _http(exc: CartError) -> HTTPException:
@@ -553,8 +543,23 @@ def install_carts(router: StationRouter) -> None:
             for other in carts.store.wall.pages
         ):
             raise HTTPException(status_code=409, detail=f"Another page is named {body.name}")
-        target.name = body.name
-        await carts.changed()
+        from autodj.profile_settings import profile_settings
+
+        def rename() -> None:
+            previous = target.name
+            with profile_settings(station).changing_reference("cart", previous, body.name):
+                try:
+                    target.name = body.name
+                    carts.store.save()
+                except Exception:
+                    target.name = previous
+                    raise
+
+        try:
+            await asyncio.to_thread(rename)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await carts.publish({"type": "cart_changed"})
         return {"name": body.name}
 
     @router.put("/carts/active-page/{page}")

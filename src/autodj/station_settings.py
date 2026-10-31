@@ -7,9 +7,52 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from autodj.settings_bodies import PlaybackSettingsBody
+from autodj.settings_bodies import PAGE_SAVED_BREAKS, PAGE_SAVED_REQUESTS, PlaybackSettingsBody
 
 logger = logging.getLogger(__name__)
+
+
+def _request_settings(requests: Any) -> dict[str, Any]:
+    """The listener request settings the operator's card saves (#49), when the station has them."""
+    if requests is None:
+        return {}
+    return {
+        "requests_bridges_enabled": bool(requests.bridges_enabled),
+        "requests_max_bridges": int(requests.max_bridges),
+        "requests_bridge_cost_threshold": float(requests.bridge_cost_threshold),
+        "requests_no_smooth_spot": requests.no_smooth_spot,
+    }
+
+
+def _request_switches(requests: Any, page_saved: set[str]) -> dict[str, Any]:
+    """Whether the station takes requests and how they are approved, once the card saved them.
+
+    Until the Listener requests card has saved them for this station,
+    ``[requests]`` in config.toml stays in charge: no other save (volume,
+    EQ ...) writes them to ``web_state.json``.
+    """
+    if requests is None or PAGE_SAVED_REQUESTS not in page_saved:
+        return {}
+    return {
+        "requests_enabled": bool(requests.enabled),
+        "requests_approval": requests.approval,
+    }
+
+
+def _break_settings(breaks: Any, page_saved: set[str]) -> dict[str, Any]:
+    """The announcer break settings, once Settings, Breaks saved them for the station (#88).
+
+    Until then ``[breaks]`` in config.toml stays in charge, as for
+    :func:`_request_switches`.
+    """
+    if breaks is None or PAGE_SAVED_BREAKS not in page_saved:
+        return {}
+    return {
+        "breaks_enabled": bool(breaks.enabled),
+        "breaks_dj_placement": breaks.dj_placement,
+        "breaks_min_intro_seconds": float(breaks.min_intro_seconds),
+        "breaks_duck_db": None if breaks.duck_db is None else float(breaks.duck_db),
+    }
 
 
 class StationSettings:
@@ -78,15 +121,12 @@ class StationSettings:
     def get_settings(self) -> dict[str, Any]:
         """Return the same settings document shape served by PlayerBridge."""
         cfg, pb = self.cfg, self.cfg.playback
-        from autodj._bridge import _break_settings, _request_settings, _request_switches
         from autodj.presets import BUILTIN_PRESETS
 
         names = sorted(set(BUILTIN_PRESETS) | set(cfg.presets))
         library_dir = cfg.index.library_dir
-        related_problem = getattr(
-            self.player, "related_artists_problem", self.related_artists_problem
-        )
-        tracks_problem = getattr(self.player, "related_tracks_problem", self.related_tracks_problem)
+        related_problem = self.related_artists_problem
+        tracks_problem = self.related_tracks_problem
         return {
             "preset": self._preset.name if self._preset else None,
             "available_presets": names,
@@ -221,8 +261,8 @@ class StationSettings:
             "eq": settings["eq"],
         }
 
-    def apply_settings_patch(self, changes: Any) -> None:
-        """Apply validated groups and persist them through the station settings store."""
+    def validate_settings_patch(self, changes: Any) -> Any:
+        """Validate all core settings and file-backed choices before mutation."""
         from autodj.presets import get_preset
         from autodj.settings_bodies import StationSettingsChangesBody
         from autodj.transitions import TRANSITION_EFFECT_NAMES
@@ -232,14 +272,26 @@ class StationSettings:
             getattr(patch, name) is not None for name in StationSettingsChangesBody.model_fields
         ):
             raise ValueError("At least one settings group is required")
-        with self._lock:
-            if patch.preset is not None and patch.preset.name:
-                get_preset(patch.preset.name, self.cfg.presets)
-            if patch.transition is not None and patch.transition.effect.lower() not in (
-                TRANSITION_EFFECT_NAMES
-            ):
-                raise ValueError(f"unknown transition effect: {patch.transition.effect}")
+        if patch.preset is not None and patch.preset.name:
+            get_preset(patch.preset.name, self.cfg.presets)
+        if (
+            patch.transition is not None
+            and patch.transition.effect.lower() not in TRANSITION_EFFECT_NAMES
+        ):
+            raise ValueError(f"unknown transition effect: {patch.transition.effect}")
+        if patch.playback is not None:
+            if patch.playback.stereotool_preset:
+                from autodj.stereotool_presets import preset_path
 
+                preset_path(self.cfg.index.shared_dir, patch.playback.stereotool_preset)
+            self._read_related_artists(patch.playback, restoring=False)
+            self._read_related_tracks(patch.playback, restoring=False)
+        return patch
+
+    def apply_settings_patch(self, changes: Any) -> None:
+        """Apply validated groups and persist them through the station settings store."""
+        with self._lock:
+            patch = self.validate_settings_patch(changes)
             # Playback is the only setter here that can reject file-backed choices;
             # run it before the simple in-memory groups so validation cannot leave a
             # subset applied.
@@ -412,53 +464,39 @@ class StationSettings:
     def _read_related_artists(self, body: PlaybackSettingsBody, *, restoring: bool) -> Any:
         if body.repeat_rules is None:
             return None
-        from autodj.related_artist_file import (
-            invalid_related_artists_message,
-            load_configured_related_artists,
-            unused_related_artists_message,
-        )
-        from autodj.repeat_rules import RelatedArtists
+        from autodj.related_artist_file import load_related_file
 
-        related = RelatedArtists()
-        problem = None
-        if body.repeat_rules.use_related_artists:
-            try:
-                related = load_configured_related_artists(self.cfg.index.library_dir)
-            except (OSError, ValueError) as exc:
-                if not restoring:
-                    message = invalid_related_artists_message(exc)
-                    self.related_artists_problem = message
-                    if self.player is not None:
-                        self.player.related_artists_problem = message
-                    raise ValueError(message) from exc
-                problem = unused_related_artists_message(exc)
-                logger.warning("Related artists file was not used: %s", exc)
+        try:
+            related, problem = load_related_file(
+                self.cfg.index.library_dir,
+                "artists",
+                enabled=body.repeat_rules.use_related_artists,
+                restoring=restoring,
+            )
+        except ValueError as exc:
+            self.related_artists_problem = str(exc)
+            raise
+        if problem:
+            logger.warning("Related artists file was not used: %s", problem)
         return related, problem
 
     def _read_related_tracks(self, body: PlaybackSettingsBody, *, restoring: bool) -> Any:
         if body.repeat_rules is None:
             return None
-        from autodj.related_artist_file import (
-            invalid_related_artists_message,
-            load_configured_related_tracks,
-            unused_related_artists_message,
-        )
-        from autodj.repeat_rules import RelatedTracks
+        from autodj.related_artist_file import load_related_file
 
-        related = RelatedTracks()
-        problem = None
-        if body.repeat_rules.use_related_tracks:
-            try:
-                related = load_configured_related_tracks(self.cfg.index.library_dir)
-            except (OSError, ValueError) as exc:
-                if not restoring:
-                    message = invalid_related_artists_message(exc, "tracks")
-                    self.related_tracks_problem = message
-                    if self.player is not None:
-                        self.player.related_tracks_problem = message
-                    raise ValueError(message) from exc
-                problem = unused_related_artists_message(exc, "tracks")
-                logger.warning("Related tracks file was not used: %s", exc)
+        try:
+            related, problem = load_related_file(
+                self.cfg.index.library_dir,
+                "tracks",
+                enabled=body.repeat_rules.use_related_tracks,
+                restoring=restoring,
+            )
+        except ValueError as exc:
+            self.related_tracks_problem = str(exc)
+            raise
+        if problem:
+            logger.warning("Related tracks file was not used: %s", problem)
         return related, problem
 
     def set_bpm_range(self, lo: float | None, hi: float | None) -> None:

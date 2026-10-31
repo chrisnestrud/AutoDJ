@@ -108,18 +108,19 @@ def _optional(convert: Callable[[Any], Any], value: Any) -> Any:
 
 @dataclass
 class LibraryConfig(_Section):
-    """Settings for the music library location and format filtering.
+    """Shared library format filtering and optional path compatibility settings.
 
     Attributes:
-        music_dir: Optional base for legacy relative paths only. New libraries
+        music_dir: Optional base for legacy relative paths and DJ cue exports. New libraries
             start empty; registered folders determine the music available.
             For beets users, this should match the local mount point of the
             beets ``directory`` setting — relative paths stored in the beets
-            database are resolved against ``music_dir``.
+            database are resolved against ``music_dir``. Also used for relative
+            playlist paths, DJ cache keys, request exclusions and explicit index migration.
         beets_db: Optional path to the beets SQLite library database.
         supported_formats: List of audio file extensions to index (without dots).
         playlists_folder: Folder holding the M3U and M3U8 files that rotation
-            categories read; ``None`` means ``<index_dir>/<name>/playlists``.
+            categories read; ``None`` means ``<index_dir>/shared/playlists``.
     """
 
     SECTION: ClassVar[str] = "library"
@@ -1096,10 +1097,65 @@ def resolve_trusted_proxy_secret(cfg: ServerConfig) -> str | None:
 
 STATION_OUTPUTS = ("browser", "server", "stream")
 
+# A station's log label is printed inside the brackets that start its log
+# lines, so it allows nothing that could end the prefix or start a new line.
+_LOG_LABEL = re.compile(r"[A-Za-z0-9._-]{1,16}")
+LOG_LABEL_RULE = (
+    "1 to 16 letters, digits, hyphens (-), underscores (_) or dots (.), with no spaces or brackets"
+)
+
+
+def check_log_label(value: object) -> str:
+    """Return *value* as a station log label; ``None`` or empty means none.
+
+    Raises:
+        TypeError: *value* is not text.
+        ValueError: *value* breaks :data:`LOG_LABEL_RULE`.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise TypeError("station.log_label must be text")
+    if value and not _LOG_LABEL.fullmatch(value):
+        raise ValueError(f"station.log_label must be {LOG_LABEL_RULE}")
+    return value
+
+
+def log_label_conflict(slug: str, label: str, labels: Mapping[str, str]) -> str | None:
+    """Why *slug* may not log as *label*, or ``None`` when its lines stay distinct.
+
+    Args:
+        slug: The station taking the label.
+        label: Its proposed label; empty means it logs as its slug.
+        labels: Every configured station's slug and current label.
+
+    Returns:
+        A sentence naming the other station when *label* repeats another
+        station's label or is another station's ID, compared regardless of
+        case. A station may use its own ID.
+    """
+    if not label:
+        return None
+    wanted = label.casefold()
+    for other, other_label in labels.items():
+        if other == slug:
+            continue
+        if other.casefold() == wanted:
+            return (
+                f"Log label {label} is the ID of station {other}. Choose another label "
+                "so log lines show which station they came from."
+            )
+        if other_label and other_label.casefold() == wanted:
+            return (
+                f"Log label {label} is already used by station {other}. Each station "
+                "needs its own label so log lines show which station they came from."
+            )
+    return None
+
 
 @dataclass
 class StationConfig(_Section):
-    """Station-local output mode, time zone and liner upload cap."""
+    """Station-local output mode, time zone, liner upload cap and log label."""
 
     SECTION: ClassVar[str] = "station"
 
@@ -1107,9 +1163,12 @@ class StationConfig(_Section):
     liner_upload_max_mib: int = 50
     output: str = "browser"
     server_audio_too: bool = False
+    #: Shown in brackets at the start of the station's log lines; empty uses its slug.
+    log_label: str = ""
 
     def __post_init__(self) -> None:
-        """Validate the station's time zone, upload cap and output mode."""
+        """Validate the station's time zone, upload cap, output mode and log label."""
+        self.log_label = check_log_label(self.log_label)
         if self.timezone is not None:
             try:
                 ZoneInfo(self.timezone)
@@ -3012,13 +3071,26 @@ def station_config(station: AutoDJConfig, root: AutoDJConfig) -> AutoDJConfig:
     )
 
 
-def _check_station_conflicts(root: AutoDJConfig, specs: Iterable[StationSpec]) -> None:
-    """Refuse two stations that share a recording folder or a relay target.
+def _check_station_conflicts(
+    root: AutoDJConfig,
+    specs: Iterable[StationSpec],
+    *,
+    log_labels: Mapping[str, str] | None = None,
+) -> None:
+    """Refuse two stations that share a recording folder, relay target or log label.
 
     A recorder deletes old recordings from its folder, so a shared folder
     would let one station's retention delete the other's.  Two sources on
-    one relay mount fight over it.  Two stations with the same name are
-    only warned about.
+    one relay mount fight over it.  A log label that repeats another
+    station's label or ID would make their log lines look alike.  Two
+    stations with the same name are only warned about.
+
+    Args:
+        root: The default station's configuration and the shared sections.
+        specs: The other stations.
+        log_labels: Saved log labels by slug, when the configurations can be
+            older: a running server saves the default's label to its own
+            configuration, not to *root*.
 
     Raises:
         ValueError: Naming both stations.
@@ -3026,7 +3098,24 @@ def _check_station_conflicts(root: AutoDJConfig, specs: Iterable[StationSpec]) -
     folders: dict[str, str] = {}
     targets: dict[tuple[object, ...], str] = {}
     names: dict[str, str] = {}
-    for slug, cfg in (("default", root), *((spec.slug, spec.cfg) for spec in specs)):
+    stations = (("default", root), *((spec.slug, spec.cfg) for spec in specs))
+    earlier: dict[str, str] = {}
+    for slug, cfg in stations:
+        label = cfg.station.log_label
+        if log_labels is not None:
+            label = log_labels.get(slug, label)
+        problems = (
+            (slug, log_label_conflict(slug, label, earlier)),
+            *(
+                (other, log_label_conflict(other, used, {slug: label}))
+                for other, used in earlier.items()
+            ),
+        )
+        for owner, problem in problems:
+            if problem is not None:
+                raise ValueError(f"station {owner}: {problem}")
+        earlier[slug] = label
+    for slug, cfg in stations:
         name = cfg.stream.station_name.strip().casefold()
         if name in names:
             logger.warning(
@@ -3162,10 +3251,14 @@ def load_config(
             f"{presets_path} is no longer read: move each [NAME] table into config.toml "
             "as [presets.NAME], then delete presets.toml"
         )
-    return _build_config(
+    cfg = _build_config(
         raw,
         config_path=loaded_path,
         sources=sources,
         legacy_station_environment=legacy_station_environment,
         environment=environment,
     )
+    from autodj.certificates import apply_saved_certificate
+
+    apply_saved_certificate(cfg)
+    return cfg

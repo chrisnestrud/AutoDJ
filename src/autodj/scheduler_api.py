@@ -116,7 +116,10 @@ def _builtin_actions(
             audio = await asyncio.to_thread(worker.decode, params["name"])
         except LinerDecodeError as exc:
             raise ValueError(f"Liner {params['name']} could not be played") from exc
-        return lambda: worker.play_audio(audio)
+        found = await asyncio.to_thread(worker.liner_path, params["name"])
+        path = str(found) if found is not None else None
+        title = found.stem if found is not None else params["name"]
+        return lambda: worker.play_audio(audio, kind="liner", title=title, path=path)
 
     async def stream(params: dict[str, str]) -> None:
         station = bridge.station
@@ -248,6 +251,7 @@ def build_scheduler(
     )
     if bridge.player is not None:
         bridge.player._hour_fit_events = scheduler.hard_events
+        bridge.player._voice_schedule_events = scheduler.voice_events
         bridge.player._hour_fit_timezone = timezone
     for action in _builtin_actions(
         bridge, apply_profile, profile_names, liner_names, clock_names, select_clock

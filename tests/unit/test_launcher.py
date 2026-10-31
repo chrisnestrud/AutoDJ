@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -532,3 +534,96 @@ def test_a_stop_that_comes_while_the_server_starts_still_stops_it(
         launcher._run_child(["serve"], {})
     assert stop.value.signum == signal.SIGTERM
     started.send_signal.assert_called_with(signal.SIGTERM)
+
+
+def _serving_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The checkout launcher about to supervise ``serve``; returns its update folder."""
+    root = _project(tmp_path, monkeypatch)
+    environment = root / "runtime"
+    _save(root, environment)
+    monkeypatch.setattr(launcher.sys, "prefix", str(environment.resolve()))
+    monkeypatch.setattr(launcher.sys, "argv", ["autodj", "serve"])
+    monkeypatch.setenv("AUTODJ_BOOTSTRAP", "1")
+    monkeypatch.delenv(launcher.SUPERVISOR_ENV, raising=False)
+    return root / ".uv" / "update"
+
+
+def test_a_launcher_ended_by_a_signal_lets_go_of_its_serving_lock_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0016-18: dying of the signal skips the finally, so it lets go before."""
+    from autodj import update_contract as contract
+
+    folder = _serving_launch(tmp_path, monkeypatch)
+    mine = contract.serving_path(folder, os.getpid())
+    seen: list[bool] = []
+
+    def run_supervised(command, environment, **options) -> int:
+        assert mine.exists()
+        return options["end_with_signal"](15)
+
+    def end_with_signal(signum: int) -> int:
+        seen.append(mine.exists())
+        return 128 + signum
+
+    monkeypatch.setattr(launcher, "run_supervised", run_supervised)
+    monkeypatch.setattr(launcher, "_end_with_signal", end_with_signal)
+    assert launcher.main() == 143
+    assert seen == [False]
+
+
+def test_a_launcher_refuses_to_serve_while_an_update_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR-0016-18: the checkout is half switched until that update finishes."""
+    from autodj import update_contract as contract
+    from autodj.checkout_update import LOCK
+
+    folder = _serving_launch(tmp_path, monkeypatch)
+    held = contract.try_lock(folder / LOCK)  # another launcher's update
+    supervised = Mock()
+    monkeypatch.setattr(launcher, "run_supervised", supervised)
+    try:
+        assert launcher.main() == 1
+    finally:
+        contract.unlock(held)
+    supervised.assert_not_called()
+    assert launcher.UPDATE_RUNNING in capsys.readouterr().err
+    assert not contract.serving_path(folder, os.getpid()).exists()
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+def test_the_posix_launcher_never_passes_on_an_inherited_update_watch(tmp_path: Path) -> None:
+    """Only the launcher marks a start an update watches, so ./autodj clears the mark."""
+    root = Path(__file__).parents[2]
+    project = tmp_path / "project"
+    project.mkdir()
+    shutil.copy2(root / "autodj", project / "autodj")
+    shutil.copy2(root / ".python-version", project / ".python-version")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    record = tmp_path / "watch.txt"
+    (tools / "uv").write_text(
+        '#!/bin/sh\nprintf "%s" "${AUTODJ_UPDATE_WATCH-unset}" > "$AUTODJ_TEST_RECORD"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    (tools / "uv").chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": os.pathsep.join([str(tools), os.environ.get("PATH", "")]),
+        "AUTODJ_UPDATE_WATCH": "1",
+        "AUTODJ_TEST_RECORD": str(record),
+    }
+
+    done = subprocess.run(
+        [str(shutil.which("sh")), str(project / "autodj"), "serve"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert record.read_text(encoding="utf-8") == "unset"

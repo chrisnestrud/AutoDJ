@@ -23,6 +23,7 @@ def _project(tmp_path: Path, *, interactive: bool = False) -> tuple[Path, Path]:
     root = tmp_path / "project"
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / ".python-version", root / ".python-version")
     script = (ROOT / "scripts" / "run.ps1").read_text(encoding="utf-8")
     if interactive:
         script = script.replace(
@@ -192,7 +193,8 @@ def test_install_refreshes_path_and_forwards_setup_args(tmp_path: Path, unattend
     assert len(calls) == 1
     assert "--id astral-sh.uv --exact --source winget --scope user" in calls[0]
     assert (user_bin / "uv.cmd").is_file()
-    assert "run --no-project --python 3.14" in (tmp_path / "uv.log").read_text()
+    python = (ROOT / ".python-version").read_text(encoding="utf-8").strip()
+    assert f"run --no-project --python {python}" in (tmp_path / "uv.log").read_text()
     assert "setup --backend cpu" in (tmp_path / "uv.log").read_text()
     if unattended:
         assert "--yes" in (tmp_path / "uv.log").read_text()
@@ -282,3 +284,23 @@ def test_existing_runtime_without_state_checks_tools_for_interactive_setup(
     assert result.returncode == 0, result.stderr
     assert json.loads((tmp_path / "run.json").read_text()) == ["serve"]
     assert "uv" not in result.stderr
+
+
+def test_the_launcher_never_passes_on_an_inherited_update_watch(tmp_path: Path) -> None:
+    """Only the launcher marks a start an update watches, so run.ps1 clears the mark."""
+    root, script = _project(tmp_path)
+    _saved_cpu(root)
+    (root / "scripts" / "run.py").write_text(
+        "import json, os\n"
+        "open(os.environ['AUTODJ_TEST_LOG'], 'w').write("
+        "json.dumps(os.environ.get('AUTODJ_UPDATE_WATCH')))\n",
+        encoding="utf-8",
+    )
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    environment = {**_env(tmp_path, empty), "AUTODJ_UPDATE_WATCH": "1"}
+
+    result = _run(script, "serve", env=environment)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads((tmp_path / "run.json").read_text()) is None

@@ -1,32 +1,78 @@
-# Manifest-list digests reviewed 2026-08-02 via registry Docker-Content-Digest headers.
-FROM python:3.14.6-slim-bookworm@sha256:86f975aca15cf04a40b399eebede9aea7c82eae084d1f1a0a6ef6bcaae871a30 AS python-base
+# Manifest-list digests reviewed 2026-10-28 via registry Docker-Content-Digest headers.
+FROM python:3.14.10-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527 AS python-base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \
     UV_LINK_MODE=copy \
+    UV_NO_CACHE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.26@sha256:3d868e555f8f1dbc324afa005066cd11e1053fc4743b9808ca8025283e65efa5 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /usr/local/bin/uv
+# uv installs everything into /opt/venv, which does not see the base image's
+# site-packages, so the base image's pip and the pip wheel that ensurepip
+# bundles are never used. Their vendored msgpack, urllib3 and setuptools lag
+# behind security releases, so remove both.
+#
+# The image has no Tk libraries, so tkinter cannot even import; it goes with
+# IDLE and turtledemo, which need it. It has no C compiler either, so nothing
+# builds against Python's C headers in /usr/local/include. The copyright files
+# in /usr/share/doc stay.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libsndfile1 libpcre2-8-0 perl-base \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libsndfile1 libpcre2-8-0 perl-base libssl3 openssl \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip uninstall --yes --no-input --root-user-action ignore pip \
+    && rm -rf /usr/local/lib/python3.*/ensurepip \
+        /usr/local/lib/python3.*/idlelib /usr/local/lib/python3.*/tkinter \
+        /usr/local/lib/python3.*/turtledemo /usr/local/lib/python3.*/turtle.py \
+        /usr/local/lib/python3.*/lib-dynload/_tkinter.* /usr/local/bin/idle* \
+        /usr/local/include
 
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY container/torch-cpu.txt ./container/
-# uv.lock resolves Linux torch from PyPI, which is the CUDA build and pulls in several GB of
-# nvidia-*, cuda-* and triton wheels. The image has no GPU, so the locked sync skips the torch
+# TORCH_VARIANT chooses the PyTorch build: cpu (the default) or cuda. Either way every version
+# comes from uv.lock, and UV_NO_CACHE keeps uv's download cache out of the image.
+#
+# cpu: uv.lock resolves Linux torch from PyPI, which is the CUDA build and pulls in several GB of
+# nvidia-*, cuda-* and triton wheels. The CPU image has no GPU, so the locked sync skips the torch
 # family and those wheels, then the CPU builds of the same locked torch, torchaudio and
 # torchvision versions come from PyTorch's CPU index, hash-checked against container/torch-cpu.txt.
-# The build stops if that file's versions drift from uv.lock. Bare-metal installs are unaffected
-# and keep the locked PyPI builds.
+# The build stops if that file's versions drift from uv.lock.
+#
+# cuda: the locked sync installs everything uv.lock names: PyPI's CUDA build of torch and the
+# nvidia-*, cuda-* and triton wheels it needs, each checked against the lock's hashes. Those wheels
+# carry the CUDA runtime libraries, so no nvidia/cuda base image is needed; the host's driver comes
+# in through the NVIDIA Container Toolkit. uv.lock is its only pin, so when torch moves, updating
+# uv.lock and container/torch-cpu.txt together covers both images.
+#
+# Bare-metal installs are unaffected and keep the locked PyPI builds.
+#
+# Both images then drop what no runtime path loads:
+# - every tests and test folder in site-packages. Only test runners and other tests import them;
+#   the testing modules, such as numpy.testing and torch.testing, are real modules and stay. In the
+#   CPU build this includes torch/test, PyTorch's C++ unit-test programs.
+# - torch/include, the C++ headers that torch.compile and torch.utils.cpp_extension build against.
+#   AutoDJ never compiles C++, and the image has no compiler to do it.
+ARG TORCH_VARIANT=cpu
 RUN set -eu; \
-    python -c 'import re, tomllib; lock = {p["name"]: p["version"] for p in tomllib.load(open("uv.lock", "rb"))["package"]}; pins = dict(re.findall(r"^(torch|torchaudio|torchvision)==(\S+)\+cpu ", open("container/torch-cpu.txt").read(), re.M)); want = {n: lock[n] for n in ("torch", "torchaudio", "torchvision")}; assert pins == want, f"container/torch-cpu.txt {pins} != uv.lock {want}"'; \
-    skipped="$(python -c 'import re, tomllib; names = sorted(p["name"] for p in tomllib.load(open("uv.lock", "rb"))["package"]); print(" ".join(f"--no-install-package {n}" for n in names if re.fullmatch(r"(nvidia|cuda)-.+|triton|torch|torchaudio|torchvision", n)))')"; \
-    uv sync --frozen --no-dev --extra index --no-install-project $skipped; \
-    uv pip install --python /opt/venv/bin/python --no-deps --require-hashes \
-        --index-url https://download.pytorch.org/whl/cpu -r container/torch-cpu.txt
+    case "$TORCH_VARIANT" in \
+        cpu|cuda) ;; \
+        *) echo "TORCH_VARIANT must be cpu or cuda, not '$TORCH_VARIANT'" >&2; exit 1 ;; \
+    esac; \
+    if [ "$TORCH_VARIANT" = cuda ]; then \
+        uv sync --frozen --no-dev --extra index --no-install-project; \
+    else \
+        python -c 'import re, tomllib; lock = {p["name"]: p["version"] for p in tomllib.load(open("uv.lock", "rb"))["package"]}; pins = dict(re.findall(r"^(torch|torchaudio|torchvision)==(\S+)\+cpu ", open("container/torch-cpu.txt").read(), re.M)); want = {n: lock[n] for n in ("torch", "torchaudio", "torchvision")}; assert pins == want, f"container/torch-cpu.txt {pins} != uv.lock {want}"'; \
+        skipped="$(python -c 'import re, tomllib; names = sorted(p["name"] for p in tomllib.load(open("uv.lock", "rb"))["package"]); print(" ".join(f"--no-install-package {n}" for n in names if re.fullmatch(r"(nvidia|cuda)-.+|triton|torch|torchaudio|torchvision", n)))')"; \
+        uv sync --frozen --no-dev --extra index --no-install-project $skipped; \
+        uv pip install --python /opt/venv/bin/python --no-deps --require-hashes \
+            --index-url https://download.pytorch.org/whl/cpu -r container/torch-cpu.txt; \
+    fi; \
+    site_packages="$(/opt/venv/bin/python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"; \
+    find "$site_packages" -type d \( -name tests -o -name test \) -not -path '*.dist-info/*' -prune \
+        -exec rm -rf {} +; \
+    rm -rf "$site_packages/torch/include"
 
 FROM python-base AS package
 COPY src ./src
@@ -56,11 +102,15 @@ ENV HOME=/home/autodj \
 # server shows and links it only when it is 7 to 40 hex digits.  The update
 # channel of a published image, stable or development, is set by the workflow
 # that publishes it; a locally built image leaves it empty and follows the
-# checkout it is built from.  Declared last so a new commit rebuilds only
+# checkout it is built from.  The variant, cpu or cuda, keeps an update on
+# the same variant's tags.  Declared last so a new commit rebuilds only
 # these layers.
 ARG AUTODJ_COMMIT=""
 ARG AUTODJ_IMAGE_CHANNEL=""
-ENV AUTODJ_COMMIT=${AUTODJ_COMMIT}     AUTODJ_IMAGE_CHANNEL=${AUTODJ_IMAGE_CHANNEL}
+ARG TORCH_VARIANT=cpu
+ENV AUTODJ_COMMIT=${AUTODJ_COMMIT} \
+    AUTODJ_IMAGE_CHANNEL=${AUTODJ_IMAGE_CHANNEL} \
+    AUTODJ_IMAGE_VARIANT=${TORCH_VARIANT}
 
 USER 10001:10001
 EXPOSE 8080

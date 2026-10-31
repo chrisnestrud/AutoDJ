@@ -60,7 +60,7 @@ fail, in the run log, until you change them.
 
 ## Airing a show
 
-Add an event under **Settings**, **Schedule** with the action **Play a show** and the show (see
+Add an event under **Settings**, **Station**, **Schedule** with the action **Play a show** and the show (see
 [Scheduler](scheduler.md#scheduler)): once on a date, or repeating, with an optional date range. **Start
 after this song**, in the open list, airs it now, to test it.
 
@@ -122,3 +122,17 @@ the show's name, taking no time, as on the air.
 - [Test rotation and preview an hour](rotation-preview.md)
 
 For production-specific speech, follow [Prepared show editions](prepared-editions.md).
+
+
+## Shows and confirmed voice tracks
+
+Manual start, Play now, replacement and Stop show preflight their queue changes.
+When booked speech loses its pair, resolve Keep/Discard/Cancel before the Show
+state changes. Ordinary automatic feeding and soft schedule events defer conflicts
+with a visible reason. A hard scheduled Show releases displaced speech before
+queue cleanup, including when it waited for the current song to finish.
+
+Explicitly stopping a prepared edition does not create a new interrupted edition
+to resume. An actual replacement or interruption retains the existing explicit
+resume rules. Live queue decisions do not rewrite edition sources or approvals.
+See [the voice tracking workflow](spoken-breaks.md#choose-and-confirm-a-future-song-change).

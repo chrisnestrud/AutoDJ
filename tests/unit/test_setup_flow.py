@@ -5,16 +5,41 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import json
+import re
+import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+from zipfile import ZipFile
 
 import pytest
 
 REPOSITORY = Path(__file__).parents[2]
 SCRIPTS = REPOSITORY / "scripts"
+TORCH_FAMILY = ("torch", "torchvision", "torchaudio")
+
+
+def _locked_torch_versions() -> dict[str, str]:
+    """Return the torch, torchvision and torchaudio versions uv.lock records."""
+    lock = tomllib.loads((REPOSITORY / "uv.lock").read_text(encoding="utf-8"))
+    return {
+        package["name"]: package["version"]
+        for package in lock["package"]
+        if package["name"] in TORCH_FAMILY
+    }
+
+
+def _profile_versions(packages: list[str]) -> dict[str, str]:
+    """Map each ``name[extra]==version+local`` install spec to its public version."""
+    versions = {}
+    for spec in packages:
+        name, _, version = spec.partition("==")
+        versions[name.split("[")[0]] = version.split("+")[0]
+    return versions
 
 
 def _load_script(name: str, path: Path):
@@ -55,8 +80,11 @@ def _project(tmp_path: Path) -> tuple[Path, Path]:
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
     (scripts / "setup-profiles.json").write_bytes((SCRIPTS / "setup-profiles.json").read_bytes())
-    (root / "pyproject.toml").write_text("[project]\nname = 'autodj-test'\n", encoding="utf-8")
+    (root / "pyproject.toml").write_text(
+        "[project]\nname = 'autodj'\nversion = '1.2.3'\n", encoding="utf-8"
+    )
     (root / "uv.lock").write_text("test lock\n", encoding="utf-8")
+    (root / ".python-version").write_text("3.14\n", encoding="utf-8")
     music = root / "Music # Café"
     music.mkdir()
     return root, music
@@ -110,6 +138,7 @@ def _patch_execution(
     monkeypatch.setattr(setup, "ensure_ffmpeg", Mock(return_value=True))
     monkeypatch.delenv("AUTODJ_GPU", raising=False)
     install_python = Mock()
+    monkeypatch.setattr(setup, "ensure_idle", Mock())
     prepare_caches = Mock()
     create_configuration = Mock(wraps=modules.support.create_configuration)
     initialize_paths = Mock()
@@ -204,7 +233,7 @@ def test_fresh_auto_setup_verifies_and_saves_supported_recommendation(
         "reason": "verified",
     }
     mocks = _patch_execution(setup_modules, monkeypatch, hardware=hardware, runtime=runtime)
-    args = setup_modules.setup.parser().parse_args(["--yes"])
+    args = setup_modules.setup.parser().parse_args(["--yes", "--model", "yes"])
 
     assert setup_modules.setup.execute(args, root) == 0
 
@@ -235,7 +264,8 @@ def test_dry_run_prints_plan_without_writing_or_installing(
     assert setup_modules.setup.execute(args, root) == 0
 
     output = capsys.readouterr().out
-    assert "Processing: nvidia" in output
+    assert "Welcome to AutoDJ 1.2.3 setup." in output
+    assert "Use NVIDIA graphics processing." in output
     assert "Install: uv venv" in output
     assert not (root / "config.toml").exists()
     assert not (root / ".uv").exists()
@@ -243,6 +273,86 @@ def test_dry_run_prints_plan_without_writing_or_installing(
     setup_modules.setup.ensure_ffmpeg.assert_not_called()
     mocks.install_python.assert_not_called()
     mocks.run.assert_not_called()
+
+
+def test_managed_existing_environment_dry_run_plans_sync_without_changes(
+    setup_modules, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    root, _ = _project(tmp_path)
+    environment = _environment(setup_modules.support, root)
+    state = root / setup_modules.support.STATE
+    original = {"backend": "cpu", "environment": str(environment)}
+    setup_modules.support.write_json(state, original)
+    before = state.read_bytes()
+    mocks = _patch_execution(setup_modules, monkeypatch)
+
+    assert (
+        setup_modules.setup.execute(setup_modules.setup.parser().parse_args(["--dry-run"]), root)
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert str(environment.resolve()) in " ".join(output.split())
+    assert "Install: uv export" in output
+    assert state.read_bytes() == before
+    mocks.install_python.assert_not_called()
+    assert not (root / ".uv/setup-cpu-requirements.txt").exists()
+
+
+def test_install_commands_are_hidden_unless_verbose_or_dry_run(
+    setup_modules, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    root, _ = _project(tmp_path)
+    _patch_execution(setup_modules, monkeypatch)
+
+    args = setup_modules.setup.parser().parse_args(["--yes", "--model", "yes"])
+    assert setup_modules.setup.execute(args, root) == 0
+    ordinary = capsys.readouterr().out
+    assert "AutoDJ will install the runtime packages." in ordinary
+    assert "Install: uv" not in ordinary
+
+    (root / setup_modules.support.STATE).unlink()
+    args = setup_modules.setup.parser().parse_args(["--yes", "--model", "yes", "--verbose"])
+    assert setup_modules.setup.execute(args, root) == 0
+    verbose = capsys.readouterr().out
+    assert "Install: uv venv" in verbose
+
+
+def test_setup_prose_wraps_to_narrow_terminal(
+    setup_modules, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setattr(
+        setup_modules.setup.shutil,
+        "get_terminal_size",
+        lambda fallback: SimpleNamespace(columns=50),
+    )
+    setup_modules.setup.print_wrapped(
+        "Setup verifies the selected runtime and checks AutoDJ for problems.",
+        initial_indent="  ",
+        subsequent_indent="    ",
+    )
+    output = capsys.readouterr().out
+    assert all(len(line) <= 50 for line in output.splitlines())
+    assert "\n    " in output
+
+
+def test_welcome_is_printed_before_hardware_detection(
+    setup_modules, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    root, _ = _project(tmp_path)
+    events = []
+
+    def detect():
+        events.append(capsys.readouterr().out)
+        return _hardware(setup_modules, system="Linux")
+
+    monkeypatch.setattr(setup_modules.setup, "detect_hardware", detect)
+    _patch_execution(setup_modules, monkeypatch)
+    # _patch_execution installs its own detector, so restore this ordering probe.
+    monkeypatch.setattr(setup_modules.setup, "detect_hardware", detect)
+    args = setup_modules.setup.parser().parse_args(["--dry-run"])
+    assert setup_modules.setup.execute(args, root) == 0
+    assert "Welcome to AutoDJ 1.2.3 setup." in events[0]
 
 
 @pytest.mark.parametrize(
@@ -286,19 +396,26 @@ def test_backend_selection_uses_auto_recommendation_and_explicit_choice(
     args = setup_modules.setup.parser().parse_args(argv)
     assert setup_modules.setup.execute(args, root) == 0
 
-    assert f"Processing: {expected}" in capsys.readouterr().out
+    plan = {
+        "cpu": "Use CPU processing.",
+        "nvidia": "Use NVIDIA graphics processing.",
+    }[expected]
+    assert plan in capsys.readouterr().out
     mocks.install_python.assert_not_called()
 
 
-def test_explicit_existing_environment_skips_package_install(
+def test_explicit_existing_environment_is_adopted_without_package_install(
     setup_modules, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
 ) -> None:
+    """ADR-0012-09: an adopted environment keeps external package ownership."""
     root, _ = _project(tmp_path)
     environment = _environment(setup_modules.support, root)
     mocks = _patch_execution(setup_modules, monkeypatch)
     args = setup_modules.setup.parser().parse_args(
         [
             "--yes",
+            "--model",
+            "yes",
             "--backend",
             "cpu",
             "--environment",
@@ -314,7 +431,8 @@ def test_explicit_existing_environment_skips_package_install(
     mocks.create_configuration.assert_called_once_with(root, 8181)
     generated = tomllib.loads((root / "config.toml").read_text(encoding="utf-8"))
     assert "music_dir" not in generated["library"]
-    assert "Manage music folders" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "without changing its packages" in " ".join(output.split())
     setup_modules.setup.ensure_ffmpeg.assert_called_once_with(auto_install=True)
     selection = setup_modules.support.read_json(root / setup_modules.support.STATE)
     assert selection == {
@@ -322,6 +440,112 @@ def test_explicit_existing_environment_skips_package_install(
         "backend": "cpu",
         "external": True,
     }
+
+
+def test_manage_environment_updates_adopted_runtime_and_saves_managed_ownership(
+    setup_modules, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    """ADR-0012-09: explicit opt-in synchronizes and manages an adopted environment."""
+    root, _ = _project(tmp_path)
+    environment = _environment(setup_modules.support, root)
+    mocks = _patch_execution(setup_modules, monkeypatch)
+    args = setup_modules.setup.parser().parse_args(
+        [
+            "--yes",
+            "--model",
+            "yes",
+            "--verbose",
+            "--backend",
+            "cpu",
+            "--environment",
+            str(environment),
+            "--manage-environment",
+        ]
+    )
+
+    assert setup_modules.setup.execute(args, root) == 0
+
+    mocks.install_python.assert_called_once_with(
+        root, environment.resolve(), "cpu", "Windows", "x86_64", None
+    )
+    assert setup_modules.support.read_json(root / setup_modules.support.STATE) == {
+        "environment": str(environment.resolve()),
+        "backend": "cpu",
+        "external": False,
+    }
+    assert "Install: uv export" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_saved_runtime_keeps_backend_and_respects_package_ownership(
+    setup_modules, monkeypatch, tmp_path, external
+):
+    root, _ = _project(tmp_path)
+    environment = _environment(setup_modules.support, root)
+    setup_modules.support.write_json(
+        root / setup_modules.support.STATE,
+        {"backend": "cpu", "environment": str(environment), "external": external},
+    )
+    mocks = _patch_execution(
+        setup_modules,
+        monkeypatch,
+        hardware=_hardware(setup_modules, recommendation="nvidia"),
+    )
+    assert (
+        setup_modules.setup.execute(
+            setup_modules.setup.parser().parse_args(["--yes", "--model", "yes"]), root
+        )
+        == 0
+    )
+    assert mocks.install_python.call_count == (0 if external else 1)
+    saved = setup_modules.support.read_json(root / setup_modules.support.STATE)
+    assert saved == {
+        "backend": "cpu",
+        "environment": str(environment.resolve()),
+        "external": external,
+    }
+
+
+def test_cpu_without_platform_recipe_keeps_locked_model_dependencies(setup_modules, tmp_path):
+    root, _ = _project(tmp_path)
+    commands = setup_modules.support.install_commands(
+        root, root / ".uv/cpu", "cpu", "Darwin", "arm64"
+    )
+    export = next(command for command in commands if command[1] == "export")
+    assert "--extra" in export
+    assert "--prune" not in export
+
+
+@pytest.mark.parametrize(
+    ("backend", "system"), [("cpu", "Linux"), ("nvidia", "Windows"), ("no-model", "Linux")]
+)
+def test_requirements_export_is_quiet(setup_modules, tmp_path, backend, system):
+    """uv export writes the file without also printing every requirement during setup."""
+    root, _ = _project(tmp_path)
+    commands = setup_modules.support.install_commands(
+        root, root / ".uv" / f"setup-{backend}", backend, system
+    )
+    export = next(command for command in commands if command[1] == "export")
+    assert "--quiet" in export
+    assert export[-2] == "--output-file"
+
+
+def test_failed_managed_update_does_not_save_selection(
+    setup_modules, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, _ = _project(tmp_path)
+    environment = _environment(setup_modules.support, root)
+    old = {"environment": str(environment), "backend": "cpu", "external": True}
+    setup_modules.support.write_json(root / setup_modules.support.STATE, old)
+    mocks = _patch_execution(setup_modules, monkeypatch)
+    mocks.install_python.side_effect = RuntimeError("dependency update failed")
+    args = setup_modules.setup.parser().parse_args(
+        ["--yes", "--model", "yes", "--manage-environment"]
+    )
+
+    with pytest.raises(RuntimeError, match="dependency update failed"):
+        setup_modules.setup.execute(args, root)
+    assert setup_modules.support.read_json(root / setup_modules.support.STATE) == old
 
 
 def test_existing_configuration_is_preserved(
@@ -337,7 +561,7 @@ def test_existing_configuration_is_preserved(
     local_config.write_bytes(local_bytes)
     mocks = _patch_execution(setup_modules, monkeypatch)
     args = setup_modules.setup.parser().parse_args(
-        ["--yes", "--backend", "cpu", "--environment", str(environment)]
+        ["--yes", "--model", "yes", "--backend", "cpu", "--environment", str(environment)]
     )
 
     assert setup_modules.setup.execute(args, root) == 0
@@ -354,7 +578,7 @@ def test_failed_ffmpeg_install_keeps_setup_available(setup_modules, monkeypatch,
     _patch_execution(setup_modules, monkeypatch)
     setup_modules.setup.ensure_ffmpeg.side_effect = RuntimeError("WinGet failed")
     args = setup_modules.setup.parser().parse_args(
-        ["--yes", "--backend", "cpu", "--environment", str(environment)]
+        ["--yes", "--model", "yes", "--backend", "cpu", "--environment", str(environment)]
     )
     assert setup_modules.setup.execute(args, root) == 0
     assert "FFmpeg installation failed" in capsys.readouterr().err
@@ -376,6 +600,8 @@ def test_doctor_failure_does_not_discard_verified_runtime(
     args = setup_modules.setup.parser().parse_args(
         [
             "--yes",
+            "--model",
+            "yes",
             "--backend",
             "cpu",
             "--environment",
@@ -396,7 +622,7 @@ def test_doctor_failure_does_not_discard_verified_runtime(
 
 
 def test_selected_gpu_backend_fails_when_runtime_has_no_usable_gpu(
-    setup_modules, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    setup_modules, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
 ) -> None:
     root, _ = _project(tmp_path)
     environment = _environment(setup_modules.support, root)
@@ -421,6 +647,8 @@ def test_selected_gpu_backend_fails_when_runtime_has_no_usable_gpu(
     args = setup_modules.setup.parser().parse_args(
         [
             "--yes",
+            "--model",
+            "yes",
             "--backend",
             "nvidia",
             "--environment",
@@ -431,6 +659,10 @@ def test_selected_gpu_backend_fails_when_runtime_has_no_usable_gpu(
     with pytest.raises(ValueError, match="rerun setup with --backend cpu"):
         setup_modules.setup.execute(args, root)
 
+    output = capsys.readouterr().out
+    assert "Runtime: selected nvidia GPU verification failed" in output
+    assert "Runtime: CPU" not in output
+    assert "No usable driver" in output
     assert not (root / setup_modules.support.STATE).exists()
 
 
@@ -438,9 +670,7 @@ def test_selected_gpu_backend_fails_when_runtime_has_no_usable_gpu(
     ("actions", "expected_suffixes"),
     [
         ([], []),
-        (["--test-import"], ["index"]),
         (["--serve"], ["serve"]),
-        (["--test-import", "--serve"], ["index", "serve"]),
     ],
 )
 def test_yes_keeps_import_and_server_actions_opt_in(
@@ -456,6 +686,8 @@ def test_yes_keeps_import_and_server_actions_opt_in(
     args = setup_modules.setup.parser().parse_args(
         [
             "--yes",
+            "--model",
+            "yes",
             "--backend",
             "cpu",
             "--environment",
@@ -467,16 +699,10 @@ def test_yes_keeps_import_and_server_actions_opt_in(
     assert setup_modules.setup.execute(args, root) == 0
 
     commands = [call.args[0] for call in mocks.run.call_args_list]
-    verbs = [command[command.index("autodj") + 1] for command in commands]
+    assert commands[0][1:] == ["-m", "autodj.setup_model"]
+    verbs = [command[command.index("autodj") + 1] for command in commands[1:]]
     assert verbs == expected_suffixes
     assert mocks.doctor.call_count == 1
-    if "index" in expected_suffixes:
-        assert commands[expected_suffixes.index("index")][-4:] == [
-            "--limit",
-            "3",
-            "--no-enrich",
-            "--no-analyse",
-        ]
 
 
 def test_install_commands_keep_paths_with_spaces_as_separate_arguments(
@@ -487,21 +713,246 @@ def test_install_commands_keep_paths_with_spaces_as_separate_arguments(
     commands = setup_modules.support.install_commands(root, environment, "nvidia", "Windows")
 
     assert commands[0][:4] == ["uv", "venv", "--python", "3.14"]
-    pip_command = commands[1]
+    export_command = commands[1]
+    assert export_command[:3] == ["uv", "export", "--frozen"]
+    assert (
+        "--extra" in export_command and export_command[export_command.index("--extra") + 1] == "all"
+    )
+    assert export_command[-1] == str(root / ".uv/setup-nvidia-requirements.txt")
+    torch_command = commands[2]
+    pip_command = commands[3]
     python_argument = pip_command.index("--python") + 1
     assert pip_command[python_argument] == str(setup_modules.support.python_path(environment))
     assert " " in pip_command[python_argument]
     recipe = setup_modules.support.profiles(root)["nvidia"]["platforms"]["Windows"]
-    assert pip_command[pip_command.index("--index-url") + 1] == recipe["index"]
-    assert pip_command[-len(recipe["packages"]) :] == recipe["packages"]
-    assert commands[2][-4:] == [
-        "--constraint",
-        str(root / ".uv/setup-nvidia-constraints.txt"),
-        "-e",
-        ".[all]",
-    ]
+    assert torch_command[torch_command.index("--index-url") + 1] == recipe["index"]
+    assert torch_command[-len(recipe["packages"]) :] == recipe["packages"]
+    assert pip_command[-2:] == ["-e", ".[all]"]
+    assert pip_command[pip_command.index("-r") + 1] == str(
+        root / ".uv/setup-nvidia-requirements.txt"
+    )
+    assert pip_command[pip_command.index("--constraint") + 1] == str(
+        root / ".uv/setup-nvidia-constraints.txt"
+    )
     assert all("sync" not in command for command in commands)
 
+
+@pytest.mark.parametrize("backend", ["cpu", "no-model"])
+def test_cpu_and_no_model_package_exports(
+    setup_modules, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    root, _ = _project(tmp_path)
+    commands = setup_modules.support.install_commands(
+        root, root / ".uv" / f"setup-{backend}", backend, "Linux"
+    )
+    export = next(command for command in commands if command[1] == "export")
+    assert export[:3] == ["uv", "export", "--frozen"]
+    if backend == "cpu":
+        assert "--extra" in export and "all" in export
+        assert "--prune" in export
+        assert "-e" in commands[-1] and ".[all]" in commands[-1]
+    else:
+        assert export[export.index("--extra") + 1] == "play"
+        assert "--prune" not in export
+        assert commands[-1][-2:] == ["-e", ".[play]"]
+        monkeypatch.setattr(setup_modules.support, "run", Mock())
+        setup_modules.support.install_python(root, root / ".uv/setup-no-model", backend, "Linux")
+        assert (root / ".uv").is_dir()
+        assert export[-1] == str(root / ".uv/setup-no-model-requirements.txt")
+
+
+@pytest.mark.parametrize(
+    ("backend", "system", "machine", "amd_arch"),
+    [
+        ("cpu", "Linux", "x86_64", None),
+        ("cpu", "Darwin", "arm64", None),
+        ("nvidia", "Windows", "x86_64", None),
+        ("amd", "Linux", "x86_64", "gfx1201"),
+        ("no-model", "Linux", "x86_64", None),
+    ],
+)
+def test_managed_sync_removes_packages_the_lock_no_longer_lists(
+    setup_modules, tmp_path: Path, backend: str, system: str, machine: str, amd_arch: str | None
+) -> None:
+    """ADR-0012-10: only the final, complete install is exact, so backend wheels stay."""
+    root, _ = _project(tmp_path)
+    commands = setup_modules.support.install_commands(
+        root, root / ".uv" / f"setup-{backend}", backend, system, machine, amd_arch
+    )
+    installs = [command for command in commands if command[1:3] == ["pip", "install"]]
+
+    assert "--exact" in installs[-1]
+    assert installs[-1][installs[-1].index("-r") + 1].endswith(f"setup-{backend}-requirements.txt")
+    assert all("--exact" not in command for command in installs[:-1])
+
+
+def test_exact_sync_requests_every_backend_recipe(setup_modules, tmp_path: Path) -> None:
+    """All declared device extras remain roots of the final dependency resolution."""
+    root, _ = _project(tmp_path)
+    for backend, profile in setup_modules.support.profiles(root).items():
+        for system, platform in profile.get("platforms", {}).items():
+            variants = platform.get("architectures", {None: platform.get("packages", [])})
+            for architecture, packages in variants.items():
+                commands = setup_modules.support.install_commands(
+                    root, root / ".uv/runtime", backend, system, "x86_64", architecture
+                )
+                assert set(packages) <= set(commands[-1]), (backend, system, architecture)
+
+
+def test_exact_sync_retains_device_extra_and_removes_obsolete_package(
+    setup_modules, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve local wheels with uv: keep a device extra's transitive dependencies."""
+    uv = shutil.which("uv")
+    assert uv is not None, "Setup verification requires the project's uv tool"
+    root = tmp_path
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+
+    def wheel(name: str, metadata: str = "") -> Path:
+        path = wheels / f"{name}-1.0-py3-none-any.whl"
+        info = f"{name}-1.0.dist-info"
+        with ZipFile(path, "w") as archive:
+            archive.writestr(
+                f"{info}/METADATA",
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n{metadata}\n",
+            )
+            archive.writestr(
+                f"{info}/WHEEL",
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            archive.writestr(f"{info}/RECORD", "")
+        return path
+
+    wheel("device_runtime")
+    wheel("device_bridge", "Requires-Dist: device_runtime==1.0\n")
+    wheel(
+        "torch",
+        'Provides-Extra: device-test\nRequires-Dist: device_bridge==1.0; extra == "device-test"\n',
+    )
+    wheel("obsolete")
+    app = wheel("test_app", "Requires-Dist: torch==1.0\n")
+    environment = root / ".uv/runtime"
+
+    def run(command: list[str]) -> None:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    run([uv, "venv", "--python", sys.executable, "--no-python-downloads", str(environment)])
+    python = str(setup_modules.support.python_path(environment))
+    offline = ["--no-index", "--find-links", str(wheels), "--no-cache"]
+    run([uv, "pip", "install", "--python", python, *offline, "torch[device-test]==1.0", "obsolete"])
+    monkeypatch.setattr(
+        setup_modules.support,
+        "_platform_recipe",
+        lambda *args: {"index": "https://unused.invalid", "packages": ["torch[device-test]==1.0"]},
+    )
+    command = setup_modules.support.install_commands(root, environment, "amd", "Windows")[-1]
+    Path(command[command.index("--constraint") + 1]).write_text("torch==1.0\n", encoding="utf-8")
+    Path(command[command.index("-r") + 1]).write_text("", encoding="utf-8")
+    # Substitute a prebuilt app wheel for the editable app; keep the generated
+    # exact install, constraints and backend requirements unchanged.
+    run([uv, *command[1:-2], *offline, str(app)])
+    result = subprocess.run(
+        [uv, "pip", "list", "--python", python, "--format", "json"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    installed = {package["name"] for package in json.loads(result.stdout)}
+    assert {"torch", "device-bridge", "device-runtime", "test-app"} <= installed
+    assert "obsolete" not in installed
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_no_model_sync_keeps_installed_sound_card_output(
+    setup_modules, tmp_path: Path, installed
+) -> None:
+    """ADR-0012-10: an exact no-model sync includes sound-card support on fresh and existing installs."""
+    root, _ = _project(tmp_path)
+    environment = root / ".uv/setup-no-model"
+    site = environment / (
+        "Lib/site-packages" if sys.platform == "win32" else "lib/python3.14/site-packages"
+    )
+    if installed:
+        (site / "sounddevice-0.5.3.dist-info").mkdir(parents=True)
+
+    commands = setup_modules.support.install_commands(root, environment, "no-model", "Linux")
+    export = next(command for command in commands if command[1] == "export")
+
+    assert export[export.index("--extra") + 1] == "play"
+    assert commands[-1][-2:] == ["-e", ".[play]"]
+    assert "--exact" in commands[-1]
+
+
+@pytest.mark.parametrize(
+    ("backend", "system", "amd_arch", "expected"),
+    [
+        (
+            "cpu",
+            "Linux",
+            None,
+            "".join(f"{name}=={_locked_torch_versions()[name]}+cpu\n" for name in TORCH_FAMILY),
+        ),
+        (
+            "amd",
+            "Linux",
+            "gfx1201",
+            "torch==2.13.0+rocm7.14.0\ntorchvision==0.28.0+rocm7.14.0\ntorchaudio==2.11.0.2+rocm7.14.0\n",
+        ),
+        (
+            "amd",
+            "Windows",
+            "gfx1201",
+            "torch==2.12.0+rocm7.14.1\ntorchvision==0.27.0+rocm7.14.1\ntorchaudio==2.11.0+rocm7.14.1\n",
+        ),
+    ],
+)
+def test_backend_constraint_files_keep_profile_versions(
+    setup_modules,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    system: str,
+    amd_arch: str | None,
+    expected: str,
+) -> None:
+    root, _ = _project(tmp_path)
+    monkeypatch.setattr(setup_modules.support, "run", Mock())
+
+    setup_modules.support.install_python(
+        root, root / ".uv" / f"setup-{backend}", backend, system, amd_arch=amd_arch
+    )
+
+    assert (root / ".uv" / f"setup-{backend}-constraints.txt").read_text() == expected
+
+
+@pytest.mark.parametrize("backend", ["cpu", "nvidia"])
+def test_pytorch_index_profiles_match_the_locked_torch(backend: str) -> None:
+    """The CPU and NVIDIA recipes install the torch family that uv.lock tests.
+
+    A lock upgrade that moves torch must move these install specs too, so a
+    setup-managed runtime never falls behind the tested snapshot.
+    """
+    profiles = json.loads((SCRIPTS / "setup-profiles.json").read_text(encoding="utf-8"))
+    locked = _locked_torch_versions()
+
+    for system, recipe in profiles[backend]["platforms"].items():
+        assert _profile_versions(recipe["packages"]) == locked, (backend, system)
+
+
+def test_container_cpu_torch_matches_the_lock() -> None:
+    """container/torch-cpu.txt names the locked torch family, as the image build asserts."""
+    text = (REPOSITORY / "container" / "torch-cpu.txt").read_text(encoding="utf-8")
+    pins = dict(re.findall(r"^(torch|torchaudio|torchvision)==(\S+)\+cpu ", text, re.M))
+
+    assert pins == _locked_torch_versions()
+
+
+def test_setup_run_preserves_arguments_and_environment(setup_modules, tmp_path, monkeypatch):
+    root, _ = _project(tmp_path)
+    environment = root / ".uv" / "environment with spaces"
     called = Mock()
     executable = "C:/Program Files/uv/uv.exe"
     monkeypatch.setattr(setup_modules.support.shutil, "which", lambda name: executable)
@@ -518,42 +969,30 @@ def test_install_commands_keep_paths_with_spaces_as_separate_arguments(
     )
 
 
-def test_install_stamp_skips_matching_inputs_and_reruns_after_lock_change(
+def test_install_python_always_synchronizes_and_checks_runtime(
     setup_modules, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """ADR-0012-09: a managed setup run always synchronizes and checks dependencies."""
     support = setup_modules.support
     root, _ = _project(tmp_path)
     environment = root / ".uv" / "cached environment"
     python = support.python_path(environment)
     python.parent.mkdir(parents=True)
     python.write_text("placeholder", encoding="utf-8")
-    stamp = environment / ".autodj-setup.json"
-    paths = ("pyproject.toml", "scripts/setup-profiles.json")
-    support.write_json(
-        stamp,
-        {"dependencies": support.fingerprint(root, paths, "cpu:Linux:x86_64:")},
-    )
     run = Mock()
     monkeypatch.setattr(support, "run", run)
 
     support.install_python(root, environment, "cpu", "Linux")
-    run.assert_not_called()
-
-    (root / "pyproject.toml").write_text("[project]\nname = 'updated'\n", encoding="utf-8")
-    support.install_python(root, environment, "cpu", "Linux")
     expected = support.install_commands(root, environment, "cpu", "Linux")
     expected.append(["uv", "pip", "check", "--python", str(python)])
     assert [call.args[0] for call in run.call_args_list] == expected
-    assert support.read_json(stamp)["dependencies"] == support.fingerprint(
-        root, paths, "cpu:Linux:x86_64:"
-    )
     run_environment = run.call_args.args[2]
     assert run_environment["UV_PROJECT_ENVIRONMENT"] == str(environment)
     assert run_environment["AUTODJ_RUNTIME"] == "current"
     assert "VIRTUAL_ENV" not in run_environment
 
     support.install_python(root, environment, "cpu", "Linux")
-    assert [call.args[0] for call in run.call_args_list] == expected
+    assert len(run.call_args_list) == 2 * len(expected)
 
 
 def test_configuration_validates_port(setup_modules, tmp_path: Path) -> None:
@@ -623,7 +1062,7 @@ def test_no_model_setup_saves_runtime_without_torch_probe(
     commands = setup_modules.support.install_commands(
         root, Path(state["environment"]), "no-model", "Linux"
     )
-    assert commands[-1][-2:] == ["-e", "."]
+    assert commands[-1][-2:] == ["-e", ".[play]"]
     assert all("torch" not in str(command) for command in commands)
     assert setup_modules.support.runtime_environment(root, "no-model")["AUTODJ_NO_MODEL"] == "1"
 
@@ -633,15 +1072,19 @@ def test_no_model_setup_rejects_gpu_and_test_import_before_writes(
 ) -> None:
     root, _ = _project(tmp_path)
     mocks = _patch_execution(setup_modules, monkeypatch)
-    for flags in (["--no-model", "--backend", "nvidia"], ["--no-model", "--test-import"]):
+    for flags in (["--no-model", "--backend", "nvidia"],):
         args = setup_modules.setup.parser().parse_args([*flags, "--yes"])
         with pytest.raises(ValueError, match="no-model"):
             setup_modules.setup.execute(args, root)
     assert not (root / ".uv").exists()
     mocks.install_python.assert_not_called()
+    with pytest.raises(SystemExit):
+        setup_modules.setup.parser().parse_args(["--no-model", "--test-import"])
 
 
-def test_saved_no_model_rejects_test_import_before_writes(setup_modules, monkeypatch, tmp_path):
+def test_explicit_model_choice_replaces_saved_no_model_runtime(
+    setup_modules, monkeypatch, tmp_path
+):
     root, _ = _project(tmp_path)
     mocks = _patch_execution(setup_modules, monkeypatch)
     environment = _environment(setup_modules.support, root)
@@ -649,13 +1092,12 @@ def test_saved_no_model_rejects_test_import_before_writes(setup_modules, monkeyp
         root / setup_modules.support.STATE,
         {"backend": "no-model", "environment": str(environment)},
     )
-    before = (root / setup_modules.support.STATE).read_bytes()
     args = setup_modules.setup.parser().parse_args(["--test-import", "--yes"])
-    with pytest.raises(ValueError, match="no-model"):
-        setup_modules.setup.execute(args, root)
-    assert (root / setup_modules.support.STATE).read_bytes() == before
-    mocks.initialize_paths.assert_not_called()
-    mocks.run.assert_not_called()
+    assert setup_modules.setup.execute(args, root) == 0
+    state = setup_modules.support.read_json(root / setup_modules.support.STATE)
+    assert state["backend"] == "cpu"
+    assert Path(state["environment"]) != environment
+    assert mocks.run.call_args.args[0][1:] == ["-m", "autodj.setup_model"]
 
 
 def test_interactive_no_model_never_offers_model_test_import(setup_modules, monkeypatch, tmp_path):
@@ -668,6 +1110,107 @@ def test_interactive_no_model_never_offers_model_test_import(setup_modules, monk
     assert setup_modules.setup.execute(args, root) == 0
     confirm.assert_called_once_with("Apply this setup plan?")
     mocks.run.assert_not_called()
+
+
+def test_unattended_setup_requires_explicit_model_choice(setup_modules, monkeypatch, tmp_path):
+    """ADR-0012-11: --yes does not authorize an unspecified model download."""
+    root, _ = _project(tmp_path)
+    mocks = _patch_execution(setup_modules, monkeypatch)
+    args = setup_modules.setup.parser().parse_args(["--yes"])
+    with pytest.raises(ValueError, match="--model yes or --model no"):
+        setup_modules.setup.execute(args, root)
+    mocks.install_python.assert_not_called()
+    assert not (root / setup_modules.support.STATE).exists()
+
+
+@pytest.mark.parametrize("answer", [True, False])
+def test_interactive_model_choice_is_asked_once_and_does_not_import_tracks(
+    setup_modules, monkeypatch, tmp_path, answer
+):
+    """ADR-0012-11: the model answer controls verification without importing songs."""
+    root, _ = _project(tmp_path)
+    mocks = _patch_execution(setup_modules, monkeypatch)
+    monkeypatch.setattr(setup_modules.setup.sys.stdin, "isatty", lambda: True)
+    confirm = Mock(side_effect=[answer, True])
+    monkeypatch.setattr(setup_modules.setup, "confirm", confirm)
+    saved_weights = root / "models" / "model.safetensors"
+    saved_weights.parent.mkdir()
+    saved_weights.write_bytes(b"saved weights")
+    args = setup_modules.setup.parser().parse_args(["--port", "8080"])
+    assert setup_modules.setup.execute(args, root) == 0
+    assert [call.args[0] for call in confirm.call_args_list] == [
+        "Enable MuQ Similarity analysis?",
+        "Apply this setup plan?",
+    ]
+    assert saved_weights.read_bytes() == b"saved weights"
+    commands = [call.args[0][1:] for call in mocks.run.call_args_list]
+    assert commands == ([["-m", "autodj.setup_model"]] if answer else [])
+    assert mocks.probe_runtime.call_count == int(answer)
+
+
+def test_model_verification_failure_does_not_save_runtime(setup_modules, monkeypatch, tmp_path):
+    """ADR-0012-11: a failed model check cannot publish a verified selection."""
+    root, _ = _project(tmp_path)
+    mocks = _patch_execution(setup_modules, monkeypatch)
+    mocks.run.side_effect = setup_modules.setup.subprocess.CalledProcessError(1, "model test")
+    args = setup_modules.setup.parser().parse_args(["--yes", "--model", "yes"])
+    with pytest.raises(setup_modules.setup.subprocess.CalledProcessError):
+        setup_modules.setup.execute(args, root)
+    assert not (root / setup_modules.support.STATE).exists()
+    mocks.doctor.assert_not_called()
+
+
+def test_running_autodj_refuses_setup_before_mutations(setup_modules, monkeypatch, tmp_path):
+    """ADR-0012-12: detected activity stops setup before software changes."""
+    root, _ = _project(tmp_path)
+    mocks = _patch_execution(setup_modules, monkeypatch)
+    monkeypatch.setattr(
+        setup_modules.setup, "ensure_idle", Mock(side_effect=RuntimeError("running"))
+    )
+    args = setup_modules.setup.parser().parse_args(["--yes", "--no-model"])
+    with pytest.raises(RuntimeError, match="running"):
+        setup_modules.setup.execute(args, root)
+    mocks.install_python.assert_not_called()
+    setup_modules.setup.ensure_ffmpeg.assert_not_called()
+    mocks.create_configuration.assert_not_called()
+
+
+def test_existing_setup_paths_follow_local_and_environment_overrides(
+    setup_modules, monkeypatch, tmp_path
+):
+    root, _ = _project(tmp_path)
+    (root / "config.toml").write_text(
+        '[server]\nport=8081\n[index]\nindex_dir="library"\n', encoding="utf-8"
+    )
+    (root / "config.local.toml").write_text(
+        '[server]\nport=8082\n[index]\nmodel_dir="weights"\n', encoding="utf-8"
+    )
+    args = setup_modules.setup.parser().parse_args(["--no-model"])
+    assert setup_modules.setup.configure(args, root, False) == 8082
+    monkeypatch.setenv("AUTODJ_PORT", "8083")
+    monkeypatch.setenv("AUTODJ_MODEL_DIR", "shared-weights")
+    values = setup_modules.setup.setup_values(root)
+    assert values["port"] == 8083
+    assert values["index_dir"] == root / "library"
+    assert values["model_dir"] == root / "shared-weights"
+
+
+@pytest.mark.parametrize("backend", ["cpu", "no-model"])
+def test_web_update_preserves_model_mode_without_downloading(
+    setup_modules, monkeypatch, tmp_path, backend
+):
+    """ADR-0012-12: updates preserve the runtime mode without authorizing weights."""
+    root, _ = _project(tmp_path)
+    mocks = _patch_execution(setup_modules, monkeypatch)
+    environment = _environment(setup_modules.support, root)
+    setup_modules.support.write_json(
+        root / setup_modules.support.STATE, {"backend": backend, "environment": str(environment)}
+    )
+    monkeypatch.setenv("AUTODJ_SETUP_UPDATE", "1")
+    args = setup_modules.setup.parser().parse_args(["--yes"])
+    assert setup_modules.setup.execute(args, root) == 0
+    mocks.run.assert_not_called()
+    assert setup_modules.support.read_json(root / setup_modules.support.STATE)["backend"] == backend
 
 
 @pytest.mark.parametrize("backend", ["cpu", "nvidia", "amd", "no-model"])
@@ -688,7 +1231,7 @@ def test_setup_runs_doctor_offline_with_a_time_limit(
     mocks = _patch_execution(setup_modules, monkeypatch)
     mocks.doctor.side_effect = setup_modules.setup.subprocess.TimeoutExpired("doctor", 600)
     args = setup_modules.setup.parser().parse_args(
-        ["--yes", "--backend", "cpu", "--environment", str(environment)]
+        ["--yes", "--model", "yes", "--backend", "cpu", "--environment", str(environment)]
     )
     assert setup_modules.setup.execute(args, root) == 0
     kwargs = mocks.doctor.call_args.kwargs
@@ -696,3 +1239,12 @@ def test_setup_runs_doctor_offline_with_a_time_limit(
     assert kwargs["timeout"] == setup_modules.setup.DOCTOR_TIMEOUT_SECONDS
     assert "Doctor did not finish" in capsys.readouterr().out
     assert setup_modules.support.read_json(root / setup_modules.support.STATE)["backend"] == "cpu"
+
+
+def test_empty_python_version_stops_setup_with_a_clear_message(
+    setup_modules, tmp_path: Path
+) -> None:
+    root, _ = _project(tmp_path)
+    (root / ".python-version").write_text("\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"\.python-version is empty"):
+        setup_modules.support.python_version(root)

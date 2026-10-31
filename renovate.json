@@ -1,9 +1,118 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:best-practices", "docker:pinDigests", "helpers:pinGitHubActionDigestsToSemver"],
-  "packageRules": [
-    {"matchDepTypes": ["devDependencies"], "automerge": true},
-    {"matchDatasources": ["docker"], "groupName": "container base images"}
+  "extends": [
+    "config:best-practices",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigestsToSemver"
   ],
-  "lockFileMaintenance": {"enabled": true, "schedule": ["before 5am on Monday"]}
+  "packageRules": [
+    {
+      "description": "Our own image: compose.yaml must follow the moving :stable or :dev tag, so never pin it to a digest or bump it.",
+      "matchPackageNames": [
+        "ghcr.io/blindndangerous/autodj"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Manifests keep lower bounds only; uv.lock and package-lock.json carry the tested versions. Overrides the preset's devDependency pinning.",
+      "matchManagers": [
+        "npm",
+        "pep621"
+      ],
+      "rangeStrategy": "update-lockfile"
+    },
+    {
+      "description": "Merge minor, patch, digest and lock-file updates once the required checks pass. Majors wait for review.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest",
+        "lockFileMaintenance"
+      ],
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "matchDatasources": [
+        "docker"
+      ],
+      "groupName": "container base images"
+    },
+    {
+      "description": "A Python minor release (3.14 to 3.15) moves every setup to the new Python and needs torch wheels for it, so it gets its own PR and waits for approval on the Dependency Dashboard. The python-readiness workflow approves it once every package has wheels. Package names: .python-version (pyenv) and the Containerfile base (docker) are python, .tool-versions (asdf) is python/cpython.",
+      "matchPackageNames": [
+        "python",
+        "python/cpython"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "python minor release",
+      "automerge": false,
+      "dependencyDashboardApproval": true,
+      "prBodyNotes": [
+        "This moves `.python-version`, which setup, the launchers and CI read, plus `.tool-versions` and the Containerfile base image. Before merging, on this branch: (1) run `uv run --no-project python scripts/update_torch_pins.py` and commit the result; (2) update the AMD recipes in `scripts/setup-profiles.json` by hand from AMD's index; (3) move the Python check in `src/autodj/doctor.py` and its tests; (4) smoke-test the native setups and the container. See CONTRIBUTING.md, Upgrading dependencies."
+      ]
+    },
+    {
+      "description": "The same gate by depName, which is python for every manager (asdf's packageName is python/cpython), so no Python minor bump falls through to minor automerge.",
+      "matchDepNames": [
+        "python"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "python minor release",
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": ".python-version holds a plain Python version for uv and actions/setup-python, never a digest.",
+      "matchManagers": [
+        "pyenv"
+      ],
+      "pinDigests": false
+    },
+    {
+      "description": "The torch family is also pinned in container/torch-cpu.txt and scripts/setup-profiles.json.",
+      "matchPackageNames": [
+        "torch",
+        "torchvision",
+        "torchaudio"
+      ],
+      "groupName": "pytorch",
+      "automerge": false,
+      "prBodyNotes": [
+        "Run `uv run --frozen --no-sync python scripts/update_torch_pins.py` on this branch and commit the result. See CONTRIBUTING.md, Upgrading dependencies."
+      ]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The Node.js release CI installs with actions/setup-node.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "node-version: \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "node",
+      "datasourceTemplate": "node-version"
+    }
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 5am"
+    ],
+    "prBodyNotes": [
+      "If this moves torch, torchvision or torchaudio, the setup and container pin tests fail until `uv run --frozen --no-sync python scripts/update_torch_pins.py` is run on this branch and committed."
+    ]
+  },
+  "pre-commit": {
+    "enabled": true
+  }
 }

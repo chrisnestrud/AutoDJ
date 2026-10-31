@@ -1,3 +1,4 @@
+import { copyByCommand } from "./clipboard.js";
 // Settings > Stream > Now-playing feed: the public feed's address, whether
 // it shows the next song, and the webhooks set in the station's secrets.json.
 //
@@ -11,7 +12,7 @@
 //     here asks for more.
 //   - Failures are said in words with the error tone.  A 401 already
 //     opened the sign-in dialog, so it says nothing more.
-//   - DMCA mode (set in Settings > Song picking) shows a plain-text status line and
+//   - DMCA mode (set in Settings > Station > Broadcasting) shows a plain-text status line and
 //     keeps the show-next box focusable but aria-disabled, its reason
 //     added to the box's description.  Pressing it says the reason and
 //     leaves it unticked: listeners never get the next song in that mode.
@@ -62,27 +63,6 @@ export function webhookText(hook) {
 // (WCAG 2.5.3) and says which destination, since hosts can repeat.
 export function testButtonName(hook) {
   return `Send test to webhook ${Number(hook.index) + 1}, ${hook.host}`;
-}
-
-// Plain http is not a secure context, so it has no clipboard API.  The
-// older copy command still works there through a one-off copy listener,
-// so nothing needs selecting and focus stays put.
-function copyByCommand(doc, text) {
-  let wrote = false;
-  const onCopy = (event) => {
-    if (!event.clipboardData) return;
-    event.clipboardData.setData("text/plain", text);
-    event.preventDefault();
-    wrote = true;
-  };
-  doc.addEventListener("copy", onCopy);
-  try {
-    return typeof doc.execCommand === "function" && doc.execCommand("copy") === true && wrote;
-  } catch (_) {
-    return false;
-  } finally {
-    doc.removeEventListener("copy", onCopy);
-  }
 }
 
 export function installNowPlayingSettings({
@@ -254,7 +234,7 @@ export function installNowPlayingSettings({
       try {
         await navigator.clipboard.writeText(field.value);
       } catch (_err) {
-        if (!copyByCommand(doc, field.value)) {
+        if (!copyByCommand(field.value, doc)) {
           // Focus moves to the selected link, ready for Ctrl+C.
           field.focus();
           field.select();

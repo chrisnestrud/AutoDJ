@@ -1,12 +1,12 @@
 # Use the keyboard and a screen reader
 
-The control page has named tabs, headings, lists, buttons, and status messages. Press the **Keyboard shortcuts** button at the bottom of the page, or press `?`, to open the list in a dialog. **Settings**, **Display and keys**, **Enable keyboard shortcuts** turns single-key shortcuts off for this browser. Text fields and dropdowns keep their typing keys. Open dialogs stop playback shortcuts.
+The control page has named tabs, headings, lists, buttons, and status messages. Press the **Keyboard shortcuts** button at the bottom of the page, or press `?`, to open the list in a dialog. **Settings**, **Global**, **Browser preferences**, **Enable keyboard shortcuts** turns single-key shortcuts off for this browser. Text fields and dropdowns keep their typing keys. Open dialogs stop playback shortcuts.
 
 ## Move around the page
 
 Use `Alt+1` through `Alt+9` to open, in order: **Now Playing**, **Queue & Search**, **Track info**, **History**, **Carts**, **Voice tracks**, **Ads**, **Library tools**, and **Settings**. These work even in text fields. Some tabs are hidden when their feature is unavailable.
 
-Use Tab to move to a tab strip, then Left Arrow and Right Arrow to change tabs; Home and End jump to its ends. Use the same keys in Settings' tab strip. Headings and landmarks let a screen reader jump to the page area you need. Lists and tables have named controls for each item. In grid tables, arrow keys move between cells; Tab moves to a control. A dialog keeps focus inside it until you close it. Press Escape to close the shortcut dialog or a message you can dismiss.
+Use Tab to move to a tab strip, then Left Arrow and Right Arrow to change tabs; Home and End jump to its ends. Use the same keys in Settings' tab strip. Headings and landmarks let a screen reader jump to the page area you need. Lists and tables have named controls for each item. In grid tables, arrow keys move between cells; Tab moves to a control. A dialog keeps focus inside it until you close it. Press Escape to close the shortcut dialog or a message you can dismiss. A confirmation, such as Clear queue or Restart AutoDJ, opens with focus on Cancel, its last button: Enter on Cancel or Escape changes nothing and returns focus to the button that opened it. Other dialogs also put the button that changes nothing last: Cancel in Browse… and Rename, Keep editing when Track info asks about unsaved changes.
 
 Editable lists such as intro rules, categories, scheduled events, ads and shows use one Tab stop for their row actions. Up Arrow and Down Arrow move between items; Left Arrow and Right Arrow move between actions in an item. Home and End move to the first or last action in the current item, and Ctrl+Home and Ctrl+End move to the first or last item while keeping the same action when available. Press Enter or Space to activate the focused button. Disabled actions are skipped.
 
@@ -45,7 +45,7 @@ The **Carts** wall has its own keys while it has focus: number keys 1 through 9 
 
 ## Set announcements
 
-**Settings**, **Display and keys**, **Announce track changes** offers **On every tab**, **Only on Now Playing**, and **Off**. The default is **Only on Now Playing**. Choose **Off** if song changes interrupt other work; use the status shortcuts when you want an update. Short success and error messages are spoken once through the page area that owns them. Their visible message can be dismissed without moving focus away from your work.
+**Settings**, **Global**, **Browser preferences**, **Announce track changes** offers **On every tab**, **Only on Now Playing**, and **Off**. The default is **Only on Now Playing**. Choose **Off** if song changes interrupt other work; use the status shortcuts when you want an update. Short success and error messages are spoken once through the page area that owns them. Their visible message can be dismissed without moving focus away from your work.
 
 **Enable keyboard shortcuts** and announcement choices are stored in this browser. **Bracket keys seek the song on air** is also per browser. Buttons, tab strips, sliders, and dialogs still have their normal keyboard controls when shortcuts are off.
 

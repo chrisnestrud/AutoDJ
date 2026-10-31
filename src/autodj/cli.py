@@ -19,6 +19,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -436,6 +437,8 @@ def cli(ctx: click.Context, config_path: str | None, verbose: bool) -> None:
     # Face hub) logs every model-download request.  -v shows them again.
     for name in ("faiss.loader", "httpx", "httpx2"):
         logging.getLogger(name).setLevel(logging.NOTSET if verbose else logging.WARNING)
+    # Compiler dumps overwhelm app diagnostics and distort startup timings.
+    logging.getLogger("numba").setLevel(logging.WARNING)
     # Without a terminal, the hub's download progress bars only add control
     # characters to the journal or log.  A value the user set is kept.
     if not verbose and not sys.stderr.isatty():
@@ -530,6 +533,12 @@ def cmd_doctor(
 
     if as_json and fix:
         raise click.UsageError("--json is read-only; run repairs separately with --fix.")
+    if not as_json:
+        from autodj import __version__
+        from autodj.terminal_text import format_text
+
+        click.echo(f"Welcome to AutoDJ {__version__} Doctor.")
+        click.echo(format_text("Checking your AutoDJ configuration and installation."))
     offer_repairs = not as_json and (sys.stdin.isatty() if fix is None else fix)
     # With --station only that station's own repairs run: nothing server-wide.
     server_repairs = offer_repairs and station is None
@@ -737,12 +746,12 @@ def _doctor_create_directories(
 ) -> bool:
     """Offer only missing writable storage directories identified by the checks.
 
-    These are the index and model folders and each other station's own
+    These are the index folder and each other station's own
     folder.  A new, empty folder replaces nothing, so no backup is made.
     """
     from autodj.doctor import CheckStatus
 
-    paths = {"index-path": cfg.index.index_dir, "model-path": cfg.index.model_dir}
+    paths = {"index-path": cfg.index.index_dir}
     changed = False
     for check in report.checks:
         path: Path | None
@@ -1100,8 +1109,8 @@ def cmd_index(
 
     Add music folders in Library before indexing. Older indexes need migrate-index first.
     Later runs rescan the folders saved in Library tools. Songs become available
-    before advanced analysis; folders with advanced analysis disabled are skipped
-    by that pass. --limit caps advanced analysis, not the basic import.
+    before similarity analysis; folders with similarity analysis disabled are skipped
+    by that pass. --limit caps similarity analysis, not the basic import.
 
     --force replaces existing analysis after each successful result. It keeps
     manual cues, history, settings and usable old vectors if a song fails.
@@ -1113,7 +1122,7 @@ def cmd_index(
     console.print(Panel("[bold green]AutoDJ library import[/]", expand=False))
     console.print(f"  Library : {cfg.index.library_dir}")
     if limit:
-        console.print(f"  Advanced analysis limit : {limit} songs")
+        console.print(f"  Similarity analysis limit : {limit} songs")
     if force:
         console.print("  Mode : [yellow]FORCE REBUILD[/] of analysis; saved station data is kept")
     try:
@@ -1132,7 +1141,7 @@ def cmd_index(
         pending = library.analysis_pending(force=force)
         if pending and not model_analysis_available():
             console.print(
-                "[yellow]Advanced analysis pending: local model analysis is unavailable. "
+                "[yellow]Similarity analysis pending: local model analysis is unavailable. "
                 "Imported songs remain available; run `autodj setup --backend cpu` "
                 "to enable local analysis.[/]"
             )
@@ -1144,7 +1153,7 @@ def cmd_index(
             ]
             if missing:
                 raise RuntimeError(
-                    f"Advanced analysis needs missing packages: {', '.join(missing)}. "
+                    f"Similarity analysis needs missing packages: {', '.join(missing)}. "
                     "Install with uv sync --extra index. Imported songs remain available."
                 )
             model_path = download_model_if_needed(
@@ -1153,9 +1162,9 @@ def cmd_index(
             completed = analyse_library(
                 cfg, load_model(model_path), limit=limit, force=force, workers=workers
             )
-            console.print(f"[green]Advanced analysis completed for {completed} songs.[/]")
+            console.print(f"[green]Similarity analysis completed for {completed} songs.[/]")
         else:
-            console.print("Advanced analysis is up to date; nothing to do.")
+            console.print("Similarity analysis is up to date; nothing to do.")
     except Exception as exc:
         raise click.ClickException(f"Indexing failed: {exc}") from exc
 
@@ -1330,7 +1339,7 @@ def cmd_enrich(ctx: click.Context) -> None:
 @cli.command("analyse-library")
 @click.pass_context
 def cmd_analyse_library(ctx: click.Context) -> None:
-    """Analyse basic-ready songs from folders with advanced analysis enabled."""
+    """Analyse basic-ready songs from folders with similarity analysis enabled."""
     _require_model_analysis()
     from autodj.library import analyse_library
     from autodj.model import download_model_if_needed, load_model
@@ -1339,9 +1348,26 @@ def cmd_analyse_library(ctx: click.Context) -> None:
     try:
         model_path = download_model_if_needed(cfg.model, cfg.index, hf_token=cfg.huggingface.token)
         completed = analyse_library(cfg, load_model(model_path))
-        click.echo(f"[AutoDJ] Advanced analysis embedded {completed} tracks.")
+        click.echo(f"[AutoDJ] Similarity analysis embedded {completed} tracks.")
     except Exception as exc:
         raise click.ClickException(f"Library analysis failed: {exc}") from exc
+
+
+@cli.command("download-model")
+@click.pass_context
+def cmd_download_model(ctx: click.Context) -> None:
+    """Download or validate the configured model cache without analyzing songs."""
+    _require_model_analysis()
+    from autodj.model import download_model_if_needed, inspect_model_cache
+
+    cfg = _load_cfg_or_exit(ctx.obj["config_path"])
+    try:
+        path = download_model_if_needed(cfg.model, cfg.index, hf_token=cfg.huggingface.token)
+        if not inspect_model_cache(cfg.model, cfg.index).complete:
+            raise RuntimeError("Model cache is incomplete")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException("Model cache download or validation failed.") from exc
+    click.echo(f"Model cache ready: {path}")
 
 
 @cli.command("worker")
@@ -1554,9 +1580,9 @@ def cmd_worker(
     wrapper: MuqWrapper | None = None
     prepared = False
 
-    def analyse(path: Path) -> TrackAnalysis:
+    def analyse(path: Path, audio_analysis: dict | None = None) -> TrackAnalysis:
         assert wrapper is not None  # loaded before analysis starts
-        return analyse_file(path, wrapper)
+        return analyse_file(path, wrapper, audio_analysis=audio_analysis)
 
     def prepare() -> None:
         nonlocal wrapper, prepared
@@ -1700,12 +1726,13 @@ def cmd_analyse(
     "--map",
     "move_map",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="JSON mapping of old to new paths relative to music_dir.",
+    help="JSON mapping of old to new paths relative to the legacy index's music base (--music-dir).",
 )
 @click.option(
     "--music-dir",
     type=click.Path(file_okay=False, path_type=Path),
-    help="Base folder for paths in a legacy index; not needed for current-library state upgrades.",
+    help="Base folder for legacy index paths; defaults to [library] music_dir when set. "
+    "Not needed for current-library state upgrades.",
 )
 @click.pass_context
 def cmd_migrate_index(
@@ -1758,11 +1785,13 @@ class _ServeCommand(click.Command):
         except click.Abort:
             raise
         except (Exception, SystemExit) as exc:
-            from autodj.updates import RESTART_EXIT_CODE
+            from autodj.update_contract import UPDATE_WATCH_ENV
+            from autodj.updates import RESTART_EXIT_CODE, UPDATE_EXIT_CODE
 
-            # A restart asked for from the web page is not a failure either.
+            # A restart or update asked for from the web page is not a failure either.
             clean_exit = (
-                isinstance(exc, click.exceptions.Exit) and exc.exit_code in (0, RESTART_EXIT_CODE)
+                isinstance(exc, click.exceptions.Exit)
+                and exc.exit_code in (0, RESTART_EXIT_CODE, UPDATE_EXIT_CODE)
             ) or (isinstance(exc, SystemExit) and exc.code in (None, 0))
             if not clean_exit:
                 hint = "Run `autodj doctor` to troubleshoot."
@@ -1771,9 +1800,13 @@ class _ServeCommand(click.Command):
                 click.echo(hint, err=True)
                 server = sys.modules.get("autodj.server")
                 started = server is not None and server.STARTUP_COMPLETE.is_set()
+                # An update waits for this start: it rolls back on the exit
+                # status, so never wait for an answer.
+                watched = os.environ.get(UPDATE_WATCH_ENV) == "1"
                 if (
                     sys.stdin.isatty()
                     and not started
+                    and not watched
                     and not os.environ.get("AUTODJ_DOCTOR_ACTIVE")
                 ):
                     import subprocess  # nosec B404 -- fixed command, argv only, no shell
@@ -1952,9 +1985,22 @@ def cmd_serve(  # pragma: no cover -- end-to-end orchestrator, exercised by smok
       uv run autodj serve --lan
       uv run autodj serve --server-audio
     """
+    from autodj import __version__
+
+    console.print(f"[bold green]Welcome to AutoDJ {escape(__version__)}[/]")
+    logger = logging.getLogger(__name__)
+    logger.info("Starting the server: loading configuration and audio components...")
+    started = time.perf_counter()
+    cfg = _load_cfg_or_exit(ctx.obj["config_path"], log_file=True)
+    configured = time.perf_counter()
     from autodj.server import serve
 
-    cfg = _load_cfg_or_exit(ctx.obj["config_path"], log_file=True)
+    imported = time.perf_counter()
+    logger.info(
+        "Startup: server imports took %.2f s; configuration and logging took %.2f s",
+        imported - configured,
+        configured - started,
+    )
     from autodj.config import is_loopback_bind
 
     original_server = cfg.server
@@ -2009,6 +2055,10 @@ def cmd_serve(  # pragma: no cover -- end-to-end orchestrator, exercised by smok
     ctx.call_on_close(library.close)
     _print_serve_banner(console, library)
     seed_entry = _resolve_seed(library, cfg, seed, console)
+    logger.info(
+        "Startup: network configuration, library and seed preparation took %.2f s",
+        time.perf_counter() - imported,
+    )
     url = _print_serve_url_banner(console, staged_server)
     cfg.server = staged_server
     if stream is not None:
@@ -2026,7 +2076,7 @@ def cmd_serve(  # pragma: no cover -- end-to-end orchestrator, exercised by smok
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
     try:
-        restart = serve(
+        requested = serve(
             cfg=cfg,
             sim=sim,
             library=library,
@@ -2040,12 +2090,18 @@ def cmd_serve(  # pragma: no cover -- end-to-end orchestrator, exercised by smok
     except KeyboardInterrupt:
         console.print("\n[yellow]Stopped.[/]")
         return
-    if restart is True:
-        from autodj.updates import RESTART_EXIT_CODE
+    from autodj.updates import RESTART_EXIT_CODE, UPDATE_EXIT_CODE
 
-        # The launcher, a systemd service or the container starts it again.
-        console.print("[yellow]Restarting AutoDJ...[/]")
-        raise click.exceptions.Exit(RESTART_EXIT_CODE)
+    # Only a restart or an update asked for from the web page exits with its
+    # status; anything else serve returns ends as before.
+    if isinstance(requested, int) and requested in (RESTART_EXIT_CODE, UPDATE_EXIT_CODE):
+        # The launcher, a systemd service or the container starts it again;
+        # for an update, the checkout's launcher updates it first.
+        if requested == UPDATE_EXIT_CODE:
+            console.print("[yellow]Stopping AutoDJ to update it...[/]")
+        else:
+            console.print("[yellow]Restarting AutoDJ...[/]")
+        raise click.exceptions.Exit(requested)
 
 
 # ---------------------------------------------------------------------------

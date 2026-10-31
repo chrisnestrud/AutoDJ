@@ -7,6 +7,7 @@ import json
 import time
 import wave
 from collections.abc import Callable, Iterator
+from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ from autodj.carts import CartError, CartSlot, StationCarts, install_carts
 from autodj.scheduler import Action
 from autodj.server import PlayerBridge
 from autodj.station_routes import StationRouter, current_station, editable_station
+from autodj.stations import StationPaths
 from tests._layout import layout_index, point_index
 from tests._server import create_app
 
@@ -68,7 +70,7 @@ class Rig:
         self.store, self.action = carts.store, carts.action
         app = FastAPI()
         install_carts(StationRouter(app.router, ("/api",)))
-        fake_station = SimpleNamespace(carts=carts, cfg=cfg)
+        fake_station = SimpleNamespace(carts=carts, cfg=cfg, paths=StationPaths.default(cfg))
         app.dependency_overrides[current_station] = lambda: fake_station
         app.dependency_overrides[editable_station] = lambda: fake_station
         self.client = TestClient(app)
@@ -394,20 +396,33 @@ def test_backwards_cart_dates_name_their_field(app_client: TestClient) -> None:
 
 def test_a_profile_shows_its_cart_page(app_client: TestClient) -> None:
     assert app_client.put("/api/carts/pages/2/name", json={"name": "Breakfast"}).status_code == 200
-    assert app_client.put("/api/carts/active-page/2").status_code == 200
-    assert app_client.post("/api/profiles", json={"name": "Morning"}).status_code == 200
-    app_client.put("/api/carts/active-page/1")
+    assert app_client.put("/api/carts/active-page/1").status_code == 200
+    created = app_client.post("/api/profiles", json={"name": "Morning"})
+    assert created.status_code == 200, created.text
+    view = app_client.get("/api/settings", params={"profile": "Morning"})
+    assert view.status_code == 200, view.text
+    saved = app_client.patch(
+        "/api/settings",
+        json={
+            "revision": view.json()["revision"],
+            "profile": "Morning",
+            "changes": {"cart": {"page": "Breakfast"}},
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["settings"]["values"]["cart"] == {"page": "Breakfast"}
     applied = app_client.post("/api/profiles/Morning/apply")
     assert applied.status_code == 200, applied.text
-    assert "cart_page" in applied.json()["applied"]
+    assert "cart" in applied.json()["applied"]
     assert app_client.get("/api/carts").json()["wall"]["active_page"] == 2
 
     app_client.put("/api/carts/active-page/1")
     app_client.put("/api/carts/pages/2/name", json={"name": "Drive"})
-    refused = app_client.post("/api/profiles/Morning/apply")
-    assert refused.status_code == 400
-    assert "cart page 'Breakfast'" in refused.json()["detail"]
-    assert app_client.get("/api/carts").json()["wall"]["active_page"] == 1
+    applied = app_client.post("/api/profiles/Morning/apply")
+    assert applied.status_code == 200, applied.text
+    assert app_client.get("/api/carts").json()["wall"]["active_page"] == 2
+    view = app_client.get("/api/settings", params={"profile": "Morning"}).json()
+    assert view["values"]["cart"]["page"] == "Drive"
 
 
 def test_the_app_caps_cart_uploads_and_registers_the_action(app_client: TestClient) -> None:
@@ -436,7 +451,7 @@ def test_browser_playback_fetches_from_the_carts_own_station(tmp_path: Path) -> 
     assert create_app(bridge).state.stations.default.carts.api_root == "/api"
 
 
-def test_a_cart_outside_its_play_dates_is_skipped_in_words(tmp_path: Path) -> None:
+def test_cart_dates_restrict_scheduled_but_not_manual_play(tmp_path: Path) -> None:
     rig = _server_rig(tmp_path)
     with rig.client:
         rig.upload()
@@ -447,24 +462,60 @@ def test_a_cart_outside_its_play_dates_is_skipped_in_words(tmp_path: Path) -> No
         assert listed["today"] > "2000-01-01"
         assert listed["timezone"]  # the page works out the station day from it
         assert listed["wall"]["pages"][0]["slots"][2]["not_after"] == "2000-01-01"
-        refused = rig.play()
-        assert refused.status_code == 409
-        assert refused.json()["detail"] == (
-            "Cart 3, Station ID was skipped: it is expired after 1 January 2000"
-        )
-        rig.bridge.liner_scheduler.play_cart.assert_not_called()
-        # A scheduled run fails with the same words.
+        assert rig.play().status_code == 200
+        rig.bridge.liner_scheduler.play_cart.assert_called_once()
+        rig.bridge.liner_scheduler.play_cart.reset_mock()
+        # A scheduled run observes the date restriction.
         with pytest.raises(Exception, match="expired after 1 January 2000"):
             rig.client.portal.call(rig.action.handle, {"page": "1", "slot": "3"})
+        rig.bridge.liner_scheduler.play_cart.assert_not_called()
 
         rig.assign(not_before="2099-12-31")
-        assert "not playable before 31 December 2099" in rig.play().json()["detail"]
+        assert rig.play().status_code == 200
+        rig.bridge.liner_scheduler.play_cart.reset_mock()
+        with pytest.raises(Exception, match="not playable before 31 December 2099"):
+            rig.client.portal.call(rig.action.handle, {"page": "1", "slot": "3"})
+        rig.bridge.liner_scheduler.play_cart.assert_not_called()
         assert rig.assign(not_before="2026-12-26", not_after="2026-11-27").status_code == 422
         rig.assign()
         assert rig.play().status_code == 200
         saved = json.loads((tmp_path / "carts.json").read_text(encoding="utf-8"))
         # Without dates the slot is written as before, so an older AutoDJ reads it.
         assert "not_after" not in saved["pages"][0]["slots"][2]
+
+
+def test_scheduled_cart_dates_include_station_local_boundary_days(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime
+
+    import autodj.clip_dates
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            instant = datetime(2027, 1, 1, 0, 30, tzinfo=UTC)
+            return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(autodj.clip_dates, "datetime", FrozenDateTime)
+    rig = _server_rig(tmp_path)
+    rig.bridge.player._cfg.station.timezone = "America/Los_Angeles"
+    with rig.client:
+        rig.upload()
+        # 00:30 UTC on 1 January is still 31 December at the station.
+        rig.assign(not_before="2026-12-31", not_after="2026-12-31")
+        rig.client.portal.call(rig.action.handle, {"page": "1", "slot": "3"})
+        rig.bridge.liner_scheduler.play_cart.assert_called_once()
+
+
+def test_manual_browser_cart_api_overrides_play_dates(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    with rig.client:
+        rig.upload()
+        rig.assign(not_after="2000-01-01")
+        played = rig.play()
+        assert played.status_code == 200
+        assert played.json()["url"] == "/api/carts/uploads/id.wav"
 
 
 def test_every_registered_liner_is_offered(tmp_path: Path) -> None:

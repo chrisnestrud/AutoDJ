@@ -74,10 +74,58 @@ class _Prepared:
     # A sequential pick's list, its size, and how far the cursor moved for it
     # (more than one when it passed over liners outside their play dates).
     rotation: tuple[str, int, int] | None = None
+    # Its file, and its kind and title in History once it airs (#601); an
+    # empty title is the file's name.
+    path: str | None = None
+    kind: str = "liner"
+    title: str = ""
 
 
 class LinerDecodeError(Exception):
     """A liner file could not be decoded by either soundfile or ffmpeg."""
+
+
+def _decode_liner_data(
+    data: bytes,
+    name: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]],
+) -> np.ndarray:
+    """Decode liner bytes to stereo float32 at the mix-bus sample rate."""
+    try:
+        audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+        audio = to_stereo(audio)
+        if int(sr) != SAMPLE_RATE:
+            import librosa
+
+            audio = librosa.resample(audio, orig_sr=int(sr), target_sr=SAMPLE_RATE, axis=0)
+        return to_stereo(audio)
+    except Exception:
+        result = runner(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                *SAFE_FFMPEG_INPUT,
+                "-i",
+                "pipe:0",
+                "-f",
+                "f32le",
+                "-ac",
+                "2",
+                "-ar",
+                str(SAMPLE_RATE),
+                "pipe:1",
+            ],
+            input=data,
+            capture_output=True,
+            check=False,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0 or not result.stdout or len(result.stdout) % 8:
+            raise LinerDecodeError(f"cannot decode liner {name!r}") from None
+        return np.frombuffer(result.stdout, dtype=np.float32).reshape(-1, 2).copy()
 
 
 def decode_liner(
@@ -114,39 +162,7 @@ def decode_liner(
         data = opened.file.read()
     finally:
         opened.file.close()
-    try:
-        audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
-        audio = to_stereo(audio)
-        if int(sr) != SAMPLE_RATE:
-            import librosa
-
-            audio = librosa.resample(audio, orig_sr=int(sr), target_sr=SAMPLE_RATE, axis=0)
-        return to_stereo(audio)
-    except Exception:
-        result = runner(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                *SAFE_FFMPEG_INPUT,
-                "-i",
-                "pipe:0",
-                "-f",
-                "f32le",
-                "-ac",
-                "2",
-                "-ar",
-                str(SAMPLE_RATE),
-                "pipe:1",
-            ],
-            input=data,
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
-        if result.returncode != 0 or not result.stdout:
-            raise LinerDecodeError(f"cannot decode liner {name!r}") from None
-        return np.frombuffer(result.stdout, dtype=np.float32).reshape(-1, 2).copy()
+    return _decode_liner_data(data, name, runner=runner)
 
 
 def decode_liner_path(
@@ -164,40 +180,7 @@ def decode_liner_path(
     if path.suffix.lower() not in {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"}:
         raise LinerDecodeError(f"unsupported liner type: {path.name}")
     data = path.read_bytes()
-    try:
-        audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
-        audio = to_stereo(audio)
-        if int(sr) != SAMPLE_RATE:
-            import librosa
-
-            audio = librosa.resample(audio, orig_sr=int(sr), target_sr=SAMPLE_RATE, axis=0)
-        return to_stereo(audio)
-    except Exception:
-        result = runner(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                *SAFE_FFMPEG_INPUT,
-                "-i",
-                "pipe:0",
-                "-f",
-                "f32le",
-                "-ac",
-                "2",
-                "-ar",
-                str(SAMPLE_RATE),
-                "pipe:1",
-            ],
-            input=data,
-            capture_output=True,
-            check=False,
-            timeout=30,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        if result.returncode != 0 or not result.stdout or len(result.stdout) % 8:
-            raise LinerDecodeError(f"cannot decode liner {path.name!r}") from None
-        return np.frombuffer(result.stdout, dtype=np.float32).reshape(-1, 2).copy()
+    return _decode_liner_data(data, path.name, runner=runner)
 
 
 class LinerScheduler:
@@ -311,6 +294,10 @@ class LinerScheduler:
         self._planned_moves = 1
         self._forecast_only = False
         self._forecast_clock_aligned = False
+        # Hears each liner, time check and cart that airs, for History
+        # (#601): ``on_aired(kind, title=..., path=..., duration=...)``.  The
+        # station sets it; a snapshot has none.
+        self.on_aired: Callable[..., None] | None = None
 
     def _trigger(self) -> LinerTrigger:
         """Build a :class:`LinerTrigger` from the current config values."""
@@ -361,6 +348,7 @@ class LinerScheduler:
             snapshot._bus = None
             snapshot._can_fire = lambda: False
             snapshot.announcement = None
+            snapshot.on_aired = None
             snapshot._forecast_only = True
             return snapshot
 
@@ -568,7 +556,7 @@ class LinerScheduler:
         key, path, rotation = choice
         if path is not None:
             try:
-                return _Prepared(key, self._path_decoder(path), rotation=rotation)
+                return _Prepared(key, self._path_decoder(path), rotation=rotation, path=str(path))
             except Exception:
                 logger.warning(
                     "Skipping registered liner %s: it could not be decoded", key, exc_info=True
@@ -579,7 +567,7 @@ class LinerScheduler:
         except Exception:
             logger.warning("Skipping liner %s: it could not be decoded", key, exc_info=True)
             return None
-        return _Prepared(key, audio, rotation=rotation)
+        return _Prepared(key, audio, rotation=rotation, path=str(self._folder / key))
 
     def _undo_pick_locked(self, liner: _Prepared) -> None:
         """Undo a sequential pick that was discarded before playback."""
@@ -644,12 +632,45 @@ class LinerScheduler:
         # Under a live DJ (#48) a station ID or other liner waits to play once
         # when they hand back; a time check ("announcement") would be stale.
         after_live = liner.name != "announcement"
+        on_start = self._on_start(liner)
         if cue is None:
-            self._bus.play_liner(liner.audio, duck_db=duck_db, after_live=after_live)
+            self._bus.play_liner(
+                liner.audio, duck_db=duck_db, after_live=after_live, on_start=on_start
+            )
         else:
-            self._bus.play_liner(liner.audio, duck_db=duck_db, at=cue, after_live=after_live)
+            self._bus.play_liner(
+                liner.audio, duck_db=duck_db, at=cue, after_live=after_live, on_start=on_start
+            )
         self._fired_locked()
         return liner.name
+
+    def _on_start(self, liner: _Prepared) -> Callable[[], None]:
+        """What the bus calls when *liner* actually starts, to list it in History.
+
+        The bus calls it at the real start: now, at a cue, or when a live DJ
+        hands back.  A liner it drops is never listed.
+        """
+        return lambda: self._report(liner)
+
+    def _report(self, liner: _Prepared) -> None:
+        """Tell History that *liner* started airing now (any thread; takes no lock)."""
+        listener = self.on_aired
+        if listener is None:
+            return
+        kind, title = liner.kind, liner.title
+        if liner.name == "announcement" and kind == "liner" and not title:
+            kind = "time_check"  # an announcement due at a song change
+        if not title:
+            title = "Time check" if kind == "time_check" else Path(liner.path or liner.name).stem
+        try:
+            listener(
+                kind,
+                title=title,
+                path=liner.path,
+                duration=round(len(liner.audio) / SAMPLE_RATE, 3),
+            )
+        except Exception:
+            logger.exception("Could not add the %s that aired to History", kind)
 
     def _talk_up(self) -> bool:
         """Whether talk-ups are on and can be timed."""
@@ -727,7 +748,9 @@ class LinerScheduler:
             if overlap_start <= frame < len(track.audio):
                 liner.cue = LinerCue(track, frame)
                 duck_db = float(self._cfg.liners_duck_db)
-                self._bus.play_liner(liner.audio, duck_db=duck_db, at=liner.cue)
+                self._bus.play_liner(
+                    liner.audio, duck_db=duck_db, at=liner.cue, on_start=self._on_start(liner)
+                )
             self._prepared = liner
 
     def _auto_due_locked(self) -> bool:
@@ -846,23 +869,48 @@ class LinerScheduler:
             raise LinerDecodeError(f"cannot decode liner {name!r}")
         return prepared.audio
 
-    def play_cart(self, audio: np.ndarray, duck_db: float) -> None:
+    def play_cart(self, audio: np.ndarray, duck_db: float, *, title: str = "Cart") -> None:
         """Play a cart clip now through the liner path; it does not reset the liner triggers.
 
-        Never waits for a liner decode in progress.
+        Never waits for a liner decode in progress.  History lists it as
+        *title*, kind ``cart``.
         """
+        cart = _Prepared("cart", audio, kind="cart", title=title)
         with self._state():
-            self._bus.play_liner(audio, duck_db=duck_db)
+            self._bus.play_liner(audio, duck_db=duck_db, on_start=self._on_start(cart))
 
     def stop_cart(self) -> None:
         """Fade out the clip on the liner path and bring the music back up."""
         with self._state():
             self._bus.stop_liner()
 
-    def play_audio(self, audio: np.ndarray) -> None:
-        """Play rendered *audio* now, as :meth:`fire` plays a named liner."""
+    def play_audio(
+        self,
+        audio: np.ndarray,
+        *,
+        kind: str = "time_check",
+        title: str = "",
+        path: str | None = None,
+    ) -> None:
+        """Play rendered *audio* now, as :meth:`fire` plays a named liner.
+
+        History lists it as *kind*, a time check unless told otherwise,
+        with *title* and *path*.
+        """
         with self._state():
-            self._play_locked(_Prepared("announcement", audio), None)
+            self._play_locked(
+                _Prepared("announcement", audio, path=path, kind=kind, title=title), None
+            )
+
+    def liner_path(self, name: str) -> Path | None:
+        """The file of liner *name*, a catalog ID or liner-folder file name, if found."""
+        for key, path in self._registered_entries():
+            if key == name:
+                return path
+        if Path(name).name != name:
+            return None  # only a plain file name inside the liner folder
+        candidate = self._folder / name
+        return candidate if candidate.is_file() else None
 
     def _planner_mode(self) -> bool:
         """Whether saved-point liners are owned by the cue-based renderer."""

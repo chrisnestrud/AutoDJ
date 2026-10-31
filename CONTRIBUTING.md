@@ -254,9 +254,35 @@ Use the PR template and check the following as applicable:
   `AUTODJ_BROWSERS=chromium npm run audit:ci`. CI does not run WebKit, so also run
   `AUTODJ_BROWSERS=webkit npm run audit:visual` after `npx playwright install webkit`
   (see [Accessibility testing](docs/accessibility-testing.md)).
-- For container changes on Linux or WSL2, run `bash scripts/container_smoke.sh`.
+- For container changes on Linux or WSL2, run `bash scripts/container_smoke.sh`; with
+  `AUTODJ_SMOKE_VARIANT=cuda` it builds and checks the CUDA image.
 
 See [Operations](docs/operations.md) for setup, diagnosis, backup, restore, and upgrade procedures.
+
+## Upgrading dependencies
+
+`pyproject.toml` and `package.json` give lower bounds only. `uv.lock` and
+`package-lock.json` record the tested versions that setup, CI and the container
+install. Renovate keeps them current: it refreshes both locks every day and
+merges minor, patch, digest and lock updates once the required checks pass.
+Major updates wait for review.
+
+To upgrade everything by hand, run `uv lock --upgrade` and
+`npx npm-check-updates -u`, then `npm install --ignore-scripts`.
+
+When an upgrade moves torch, torchvision or torchaudio in `uv.lock`, also run:
+
+```bash
+uv run --frozen --no-sync python scripts/update_torch_pins.py
+```
+
+It rewrites the hashes in `container/torch-cpu.txt` and the CPU and NVIDIA
+recipes in `scripts/setup-profiles.json` from PyTorch's index. Until then,
+`tests/unit/test_setup_flow.py` fails and Renovate does not merge the change.
+The AMD recipes follow AMD's own index; update them by hand.
+
+Coverage is uploaded to Codecov for information only. The 90% floor in
+`pyproject.toml` stays the gate.
 
 ## Releasing
 
@@ -277,7 +303,9 @@ The maintainer cuts releases from `master`. For version `X.Y.Z`:
 5. Tag and push the tag: `git tag vX.Y.Z`, then `git push origin vX.Y.Z`. The Release workflow
    reruns CI and the security scans, checks that the tag equals `uv version --short` and that
    `CHANGELOG.md` has a `## [X.Y.Z]` heading, smoke-installs the wheel, then publishes the signed
-   artifacts.
+   artifacts. The GitHub release's notes are that changelog section
+   (`scripts/release_notes.py vX.Y.Z` prints them), followed by GitHub's list of merged pull
+   requests. Settings, Updates links Stable users to that release page.
 
 The README install command uses `X.Y.Z` placeholders, so it needs no edit per release. Only
 v0.12.0, v0.16.0, v0.16.1, v0.18.0, v0.18.1, v0.18.2, v0.19.0, v0.19.1, v0.21.0, and v0.22.0 were tagged. The other versions from 0.1.0 through 0.15.0,

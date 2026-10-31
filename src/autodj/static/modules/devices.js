@@ -1,3 +1,4 @@
+import { copyByCommand } from "./clipboard.js";
 // Settings > Browser access: native pairing or SSO-owned browser names.
 // SSO forgetting removes a name without revoking the provider session.
 // Native: "Sign out this browser", the paired devices
@@ -27,7 +28,8 @@ import {
 } from "./api-client.js";
 import { authenticationState } from "./auth.js";
 import { confirmAction } from "./confirm-dialog.js";
-import { fmtTime, focusAfterDialog, nextRowControl, reconcileRows, releaseDialogFocus, rowButton } from "./dom-helpers.js";
+import { closeDialog, openDialog } from "./dialog-guard.js";
+import { fmtTime, nextRowControl, reconcileRows, rowButton } from "./dom-helpers.js";
 import { installActionListNavigation } from "./action-list-navigation.js";
 import { announceStatus } from "./live-region.js";
 
@@ -68,26 +70,6 @@ export function spokenCode(code) {
   return `${[...code.slice(0, 4)].join(" ")}, ${[...code.slice(4)].join(" ")}`;
 }
 
-// Plain http is not a secure context, so it has no clipboard API; the
-// older copy command still works there through a one-off copy listener.
-export function copyByCommand(text, doc = globalThis.document) {
-  let wrote = false;
-  const onCopy = (event) => {
-    if (!event.clipboardData) return;
-    event.clipboardData.setData("text/plain", text);
-    event.preventDefault();
-    wrote = true;
-  };
-  doc.addEventListener("copy", onCopy);
-  try {
-    return typeof doc.execCommand === "function" && doc.execCommand("copy") === true && wrote;
-  } catch (_) {
-    return false;
-  } finally {
-    doc.removeEventListener("copy", onCopy);
-  }
-}
-
 export function installAccess(els, { onSignedOut, getAuthState = authenticationState }) {
   const {
     card, note, controls, signOut, refresh, list, status,
@@ -119,7 +101,7 @@ export function installAccess(els, { onSignedOut, getAuthState = authenticationS
     row.text = doc.createElement("span");
     row.text.className = "device-text";
     row.rename = rowButton(doc, "Rename", "", () => void renameDevice(row));
-    row.revoke = rowButton(doc, "Revoke", "", (button) => void revokeDevice(row.device, button));
+    row.revoke = rowButton(doc, "Revoke access", "", (button) => void revokeDevice(row.device, button));
     for (const [button, action] of [[row.rename, "rename"], [row.revoke, "revoke"]]) {
       button.dataset.deviceId = device.device_id;
       button.dataset.action = action;
@@ -142,7 +124,7 @@ export function installAccess(els, { onSignedOut, getAuthState = authenticationS
         + `last seen ${lastSeenWords(device.last_seen_at, now)}.`;
       if (row.text.textContent !== words) row.text.textContent = words;
       if (row.rename.getAttribute("aria-label") !== `Rename ${name}`) row.rename.setAttribute("aria-label", `Rename ${name}`);
-      const action = sso ? "Forget" : "Revoke";
+      const action = sso ? "Forget" : "Revoke access";
       if (row.revoke.textContent !== action) row.revoke.textContent = action;
       if (row.revoke.getAttribute("aria-label") !== `${action} ${name}`) row.revoke.setAttribute("aria-label", `${action} ${name}`);
     }, { fallback: refresh, onFocusLost: ({ target }) => {
@@ -294,11 +276,12 @@ export function installAccess(els, { onSignedOut, getAuthState = authenticationS
     if (result) say(...result);
   }
 
-  // A native modal dialog with one labelled field.  Save keeps the dialog
-  // open until the server answers: a refusal is said inside the dialog
-  // (the page behind it is inert) and focus stays in the field.  After a
-  // save the row's words change in place, the dialog closes onto the same
-  // Rename button that opened it, and the new name is said once.
+  // A dialog with one labelled field, opened with show() and aria-modal
+  // (#631, see dialog-guard.js); Cancel is its last button.  Save keeps the
+  // dialog open until the server answers: a refusal is said inside the
+  // dialog and focus stays in the field.  After a save the row's words
+  // change in place, the dialog closes onto the same Rename button that
+  // opened it, focus going straight there, and the new name is said once.
   function renameDevice(row) {
     const dialog = doc.getElementById("device-rename-dialog");
     const form = doc.getElementById("device-rename-form");
@@ -314,6 +297,10 @@ export function installAccess(els, { onSignedOut, getAuthState = authenticationS
     error.textContent = "";
     let pending = false;
     let saved = null;
+    // Back on the Rename button, or on Refresh when its row is gone.
+    const closeTo = (value) => closeDialog(dialog, {
+      opener: row.rename, target: row.rename.isConnected ? null : refresh, value,
+    });
 
     const showError = (message) => {
       input.setAttribute("aria-invalid", "true");
@@ -344,7 +331,7 @@ export function installAccess(els, { onSignedOut, getAuthState = authenticationS
       } catch (errorValue) {
         pending = false;
         if (!isAuthenticatedRequestCurrent(epoch)) {
-          dialog.close("cancel");
+          closeTo("cancel");
           return;
         }
         showError(errorValue.status === 422
@@ -352,17 +339,16 @@ export function installAccess(els, { onSignedOut, getAuthState = authenticationS
         return;
       }
       pending = false;
-      releaseDialogFocus(dialog);
-      dialog.close("save");
+      closeTo("save");
     }
     function cancelClick() {
       if (pending) return;
-      releaseDialogFocus(dialog);
-      dialog.close("cancel");
+      closeTo("cancel");
     }
+    // Escape: held while Save runs.
     function holdWhilePending(event) {
-      if (pending) event.preventDefault();
-      else releaseDialogFocus(dialog);
+      event.preventDefault();
+      cancelClick();
     }
     function closed() {
       form.removeEventListener("submit", submit);
@@ -370,15 +356,13 @@ export function installAccess(els, { onSignedOut, getAuthState = authenticationS
       dialog.removeEventListener("cancel", holdWhilePending);
       dialog.removeEventListener("close", closed);
       error.textContent = "";
-      // Focus goes back once the dialog has closed (#385).
-      focusAfterDialog(row.rename.isConnected ? row.rename : refresh);
       if (saved !== null) say(`Renamed to ${saved}.`);
     }
     form.addEventListener("submit", submit);
     cancel.addEventListener("click", cancelClick);
     dialog.addEventListener("cancel", holdWhilePending);
     dialog.addEventListener("close", closed);
-    dialog.showModal();
+    openDialog(dialog, { home: input });
     input.focus();
     input.select();
   }

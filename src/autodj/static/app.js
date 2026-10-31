@@ -1,4 +1,4 @@
-import { registerSettingsGroup, applySettingsDrafts, loadSettingsDrafts, resetSettingsDrafts, confirmSettingsNavigation, settingsDraftHolds } from "./modules/settings-drafts.js";
+import { registerSettingsGroup, applySettingsDrafts, loadSettingsDrafts, resetSettingsDrafts, confirmSettingsNavigation, settingsDraftHolds, setSettingsProfile } from "./modules/settings-drafts.js";
 // Pure helpers live in ./modules/dom-helpers.js.
 import {
   isDebug,
@@ -58,6 +58,7 @@ import { initSubtabs } from "./modules/subtabs.js";
 import { installCardState } from "./modules/card-state.js";
 import { installThemeSetting } from "./modules/theme.js";
 import { confirmAction } from "./modules/confirm-dialog.js";
+import { installSecureConnections } from "./modules/secure-connections.js";
 import {
   DEFAULT_STATION,
   controllingText,
@@ -235,6 +236,22 @@ btnListen.addEventListener("click", () => {
 });
 // Settings subtabs (./modules/subtabs.js).  Stream shows only in stream mode.
 initSubtabs(document.getElementById("settings-tabs"));
+const settingsProfile = document.getElementById("settings-profile");
+let settingsProfileTarget = "";
+function resetSettingsProfileTarget() {
+  settingsProfileTarget = "";
+  if (settingsProfile) settingsProfile.value = "";
+}
+settingsProfile?.addEventListener("change", async () => {
+  const next = settingsProfile.value;
+  if (next === settingsProfileTarget) return;
+  if (!await confirmSettingsNavigation()) {
+    settingsProfile.value = settingsProfileTarget;
+    return;
+  }
+  settingsProfileTarget = next;
+  await setSettingsProfile(next);
+});
 // Settings > Stream > More formats: the AAC and Opus streams (#50).
 const streamFormats = installStreamFormats({
   doc: document,
@@ -428,6 +445,7 @@ function clearStationViews({ keepSettings = false } = {}) {
 
 function clearProtectedSessionData() {
   resetSettingsDrafts();
+  resetSettingsProfileTarget();
   streamMode.stop();
   clearStationViews();
   btnMute.innerHTML = '<span aria-hidden="true">🔊</span> Mute';
@@ -869,6 +887,7 @@ function applyState(s, { announceTrack = true } = {}) {
   if (s.settings) {
     applySavedSettings({ ...s.settings, discovery_enabled: s.discovery_enabled });
   }
+  if (Object.hasOwn(s, "active_profile")) profileControls?.updateActive(s.active_profile);
 
   // Last, so Play / Pause already has its enabled state for this push.
   if (losesFocus) (btnPause.disabled ? btnSkip : btnPause).focus();
@@ -877,6 +896,7 @@ function applyState(s, { announceTrack = true } = {}) {
 function applySavedSettings(settings) {
   applySettingsDrafts(settings);
   if (!settings) return;
+  if (Object.hasOwn(settings, "active_profile")) profileControls?.updateActive(settings.active_profile);
   if (stationOffAir) {
     streamSettings.apply({ settings });
     nowPlayingSettings.apply({ settings });
@@ -888,7 +908,9 @@ function applySavedSettings(settings) {
       && _mixEls.stereoPreset?.value === settings.playback.stereotool_preset) {
     _stereoToolPresets?.setActive(settings.playback.stereotool_preset);
   }
-  applyRepeatSettings(settings, _repeatEls);
+  applyRepeatSettings(settings, _repeatEls, {
+    acceptDraft: !(settings.values && settings.revision),
+  });
 }
 
 function renderMute(isMuted) {
@@ -1380,13 +1402,15 @@ const _profileEls = {
   saveButton: document.getElementById("profile-save"),
   list:       document.getElementById("profile-list"),
   status:     document.getElementById("profiles-status"),
+  profileSelect: settingsProfile,
+  applyDefaultsButton: document.getElementById("profile-apply-defaults"),
+  clockSelect: document.getElementById("profile-clock"),
+  cartSelect: document.getElementById("profile-cart"),
 };
-const profileControls = installProfiles(_profileEls, {
-  getSettings: () => _lastState?.settings || null,
-});
+const profileControls = installProfiles(_profileEls);
 
 const _accessEls = {
-  card:     document.getElementById("spanel-access"),
+  card:     document.getElementById("spanel-server"),
   note:     document.getElementById("access-note"),
   controls: document.getElementById("access-controls"),
   signOut:  document.getElementById("access-sign-out"),
@@ -1419,7 +1443,7 @@ import { setTimeFormat } from "./modules/time-format.js";
 
 installAnalysisWorkers();
 // Settings > Updates -- ./modules/updates.js loads when its subtab is shown.
-installUpdates();
+const updateControls = installUpdates();
 const timeSettings = installTimeSettings();
 
 // ----------------------------------------------------------------
@@ -1709,7 +1733,7 @@ const stationSwitcher = installStationSwitcher({
   onChoose: (slug) => switchStation(slug),
 });
 
-// Settings > Stations (#233): the list and New station.  A created station
+// Settings > Station > Stations (#233): the list and New station.  A created station
 // joins the list at once; Switch to it puts focus on the Station button.
 const stationCreator = installStationCreator({
   onCreated: () => refreshStationList(),
@@ -1871,7 +1895,10 @@ function scheduleOffAirCheck() {
     await refreshStationList();
     if (station !== currentStation()) return;
     if (isOnAir(stationEntry())) void loadStation({ announce: false });
-    else scheduleOffAirCheck();
+    else {
+      if (!document.getElementById("panel-settings").hidden) void profileControls?.refresh();
+      scheduleOffAirCheck();
+    }
   }, 10000);
 }
 
@@ -2018,6 +2045,7 @@ async function switchStation(slug) {
   if (!await confirmLeavingStation(entry.name)) return;
   if (slug === currentStation()) return;
   resetSettingsDrafts();
+  resetSettingsProfileTarget();
   selectStation(slug);
   rememberStationInAddress(slug);
   rememberLastStation(slug);
@@ -2902,8 +2930,15 @@ const _libEls = {
 // ----------------------------------------------------------------
 import { formatPlayedAt, updateHistoryDateHeadings } from "./modules/history-format.js";
 import { installHistoryExport } from "./modules/history-export.js";
+import {
+  historyAnchor, historyKindLabel, historyQuery, linersMessage, readShowLiners,
+  setHistoryTypeColumn, writeShowLiners,
+} from "./modules/history-view.js";
+import { defaultStorage } from "./modules/safe-storage.js";
 
 let _histPage = 1;
+// Show liners (#601): off unless this browser chose it.
+let _histShowLiners = readShowLiners(defaultStorage());
 const historyNavigation = installTableNavigation(document.getElementById("history-tbody"));
 // The history request in flight: a newer one aborts it.
 let historyRequest = null;
@@ -2914,16 +2949,20 @@ let _histNewestAt = null;
 let _histPlayingPath = null;
 
 // A live DJ session (#48) is a row too: kind "live", the DJ as the artist,
-// no file and so no Track info, and "On the air" until it ends.
-function historyRowHtml(it) {
+// no file and so no Track info, and "On the air" until it ends.  With
+// liners shown (#601) a Type column says what each row is; a liner file
+// opens in Track info, and other non-music items have none.
+function historyRowHtml(it, withType = false) {
   const historyId = it.event_id || `${it.played_at}:${it.path || ""}`;
-  const live = it.kind === "live";
+  const kind = it.kind || "song";
+  const live = kind === "live";
   let actionCell = "";
-  if (!live) {
+  if (kind === "song" || (kind === "liner" && it.path)) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "history-info";
     button.dataset.path = it.path || "";
+    button.dataset.kind = kind === "liner" ? "liner" : "music";
     button.dataset.historyId = historyId;
     button.textContent = "Track info";
     button.setAttribute("aria-label", `Track info for ${[it.artist, it.title].filter(Boolean).join(", ")}`);
@@ -2931,10 +2970,12 @@ function historyRowHtml(it) {
   }
   const row = tableRow(document, [
     formatPlayedAt(it.played_at, false), live ? it.title || "Live" : it.title ?? "", it.artist ?? "",
-    live && !it.ended_at ? "On the air" : _fmtDuration(it.duration), actionCell,
+    live && !it.ended_at ? "On the air" : _fmtDuration(it.duration),
+    ...(withType ? [historyKindLabel(kind)] : []), actionCell,
   ], { nameIndex: 1 });
   row.dataset.historyId = historyId;
   row.dataset.playedAt = it.played_at;
+  row.dataset.kind = kind;
   return row;
 }
 
@@ -2974,13 +3015,15 @@ function focusRemainingHistoryRow(tbody, index, message, column = null) {
 }
 
 // announce: "page" says where paging landed; "refresh" confirms a
-// Refresh press even when nothing changed.
-async function fetchHistory(page, { announce = false } = {}) {
+// Refresh press even when nothing changed; "liners" says what Show liners
+// now shows.  anchor: the event_id of a row whose page the server finds.
+async function fetchHistory(page, { announce = false, anchor = null } = {}) {
   _histPage = page;
   historyRequest?.abort();
   const request = historyRequest = new AbortController();
+  const liners = _histShowLiners;
   try {
-    const data = await requestJson(`/api/history?page=${page}&per_page=50`, {
+    const data = await requestJson(`/api/history?${historyQuery({ page, showLiners: liners, anchor })}`, {
       signal: request.signal,
     });
     if (request.signal.aborted) return;
@@ -3001,6 +3044,7 @@ async function fetchHistory(page, { announce = false } = {}) {
       ? [...focusedCell.parentElement.children].indexOf(focusedCell) : null;
     const focusedId = focusedRow?.dataset.historyId;
     let focusLost = false;
+    setHistoryTypeColumn(table, liners);
     if (!data.total) {
       tbody.replaceChildren();
       historyNavigation.refresh();
@@ -3013,15 +3057,16 @@ async function fetchHistory(page, { announce = false } = {}) {
           "That play is no longer on this History page.", focusedColumn);
         focusLost = true;
       }
-      if (announce === "refresh" && !focusLost) {
+      if ((announce === "refresh" || announce === "liners") && !focusLost) {
         announceStatus(document.getElementById("sr-status"),
-          "History refreshed.  No tracks played yet.", { dwellMs: 3000, force: true, mirror: false });
+          announce === "liners" ? linersMessage(liners, data) : "History refreshed.  No tracks played yet.",
+          { dwellMs: 3000, force: true, mirror: false });
       }
       return;
     }
     empty.setAttribute("hidden", "");
     table.removeAttribute("hidden");
-    tbody.replaceChildren(...data.items.map(historyRowHtml));
+    tbody.replaceChildren(...data.items.map((it) => historyRowHtml(it, liners)));
     updateHistoryDateHeadings(tbody);
     historyNavigation.refresh();
     if (focusedId) {
@@ -3046,8 +3091,9 @@ async function fetchHistory(page, { announce = false } = {}) {
     // Prev / Next / Go leave focus where it was, so say where they landed.
     // The page label is already on screen, hence no visible mirror.
     if (announce && !focusLost) {
-      announceStatus(document.getElementById("sr-status"),
-        announce === "refresh" ? `History refreshed.  ${pageText}.` : pageText,
+      const message = announce === "refresh" ? `History refreshed.  ${pageText}.`
+        : announce === "liners" ? linersMessage(liners, data) : pageText;
+      announceStatus(document.getElementById("sr-status"), message,
         { dwellMs: 3000, force: true, mirror: false });
     }
   } catch (err) {
@@ -3099,13 +3145,16 @@ async function addNewHistoryRows() {
   const newestShown = _histNewestAt;
   historyRequest?.abort();
   const request = historyRequest = new AbortController();
+  const liners = _histShowLiners;
   let data;
   try {
-    data = await requestJson("/api/history?page=1&per_page=50", { signal: request.signal });
+    data = await requestJson(`/api/history?${historyQuery({ page: 1, showLiners: liners })}`,
+      { signal: request.signal });
   } catch (_) {
     return;  // The next track change or Refresh tries again.
   }
-  if (request.signal.aborted || _histPage !== 1 || _histNewestAt !== newestShown) return;
+  if (request.signal.aborted || _histPage !== 1 || _histNewestAt !== newestShown
+    || liners !== _histShowLiners) return;
   const fresh = data.items.filter((it) => it.played_at > newestShown);
   if (!fresh.length) return;
   const tbody = document.getElementById("history-tbody");
@@ -3117,7 +3166,7 @@ async function addNewHistoryRows() {
   const focusedColumn = focusedCell
     ? [...focusedCell.parentElement.children].indexOf(focusedCell) : null;
   const focusedElement = focusedCell || focusedButton;
-  tbody.prepend(...fresh.map(historyRowHtml));
+  tbody.prepend(...fresh.map((it) => historyRowHtml(it, liners)));
   for (const row of [...tbody.querySelectorAll("tr[data-played-at]")].slice(50)) row.remove();
   updateHistoryDateHeadings(tbody);
   historyNavigation.refresh();
@@ -3153,9 +3202,21 @@ function noteTrackForHistory(s) {
       return;
     }
     document.dispatchEvent(new CustomEvent("autodj:edit-points", {
-      detail: { path: button.dataset.path, kind: "music", opener: button },
+      detail: { path: button.dataset.path, kind: button.dataset.kind || "music", opener: button },
     }));
   });
+  // Show liners keeps focus and its place: the page asked for is the one
+  // holding the first row shown now, and the result is said once.
+  const showLiners = document.getElementById("hist-show-liners");
+  if (showLiners) {
+    showLiners.checked = _histShowLiners;
+    showLiners.addEventListener("change", () => {
+      _histShowLiners = showLiners.checked;
+      writeShowLiners(defaultStorage(), _histShowLiners);
+      const anchor = historyAnchor(document.getElementById("history-tbody"));
+      void fetchHistory(_histPage, { announce: "liners", anchor });
+    });
+  }
   const stepPage = (button, delta) => {
     if (button.getAttribute("aria-disabled") === "true") return;
     void fetchHistory(_histPage + delta, { announce: true });
@@ -3376,6 +3437,7 @@ function startAuthenticatedApp(initialState) {
   void cartWallControls?.refresh();
   voiceTrackerControls = installVoiceTracker();
   void voiceTrackerControls?.refresh();
+  installSecureConnections({ updates: updateControls });
   adsControls = installAdsPanel();
   void adsControls?.refresh();
   void liveSettings?.refresh();

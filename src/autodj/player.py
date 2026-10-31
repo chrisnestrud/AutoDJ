@@ -22,7 +22,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from concurrent.futures import Future, wait
 from copy import deepcopy
@@ -62,6 +62,8 @@ from autodj.beatmatch import (
     tempo_ratio,
 )
 from autodj.breaks import (
+    AD_SCHEDULE,
+    VOICE_TRACK,
     Break,
     BreakError,
     SlotPlan,
@@ -71,6 +73,7 @@ from autodj.breaks import (
     speech_cues,
 )
 from autodj.dmca import WINDOW_SECONDS, Complement, complement, relaxed
+from autodj.history_kinds import INSERT_KINDS
 from autodj.identity_map import attached
 from autodj.indexer import IndexEntry
 from autodj.live_audio import (
@@ -82,6 +85,7 @@ from autodj.live_audio import (
     splice_audio,
 )
 from autodj.live_playout import LivePlayout
+from autodj.live_queue import queue_matches
 from autodj.matched_intros import Chosen
 from autodj.mixbus import BusEvents, MixBus, RenderedTrack, SkipTail
 from autodj.music_speed import resample_music
@@ -92,7 +96,6 @@ from autodj.repeat_rules import (
     ArtistSplitter,
     PlayRecord,
     RelatedArtists,
-    RelatedTracks,
     RepeatFilter,
     RepeatRules,
     SongVersions,
@@ -829,6 +832,16 @@ class Player:
         server_audio_too: In stream mode, also play the mix on the sound card.
     """
 
+    @property
+    def related_artists_problem(self) -> str | None:
+        """Compatibility view of the station settings' related-file status."""
+        return self._settings.related_artists_problem
+
+    @property
+    def related_tracks_problem(self) -> str | None:
+        """Compatibility view of the station settings' related-file status."""
+        return self._settings.related_tracks_problem
+
     # The track rendered just before the render cursor's track: the bus is
     # starting it while the worker picks what follows the cursor's track.
     _pending_previous: IndexEntry | None = None
@@ -862,7 +875,12 @@ class Player:
     # Hour fitting's hard events (or a callable giving the scheduler's
     # current ones) and the time zone they run in (#126).
     _hour_fit_events: Sequence[Any] | Callable[[], Sequence[Any]] = ()
+    _voice_schedule_events: Callable[[], Sequence[Any]] | None = None
+    _voice_live_takeover = False
     _hour_fit_timezone: str | None = None
+    # Why _take_render last left the bus waiting, and for which file: the
+    # mix bus names it when it reports held silence.
+    _bus_wait: tuple[str, str] = ("no track was ready", "")
     # The clockwheel _seed_clock_cursor is a place in (#133).
     _seed_clock_name: str | None = None
     _seed_clock_revision: int | None = None
@@ -1002,6 +1020,8 @@ class Player:
         ) = None
         self._live_queue_dirty = False
         self._live_queue_revision = 0
+        self._voice_run_id = new_id()
+        self._voice_targets: dict[str, Any] = {}
         self._live_queue_target: Any = None
         self._live_queue_edits: dict[int, Any] = {}
         self._server_audio_too = server_audio_too
@@ -1101,34 +1121,29 @@ class Player:
             library_size,
             player=self,
         )
-        from autodj.related_artist_file import (
-            load_configured_related_artists,
-            load_configured_related_tracks,
-            unused_related_artists_message,
-        )
+        from autodj.related_artist_file import load_related_file
 
-        try:
-            self._related_artists = (
-                load_configured_related_artists(cfg.index.library_dir)
-                if cfg.playback.repeat_rules.use_related_artists
-                else RelatedArtists()
+        rules = cfg.playback.repeat_rules
+        self._related_artists, self._settings.related_artists_problem = load_related_file(
+            cfg.index.library_dir,
+            "artists",
+            enabled=rules.use_related_artists,
+            restoring=True,
+        )
+        if self._settings.related_artists_problem:
+            logger.warning(
+                "Related artists file was not used: %s", self._settings.related_artists_problem
             )
-            self.related_artists_problem = None
-        except (OSError, ValueError) as exc:
-            self._related_artists = RelatedArtists()
-            self.related_artists_problem = unused_related_artists_message(exc)
-            logger.warning("Related artists file was not used: %s", exc)
-        try:
-            self._related_tracks = (
-                load_configured_related_tracks(cfg.index.library_dir)
-                if cfg.playback.repeat_rules.use_related_tracks
-                else RelatedTracks()
+        self._related_tracks, self._settings.related_tracks_problem = load_related_file(
+            cfg.index.library_dir,
+            "tracks",
+            enabled=rules.use_related_tracks,
+            restoring=True,
+        )
+        if self._settings.related_tracks_problem:
+            logger.warning(
+                "Related tracks file was not used: %s", self._settings.related_tracks_problem
             )
-            self.related_tracks_problem = None
-        except (OSError, ValueError) as exc:
-            self._related_tracks = RelatedTracks()
-            self.related_tracks_problem = unused_related_artists_message(exc, "tracks")
-            logger.warning("Related tracks file was not used: %s", exc)
         # (library entries, their keys), rebuilt when the library changes;
         # see _track_keys.  Its own lock: the build can take a while on a
         # large library, and _pick_lock must never make a track start wait.
@@ -1160,6 +1175,9 @@ class Player:
         # hook the bridge sets to hear about each track the bus starts.
         self.bus: MixBus | None = None
         self.on_track_started: Callable[[IndexEntry], None] | None = None
+        # The bridge's PlayerBridge.record_aired: hears each liner, break and
+        # matched intro of a handoff as it airs, for History (#601).
+        self.on_item_aired: Callable[..., None] | None = None
         # Render cursor for the bus: the next track to render, how many of
         # its samples the previous track's overlap already played, and how
         # it was picked (for "why this track" once it starts).
@@ -1207,10 +1225,13 @@ class Player:
         # that copy or that record, never across a similarity search, so a
         # track start never waits for a pick.
         #
-        # Lock order: the station lock, then _advance_lock (browser mode
-        # only), then either _set_lock or queue_lock -- never both at once:
-        # _on_track_start gives a queue pick back only after releasing
-        # _set_lock -- then _pick_lock.  _pick_lock is a leaf: nothing else
+        # Booking/queue lock order: the station lock, then _advance_lock
+        # (browser mode only), _clock_selection_lock, _set_lock when held,
+        # bus.queue_edit_guard(), then queue_lock or _slot_lock.
+        # book_live_breaks and slot_status take _slot_lock inside the bus guard.
+        # _on_track_start gives a queue pick back after releasing _set_lock;
+        # _install_handoff holds it through the guarded queue update.
+        # _pick_lock comes last and is a leaf: nothing else
         # is taken while it is held.  (The bus lock and the render-ahead
         # worker's lock come between the station lock and queue_lock; see
         # _take_render.)
@@ -1258,8 +1279,19 @@ class Player:
         if observer is not None:
             observer(event, detail)
 
+    def invalidate_voice_targets(self) -> None:
+        """End run-local selections without waiting for an in-flight renderer."""
+        with self._state.queue_lock:
+            self._voice_run_id = new_id()
+            self._voice_targets.clear()
+            self._live_queue_revision += 1
+            self._live_voice_slot = None
+
     def stop(self) -> None:
         """Wake and stop the playback loop, including empty-library waiting."""
+        self.invalidate_voice_targets()
+        if self.break_desk is not None:
+            self.break_desk.drop_unaired("the station stopped")
         self._voice_tracking_requested = False
         self._state.should_stop = True
         self._skip_event.set()
@@ -1795,8 +1827,16 @@ class Player:
             )
         return clock, validate_clock(slots)
 
+    def _normalized_history(self, last_played: Mapping[str, Any]) -> Mapping[str, Any]:
+        """*last_played* by clockwheel-normalized path, for least recently played steps."""
+        from autodj.clockwheel import _normalized
+
+        return {
+            _normalized(path): stamp for path, stamp in last_played.items() if isinstance(path, str)
+        }
+
     def _clock_pick(self, context: _PickContext, cursor: int | None) -> Any:
-        from autodj.clockwheel import ClockPick, ConditionPaths, _normalized, pick_slot
+        from autodj.clockwheel import ClockPick, ConditionPaths, pick_slot
 
         fit = self._hour_fit_choice(context)
 
@@ -1825,11 +1865,7 @@ class Player:
         ledger = self._ledger
         last_played = ledger.last_played() if ledger is not None else {}
         normalized_history = (
-            {
-                _normalized(path): stamp
-                for path, stamp in last_played.items()
-                if isinstance(path, str)
-            }
+            self._normalized_history(last_played)
             if any(slot.selection == "least_recent" for slot in slots)
             else None
         )
@@ -1885,6 +1921,7 @@ class Player:
             self._clock_condition_cache = cache
 
         closed_steps = self._closed_clock_steps(context, step_hours)
+        preview_choices = getattr(self, "_preview_clock_choices", None)
 
         def pick(
             use_rules: bool,
@@ -1929,6 +1966,9 @@ class Player:
                 versions=self._song_versions(),
                 fit=fit,
                 preferred_path=getattr(self, "_preview_preferred_path", None),
+                preferred_for_step=(lambda index: preview_choices.preferred(self, index))
+                if preview_choices is not None
+                else None,
             )
 
         # Like the other pick modes, relax rather than stop the music: first
@@ -1997,6 +2037,8 @@ class Player:
                 self._clock_status = f"Settings step skipped: {exc}"
         if picked.entry is not None:
             _log_repeat_blocks(context.repeat, picked.entry)
+        if (choices := getattr(self, "_preview_clock_choices", None)) is not None:
+            choices.remember(self, picked)
         return replace(
             picked,
             step_snapshot=self._clock_step_snapshot(picked.step_index, steps),
@@ -2360,7 +2402,7 @@ class Player:
             )
             for used in (*reserved_liners, *((reserved,) if reserved else ())):
                 for number, item in enumerate(waiting):
-                    if item.path == used.path:
+                    if queue_matches(item, used):
                         del waiting[number]
                         break
         liner_paths = {entry.path for entry in self._library.entries_snapshot("liner")}
@@ -2537,6 +2579,10 @@ class Player:
                         self._chosen_clock_liner = picked.liner
                 cursor = marked_cursor
         elif self._cfg.playback.pick_mode == "clock" and self._clock is not None:
+            boundary = self._pending_clock_boundary or getattr(self, "_clock_next_boundary", None)
+            # The first render needs the station's restart time, including
+            # when a seed liner keeps its already selected song (#357, #616).
+            self._pending_clock_boundary = boundary
             if seed is not None:
                 self._chosen_clock_step = (
                     seed[3] if len(seed) > 3 else getattr(self, "_seed_clock_step", None)
@@ -2549,11 +2595,6 @@ class Player:
                     "",
                 )
             starting_cursor = (self._clock or {}).get("cursor", 0) if cursor is None else cursor
-            boundary = self._pending_clock_boundary or getattr(self, "_clock_next_boundary", None)
-            # Carry the restart time on with the cursor: a set's first render
-            # has none of its own, and a pick that did not restart would
-            # otherwise pass none on, so the wheel would never restart (#357).
-            self._pending_clock_boundary = boundary
             natural_restart = self._pending_clock_update is not None and boundary is None
             if natural_restart and starting_cursor == 0:
                 self._promote_pending_clock()
@@ -2594,6 +2635,12 @@ class Player:
                 if restart:
                     assert boundary is not None
                     self._promote_pending_clock()
+                    if (choices := getattr(self, "_preview_clock_choices", None)) is not None:
+                        following = next_boundary(
+                            datetime.fromtimestamp(max(boundary, when)).astimezone(),
+                            (self._clock or {}).get("resync_minutes", [0]),
+                        )
+                        choices.restart(following.timestamp() if following else None)
                     reset = self._clock_pick(context, 0)
                     self._chosen_clock_revision = self._clock_revision
                     if reset.entry is None:
@@ -2739,6 +2786,20 @@ class Player:
         """Choose handoff voice using the same precedence for playback and preview."""
         if getattr(current, "_prepared_clip", False) or getattr(upcoming, "_prepared_clip", False):
             return liners, "", None
+        if self.live_mixing and self._voice_targets and self.break_desk is not None:
+            from autodj.live_queue import occurrence_ref
+
+            outgoing, incoming = occurrence_ref(self, current), occurrence_ref(self, upcoming)
+            if any(
+                item.state == "queued"
+                and item.run_id == self._voice_run_id
+                and item.outgoing_occurrence_id == outgoing
+                and item.incoming_occurrence_id == incoming
+                for item in self.break_desk.listing()
+            ):
+                # Promotion owns the frozen choices. A new random reservation here
+                # would compete with that same handoff before it becomes current.
+                return liners, "", None
         key = ""
         if self._cfg.playback.matched_intro_only_without_liner:
             if not breaks and not liners:
@@ -2899,7 +2960,9 @@ class Player:
                 if intro_id not in kept
             )
 
-    def _reserve_frozen_transition_intro(self, intro: Any, at: float | None) -> Any:
+    def _reserve_frozen_transition_intro(
+        self, intro: Any, at: float | None, *, owned: bool = False
+    ) -> Any:
         """Adopt a frozen intro choice without rerolling it on live chooser state."""
         if intro is None or self.matched_intros is None:
             return None
@@ -2918,10 +2981,18 @@ class Player:
         if intro_id.startswith("rule:"):
             rules = getattr(self.matched_intros, "rules", None)
             reserve = getattr(rules, "reserve_chosen", None)
-            held = reserve(intro_id[5:], when) if reserve is not None else False
+            held = (
+                (reserve(intro_id[5:], when, owned=True) if owned else reserve(intro_id[5:], when))
+                if reserve is not None
+                else False
+            )
         else:
             reserve = getattr(self.matched_intros, "reserve_chosen", None)
-            held = reserve(intro_id, when) if reserve is not None else False
+            held = (
+                (reserve(intro_id, when, owned=True) if owned else reserve(intro_id, when))
+                if reserve is not None
+                else False
+            )
         if not held:
             logger.info("Frozen matched intro %s is no longer eligible", intro_id)
             return None
@@ -2945,6 +3016,7 @@ class Player:
                 on_track_start=self._on_track_start,
                 on_position=self._on_position,
                 on_need_track=self._take_render,
+                wait_reason=lambda: self._bus_wait,
             ),
             eq_gains=lambda: (self._eq_low, self._eq_mid, self._eq_high),
             skip_tail=self._plan_skip,
@@ -3098,17 +3170,27 @@ class Player:
             return self._next_rendered_serial()
 
     def _live_continuation(self) -> RenderedTrack | None:
-        """Carry the incoming cursor without rendering or selecting its successor."""
+        """Keep the incoming deck playable without selecting its successor."""
         current = self._pending_entry
         assert current is not None
-        return RenderedTrack(
-            current,
-            LiveAudio(0, ()),
-            None,
-            0,
-            "",
-            start_offset=self._pending_offset,
+        self._render_live_sources = (current, self._pending_live_source, None, None)
+        try:
+            body = self._render_track(
+                current, None, self._pending_offset, glide_in=self._pending_glide
+            )
+        finally:
+            self._render_live_sources = None
+        # An incoming song exhausted by the overlap still needs cursor promotion.
+        if body is None:
+            body = RenderedTrack(
+                current, LiveAudio(0, ()), None, 0, "", start_offset=self._pending_offset
+            )
+        if isinstance(body.audio, LiveAudio):
+            self._cue_continuation_deck(body.audio)
+        return replace(
+            body,
             handoff_pending=True,
+            handoff_id=new_id(),
             live_source=self._pending_live_source,
             pick_mode=self._pending_pick_mode,
             from_queue=self._pending_from_queue,
@@ -3124,6 +3206,69 @@ class Player:
             clock_step=self._pending_clock_step,
             clock_revision=self._pending_clock_cursor_revision,
         )
+
+    def _cue_continuation_deck(self, audio: LiveAudio) -> None:
+        """Seek the continuation's first deck to where it will play, off the bus.
+
+        An incoming deck opens at its song's saved start.  When the outgoing
+        render mixed the overlap from decoded windows instead of reading that
+        deck, the continuation starts further in, and its first read at
+        promotion restarts the decoder while the bus waits in silence.  A deck
+        the playing render still reads is left alone: its overlap moves it.
+        """
+        layer = next((item for item in audio.layers if isinstance(item.source, BufferedFile)), None)
+        if layer is None or not isinstance(deck := layer.source, BufferedFile):
+            return
+        playing = (self._playing_render, self.bus.current_render() if self.bus else None)
+        for track in playing:
+            if track is None:
+                continue
+            for timeline in (track.audio, track.full_audio):
+                if isinstance(timeline, LiveAudio) and any(
+                    item.source is deck for item in timeline.layers
+                ):
+                    return
+        # A failed deck reports itself when the bus reads it.
+        with contextlib.suppress(RuntimeError):
+            deck.ready(layer.offset, 1)
+
+    def _prepare_live_candidate(
+        self,
+        entry: IndexEntry | None,
+        mode: str,
+        *,
+        failed_entries: set[str],
+        context: _PickContext,
+        current: IndexEntry,
+        current_from_queue: bool,
+        liner_key: str,
+    ) -> tuple[bool, _PickContext, str, BufferedFile | None]:
+        """Open a successor before reserving its transition speech."""
+        if not self.live_mixing or entry is None:
+            return True, context, liner_key, None
+        if entry.path in failed_entries:
+            if mode == "queue":
+                self._discard_failed_queue_pick(entry, current if current_from_queue else None)
+            return False, context, liner_key, None
+        try:
+            return True, context, liner_key, self._live_file(entry, fresh=True)
+        except Exception as exc:
+            logger.warning(
+                "Cannot prepare upcoming track %s; reselecting after it failed (%s).",
+                entry.path,
+                exc,
+            )
+            failed_entries.add(entry.path)
+            if mode == "queue":
+                self._discard_failed_queue_pick(entry, current if current_from_queue else None)
+            if liner_key and self.liner_scheduler is not None:
+                self.liner_scheduler.release_plan(liner_key)
+            return (
+                False,
+                replace(context, protected=context.protected | {entry.path}),
+                "",
+                None,
+            )
 
     def _next_rendered_serial(self) -> RenderedTrack | None:
         """Pick and render the next track for the mix bus.
@@ -3227,10 +3372,24 @@ class Player:
             breaks: tuple[Break, ...] = ()
             unbooked_ad_steps: tuple[dict, ...] = ()
             unbooked_slot_id = ""
+            failed_live_entries: set[str] = set()
+            render_live_source = getattr(self, "_pending_live_source", None)
+            render_next_live_source = None
+            current_source_error: Exception | None = None
+            if self.live_mixing:
+                try:
+                    if render_live_source is None or not self._live_source_is_current(
+                        current, render_live_source
+                    ):
+                        render_live_source = self._live_file(current, fresh=True)
+                except Exception as exc:
+                    # Still select a successor so the usual current-item skip can advance.
+                    current_source_error = exc
             # An intro matched to the next song (#127) takes the automatic
             # liner's place at this change; the liner trigger stays due.
             intro = None
             prepared = self._prepared_plan()
+
             try:
                 if plan is not None:
                     unbooked_ad_steps, unbooked_slot_id = plan.ad_steps, plan.slot_id
@@ -3305,25 +3464,48 @@ class Player:
                         )
                 elif deferred:
                     next_entry, next_mode = None, "clock"
-                elif station_mode:
-                    next_entry, next_mode, liners, next_cursor, liner_key = (
-                        self._choose_station_next(current, context, auto_liner=False)
-                    )
-                    next_clock_step = self._chosen_clock_step
-                    unbooked_ad_steps = getattr(self, "_chosen_clock_ad_steps", ())
-                    if next_mode == "clock":
-                        next_clock_name = self._pending_clock_name
-                        next_clock_revision = self._chosen_clock_revision
-                        next_clock_boundary = self._pending_clock_boundary
-                    breaks = self._prepared_breaks(current, next_entry, plan=prepared)
-                    liners, liner_key, intro = self._transition_voice(
-                        current, next_entry, liners, breaks, context.at
-                    )
                 else:
-                    next_entry, next_mode = self._choose_next(current, context)
-                    unbooked_ad_steps = getattr(self, "_chosen_clock_ad_steps", ())
+                    for _ in range(5):
+                        if station_mode:
+                            next_entry, next_mode, liners, next_cursor, liner_key = (
+                                self._choose_station_next(current, context, auto_liner=False)
+                            )
+                        else:
+                            next_entry, next_mode = self._choose_next(current, context)
+                        if (
+                            self.live_mixing
+                            and edit is not None
+                            and edit.candidate is not None
+                            and edit.candidate.path not in failed_live_entries
+                        ):
+                            next_entry, next_mode = edit.candidate, edit.candidate_mode or "queue"
+                        if station_mode:
+                            next_clock_step = self._chosen_clock_step
+                        unbooked_ad_steps = getattr(self, "_chosen_clock_ad_steps", ())
+                        if station_mode and next_mode == "clock":
+                            next_clock_name = self._pending_clock_name
+                            next_clock_revision = self._chosen_clock_revision
+                            next_clock_boundary = self._pending_clock_boundary
+                        (
+                            prepared_live,
+                            context,
+                            liner_key,
+                            render_next_live_source,
+                        ) = self._prepare_live_candidate(
+                            next_entry,
+                            next_mode,
+                            failed_entries=failed_live_entries,
+                            context=context,
+                            current=current,
+                            current_from_queue=current_from_queue,
+                            liner_key=liner_key,
+                        )
+                        if prepared_live:
+                            break
+                    else:
+                        next_entry, next_mode, liners, liner_key = None, "similarity", (), ""
                     breaks = self._prepared_breaks(current, next_entry, plan=prepared)
-                    if breaks:
+                    if next_entry is not None and (station_mode or breaks):
                         liners, liner_key, intro = self._transition_voice(
                             current, next_entry, liners, breaks, context.at
                         )
@@ -3333,7 +3515,7 @@ class Player:
                 )
                 next_entry, next_mode = None, "similarity"
             if edit is not None:
-                if edit.candidate is not None:
+                if edit.candidate is not None and edit.candidate.path not in failed_live_entries:
                     next_entry, next_mode = edit.candidate, edit.candidate_mode or "queue"
                 if (
                     intro is not None
@@ -3348,20 +3530,21 @@ class Player:
                     *retained,
                     *(item for item in breaks if item.break_id not in replaced_ids),
                 )
-                intro = edit.intro
-            render_live_source = getattr(self, "_pending_live_source", None)
-            render_next_live_source = None
+                if edit.candidate is not None and edit.candidate.path in failed_live_entries:
+                    intro = None
+                    if edit.intro is not None and self.matched_intros is not None:
+                        self.matched_intros.release((edit.intro.intro_id,))
+                else:
+                    intro = edit.intro
             try:
                 if next_entry is not None:
                     # Plan the effect knowing how next_entry was picked;
                     # the render then finds this plan.
                     self.planned_transition(current, next_entry, next_mode)
                 if getattr(self, "live_mixing", False):
-                    if render_live_source is None or not self._live_source_is_current(
-                        current, render_live_source
-                    ):
-                        render_live_source = self._live_file(current, fresh=True)
-                    if next_entry is not None:
+                    if current_source_error is not None:
+                        raise current_source_error
+                    if next_entry is not None and render_next_live_source is None:
                         render_next_live_source = self._live_file(next_entry, fresh=True)
                     self._render_live_sources = (
                         current,
@@ -3750,6 +3933,9 @@ class Player:
                 self._refresh_live_queue()
             elif ready is None and track is not None:
                 self._playout.reset(lambda: self._skip_past_render(track))
+            from autodj.live_voice import promote_future_voice
+
+            promote_future_voice(self)
 
     def _plan_slot(self, ready: RenderedTrack) -> None:
         if self.live_mixing:
@@ -4270,6 +4456,7 @@ class Player:
             reason: Why breaks waiting to air are dropped (#88): every
                 planned song change is gone.
         """
+        self.invalidate_voice_targets()
         with self._slot_lock:
             self._slot_plan = None
             self._live_voice_slot = None
@@ -4354,6 +4541,8 @@ class Player:
         if getattr(track.entry, "_prepared_clip", False):
             return 0
         boundaries = [len(track.audio)]
+        if track.transition_start_frame is not None:
+            boundaries.append(track.transition_start_frame)
         if track.overlap_frames:
             boundaries.append(len(track.audio) - track.overlap_frames)
         boundaries.extend(
@@ -4512,8 +4701,29 @@ class Player:
             self._playout.refresh()
         self._recheck_slot_plan()
 
-    def live_queue_guard(self) -> contextlib.AbstractContextManager:
-        return self.bus.queue_edit_guard() if self.bus is not None else contextlib.nullcontext()
+    @contextlib.contextmanager
+    def live_queue_guard(self) -> Iterator[None]:
+        from autodj.live_queue import catalog_revision_snapshot
+
+        with (
+            catalog_revision_snapshot(self),
+            self.bus.queue_edit_guard() if self.bus is not None else contextlib.nullcontext(),
+        ):
+            yield
+
+    def confirm_voice_target(
+        self,
+        target_id: str,
+        revision: str,
+        *,
+        voice_action: str | None = None,
+        voice_revision: str | None = None,
+    ) -> Any:
+        from autodj.live_queue import confirm_voice_target
+
+        return confirm_voice_target(
+            self, target_id, revision, voice_action=voice_action, voice_revision=voice_revision
+        )
 
     def live_editable_handoff(self) -> RenderedTrack | None:
         track = self._playing_render
@@ -4523,6 +4733,13 @@ class Player:
 
     def accept_live_queue_edit(self, decision: Any) -> None:
         if decision is not None:
+            from autodj.live_queue import apply_future_edit
+
+            apply_future_edit(self, decision)
+            if decision.track is None:
+                if self._live_queue_target is not self._playing_render:
+                    self._live_queue_target = None
+                return
             if (
                 self._live_queue_target is None
                 or self._live_queue_target is not self._playing_render
@@ -4576,12 +4793,19 @@ class Player:
             self._recheck_slot_plan()
             return
         self._rewind_render_cursor(track)
+        if track.handoff_pending:
+            # Promotion already removed this occurrence from the queue.
+            self._pending_from_queue = False
         replacement = self._next_rendered_serial()
         if replacement is None:
             self._live_queue_dirty = True
             self._playout.request_plan()
             return
-        replacement = replace(replacement, handoff_id=track.handoff_id, ad_steps=track.ad_steps)
+        replacement = replace(
+            replacement,
+            handoff_id=track.handoff_id,
+            ad_steps=replacement.ad_steps if track.handoff_pending else track.ad_steps,
+        )
         incoming_source = None
         incoming_source_start = incoming_source_end = 0
         incoming_rate: float = 1.0
@@ -4609,6 +4833,37 @@ class Player:
             self._live_queue_dirty = False
             self._live_queue_target = None
             boundary = int(self.bus.live_position(track))
+            if track.handoff_pending:
+                before = min(
+                    [
+                        self.prepared_tail_boundary(replacement),
+                        *(at for at, _entry, _queued in replacement.liner_events),
+                        *(at for at, _identity, _end, _label in replacement.intro_events),
+                    ]
+                )
+                if boundary > before or self.bus.current_render() is not track:
+                    # Finish B, then start C at its cue; never join unheard speech mid-word.
+                    self._discard_render(replacement)
+                    replacement = replace(
+                        replacement,
+                        audio=track.audio,
+                        full_audio=track.full_audio,
+                        next_start_offset=replacement.next_entry_offset,
+                        next_glide=None,
+                        overlap_frames=0,
+                        transition_start_frame=None,
+                        transition_fx="",
+                        beatmatch_ratio=1.0,
+                        liner_events=(),
+                        break_events=(),
+                        intro_events=(),
+                        intro_rng_traces=(),
+                        intro_assets=(),
+                        next_reserved_liners=(),
+                        liner_plan_key="",
+                        incoming_intro=None,
+                        voice_breaks=(),
+                    )
             if isinstance(track.audio, LiveAudio) and isinstance(replacement.audio, LiveAudio):
                 speech_started = any(
                     int(event[0]) < boundary
@@ -4703,7 +4958,12 @@ class Player:
             for _at, identity, _end in track.break_events:
                 if identity not in retained_ids:
                     self.break_desk.drop(identity, "discarded from this airing by a queue edit")
-        self._playout.reset(lambda: self._skip_past_render(replacement if swapped else track))
+        following = (
+            replacement
+            if swapped or (track.handoff_pending and self._playing_render is track)
+            else track
+        )
+        self._playout.reset(lambda: self._skip_past_render(following))
 
     def prepare_live_return(self, timeout: float) -> None:
         """Refresh automation after live input, retaining fallback only in local mode."""
@@ -4733,16 +4993,22 @@ class Player:
         it.  Lock order is bus lock, then queue lock, then the worker's
         lock; nothing takes the bus lock while holding the queue lock.
         """
+        self._bus_wait = ("the next song was still being prepared", "")
         with self._state.queue_lock:
             if getattr(self, "live_mixing", False):
                 ready = self._playout.ready()
                 if ready is None:
                     self._playout.request_plan()
                 else:
-                    if ready.handoff_pending:
+                    if ready.handoff_pending and not len(ready.audio):
+                        self._bus_wait = ("the next song had no audio yet", ready.entry.path)
                         self._playout.request_plan()
                         return None
                     if self._live_queue_dirty:
+                        self._bus_wait = (
+                            "a queue change was being applied to the next song",
+                            ready.entry.path,
+                        )
                         return None
                     audio = (
                         ready.full_audio
@@ -4752,6 +5018,10 @@ class Player:
                     if isinstance(audio, LiveAudio):
                         try:
                             if not audio.ready(0, min(1024, len(audio))):
+                                self._bus_wait = (
+                                    "the next song's file deck was still seeking",
+                                    ready.entry.path,
+                                )
                                 return None
                         except (OSError, RuntimeError, ValueError):
                             pass  # The bus consumes and skips failed decks through its normal path.
@@ -4805,14 +5075,39 @@ class Player:
             Whether an occurrence was removed.
         """
         state = self._state
-        if state.queued_next is not None and state.queued_next.path == entry.path:
+        if state.queued_next is not None and queue_matches(state.queued_next, entry):
             state.queued_next = None
             return True
         for index, queued in enumerate(state.queue):
-            if queued.path == entry.path:
+            if queue_matches(queued, entry):
                 del state.queue[index]
                 return True
         return False
+
+    def _discard_failed_queue_pick(
+        self, entry: IndexEntry, reserved: IndexEntry | None = None
+    ) -> None:
+        """Drop the failed peeked queue occurrence, respecting a reserved duplicate."""
+        state = self._state
+        with state.queue_lock:
+            queued_next = state.queued_next
+            if (
+                queued_next is not None
+                and queue_matches(queued_next, entry)
+                and (reserved is None or not queue_matches(queued_next, reserved))
+            ):
+                state.queued_next = None
+                return
+            skip_reserved = reserved is not None and not (
+                queued_next is not None and queue_matches(queued_next, reserved)
+            )
+            for index, queued in enumerate(state.queue):
+                if skip_reserved and reserved is not None and queue_matches(queued, reserved):
+                    skip_reserved = False
+                    continue
+                if queue_matches(queued, entry):
+                    del state.queue[index]
+                    return
 
     def _peek_user_queue(self, reserved: IndexEntry | None) -> IndexEntry | None:
         """The queue head a render would pick, skipping *reserved*'s slot.
@@ -4826,7 +5121,7 @@ class Player:
         waiting.extend(state.queue)
         if reserved is not None:
             for index, queued in enumerate(waiting):
-                if queued.path == reserved.path:
+                if queue_matches(queued, reserved):
                     del waiting[index]
                     break
         return waiting[0] if waiting else None
@@ -4851,6 +5146,8 @@ class Player:
         has anything, because the queue takes priority.  A render with
         announcer breaks is never stale: the breaks name its next track.
         """
+        if track.handoff_pending:
+            return True
         if track.next_entry is None and track.entry is getattr(self, "_restored_first", None):
             return True  # A restored first song: its successor is picked while it plays.
         if track.next_pick_mode == "clock" and track.next_clock_revision != self._clock_revision:
@@ -4883,13 +5180,19 @@ class Player:
                 return True
             if track.next_from_queue:
                 return (
-                    head is None or track.next_entry is None or head.path != track.next_entry.path
+                    head is None
+                    or track.next_entry is None
+                    or not queue_matches(head, track.next_entry)
                 )
             return head is not None
         with self._state.queue_lock:
             head = self._peek_user_queue(track.entry if track.from_queue else None)
         if track.next_from_queue:
-            return head is None or track.next_entry is None or head.path != track.next_entry.path
+            return (
+                head is None
+                or track.next_entry is None
+                or not queue_matches(head, track.next_entry)
+            )
         return head is not None
 
     def _on_track_start(self, rendered: RenderedTrack) -> None:
@@ -4979,7 +5282,10 @@ class Player:
         self._remember_upcoming(rendered)
         if entry is not getattr(self, "_restored_first", None):
             self._restored_first = None
-        elif rendered.next_entry is None and self.live_mixing:
+        if self.live_mixing and (
+            rendered.handoff_pending
+            or (entry is getattr(self, "_restored_first", None) and rendered.next_entry is None)
+        ):
             # Pick its successor now, while it plays: the live queue refresh
             # runs on the playout worker, never on the bus.
             self._live_queue_dirty = True
@@ -5039,6 +5345,13 @@ class Player:
             for index, (at, entry, queued) in enumerate(playing.liner_events):
                 if frames > at and index not in self._heard_liner_events:
                     self._heard_liner_events.add(index)
+                    self._item_aired(
+                        "liner",
+                        title=entry.title,
+                        artist=entry.artist,
+                        path=entry.path,
+                        duration=entry.length,
+                    )
                     if queued:
                         with self._state.queue_lock:
                             self._commit_queue_pick(entry)
@@ -5052,19 +5365,48 @@ class Player:
                     if frames > at and break_id not in self._heard_break_starts:
                         self._heard_break_starts.add(break_id)
                         desk.on_air(break_id)
+                        self._break_aired(desk, break_id, (end - at) / SAMPLE_RATE)
                     if frames >= end and break_id not in self._heard_break_ends:
                         self._heard_break_ends.add(break_id)
                         desk.aired(break_id)
             if playing.intro_events and (intros := self.matched_intros) is not None:
                 rng_traces = dict(playing.intro_rng_traces)
-                for at, intro_id, _end, _label in playing.intro_events:
+                for at, intro_id, end, label in playing.intro_events:
                     if frames > at and intro_id not in self._heard_intros:
                         self._heard_intros.add(intro_id)
+                        self._item_aired(
+                            "matched_intro", title=label, duration=(end - at) / SAMPLE_RATE
+                        )
                         rng_draws = rng_traces.get(intro_id, ())
                         if rng_draws:
                             intros.heard(intro_id, rng_draws)  # never waits
                         else:
                             intros.heard(intro_id)  # never waits
+
+    def _item_aired(self, kind: str, **fields: Any) -> None:
+        """Tell History about a handoff item that started airing (mix-bus thread)."""
+        listener = self.on_item_aired
+        if listener is None:
+            return
+        try:
+            listener(kind, **fields)
+        except Exception:
+            logger.exception("Could not add the %s that aired to History", kind)
+
+    def _break_aired(self, desk: Any, break_id: str, seconds: float) -> None:
+        """Tell History about a break that started: an ad, a voice track or speech."""
+        if self.on_item_aired is None:
+            return
+        item = desk.get(break_id)
+        if item is None:
+            return
+        if item.source == VOICE_TRACK:
+            kind = "voice_track"
+        elif item.source == AD_SCHEDULE:
+            kind = "ad"
+        else:
+            kind = item.kind if item.kind in INSERT_KINDS else "speech"
+        self._item_aired(kind, title=item.label or kind, duration=seconds)
 
     def _run_headless(self, current: IndexEntry) -> None:
         """Track-picking loop with no server audio output.
@@ -5328,15 +5670,45 @@ class Player:
                 if cached is not None and cached[1].splitter.known == known:
                     cached = (entries, cached[1])
                 else:
-                    related = (
-                        getattr(self, "_related_artists", None) or RelatedArtists()
-                        if self._cfg.playback.repeat_rules.use_related_artists
-                        else RelatedArtists()
-                    )
-                    splitter = ArtistSplitter(known, related.single_acts)
+                    splitter = ArtistSplitter(known, self._key_related().single_acts)
                     cached = (entries, TrackKeyCache(splitter))
                 self._key_cache = cached
             return cached[1]
+
+    def _key_related(self) -> RelatedArtists:
+        """The related artists whose single acts the track keys never split."""
+        return (
+            getattr(self, "_related_artists", None) or RelatedArtists()
+            if self._cfg.playback.repeat_rules.use_related_artists
+            else RelatedArtists()
+        )
+
+    def share_pick_caches(self, live: Any) -> None:
+        """Start a dry run's player with what *live*, the station's, worked out from the library.
+
+        The track keys, the song versions, the songs that are not silent or
+        closed and the clockwheel's conditions steps take a whole pass over
+        a large library to work out, and are the same for both players.  A
+        preview that worked them out again could spend its time limit before
+        its first few picks.  Each is still checked against this player's
+        own library snapshot, slots and settings when it is next used, and
+        worked out again when they differ.  The keys and conditions caches
+        are copies, so nothing either player adds later reaches the other.
+        """
+        if not isinstance(live, Player):
+            return
+        keys = getattr(live, "_key_cache", None)
+        single_acts = ArtistSplitter((), self._key_related().single_acts).single_acts
+        if keys is not None and keys[1].splitter.single_acts == single_acts:
+            self._key_cache = (keys[0], keys[1].copy())
+        # A song's versions do not depend on the splitter; neither of these
+        # is changed once built, only replaced.
+        for name in ("_versions_cache", "_eligible_cache"):
+            if (cached := getattr(live, name, None)) is not None:
+                setattr(self, name, cached)
+        conditions = getattr(live, "_clock_condition_cache", None)
+        if conditions is not None:
+            self._clock_condition_cache = conditions.copy_for(getattr(self, "_clock_slots", ()))
 
     def _song_versions(self) -> SongVersions | None:
         """The library's songs with several versions, with Count versions as one song on.
