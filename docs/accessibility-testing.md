@@ -53,7 +53,8 @@ Expected with NVDA in browse mode, in Chrome and Firefox:
 - Tab and Shift+Tab move only between the two buttons. A click outside the
   dialog, or a page control activated from the screen reader's own cursor,
   does nothing and leaves focus on Cancel.
-- Escape or Cancel returns focus to the control that opened the dialog. NVDA
+- Escape or Cancel returns focus to the opener, or its grid cell for a table row
+  action. NVDA
   reads that control twice, first as the line at its browse-mode cursor (for
   example "button Restart AutoDJ"), then as the focus ("Restart AutoDJ button").
   It never reads "Skip to main content" or another line from the top of the page.
@@ -69,12 +70,22 @@ first check is in
 
 ## Other dialogs with NVDA
 
+Known NVDA behavior (2026-10-31, NVDA 2026.2 with Edge): opening an editor
+can speak its title, short help and form landmark twice before the first field.
+The supplied reviewer trace contains both copies within one NVDA event and one
+DOM focus transition; the same behavior occurs on the baseline. Keep the short
+description, which prevents reading the complete form as the description, and
+the direct first-field focus. The owner accepted this remaining speech behavior;
+it is not evidence of two page focus calls. Browser focus traces cannot by
+themselves establish what NVDA speaks.
+
 Every other dialog the page opens works the same way, through
 `modules/dialog-guard.js`
 ([#631](https://github.com/blindndangerous/AutoDJ/issues/631)): `show()` and
 `aria-modal="true"`, a backdrop, Tab and Shift+Tab kept in the dialog, Escape
 firing its cancel event, the button that changes nothing last, and focus going
-straight back to the control that opened it. A dialog opened from another, such
+straight back to the control that opened it, or its grid cell for table actions.
+A dialog opened from another, such
 as Browse… in an editor or the discard question over an editor, sits above it,
 and only the top one keeps the keys. Check each with NVDA in browse mode, in
 Chrome and Firefox:
@@ -89,13 +100,14 @@ Chrome and Firefox:
   press Track info on another song in **Queue & Search**. The buttons are
   Save, Discard and Keep editing, in that order. Escape keeps
   editing and returns to the control that asked.
-- **Rename a paired device**: in **Settings**, **Profiles and access**,
+- **Rename a paired device**: in **Settings**, **Global**, **Server**,
   **Browser access**, press Rename on a device. Save comes before Cancel.
-  Escape and Cancel return to Rename; a save returns to it too.
+  Escape and Cancel return to the Rename action cell; a save returns to it too.
 - **Editors**: Add event in **Settings**, **Schedule**; Add spot and Add ad
   break in **Ads**; Add category, a clockwheel's New step, and Add intro rule in
-  **Library tools**. Escape on an unchanged editor returns to the button that
-  opened it; on a changed one it asks before discarding.
+  **Library tools**. Escape on an unchanged editor returns to the opening control
+  or action cell; on a changed one it asks before discarding. Its initial
+  description gives only short help, not the complete form's field text.
 - **Keyboard shortcuts**: press `?` or the **Keyboard shortcuts** button. Tab
   stays on Close; Escape, Close or `?` return to where focus was.
 - **Pairing**: open the page in a browser that is not paired. Tab goes round
@@ -105,6 +117,23 @@ For each, closing must read the control focus returns to, never "Skip to main
 content" or another line from the top of the page. NVDA reads that control
 twice, as for a confirmation. Record the results under `ADR-0011-09` in
 [ADR 0011](adr/0011-verify-accessibility-with-browser-and-speech-evidence.md).
+
+## Tab entry with NVDA
+
+With **Library tools** or **Settings** selected, use browse-mode Ctrl+Home,
+then Tab. Focus must enter the main tab strip on the selected tab, even if
+NVDA's buffer first targets an unselected tab with `tabindex="-1"`. Browser-native
+Tab alone does not exercise that path. The visual audit also sends focus directly
+to an unselected tab from outside its group; this models the focus path without
+claiming a new speech sample.
+
+Repeat within Settings' **Profile**, **Station** and **Global** groups. Enter
+on the group's selected tab, or its first visible tab if another group owns the
+selection. Entry alone must not select a different panel. Check Arrow keys,
+Home and End within the group, pointer clicks, and browse-mode Enter on another
+tab. Enter's focus-then-click sequence must still activate the original tab.
+Record speech and versions under `ADR-0011-10` in
+[ADR 11](adr/0011-verify-accessibility-with-browser-and-speech-evidence.md).
 
 ## Disposable SSO browser audit
 
@@ -333,17 +362,234 @@ with deterministic local TTS audio and injected cancellation delay. It bypasses
 normal model/hardware startup and does not establish normal-startup, physical
 output-routing, speech or Windows/NVDA evidence.
 
+## Collection tables
+
+[ADR 21](adr/0021-unify-collection-tables.md) establishes one collection pattern.
+Schedule events, Upcoming and Runs, saved Clockwheels and clockwheel steps,
+Shows and songs, prepared occurrences and takes, the queue, listener requests
+and voice-track bookings, categories, intro rules, matched intros, liner files,
+ad spots and breaks, profiles and browser access use this pattern. Ad delivery
+reports use the same table navigation without actions. Do not treat a passing
+audit as evidence for flows or platforms it did not exercise.
+
+Run `node tests/playwright/collections_audit.mjs` for the focused headless
+Chromium collection audit. It starts its own loopback static server, loads the actual
+index markup, styles and panel modules, and supplies in-memory API replies.
+Set `AUTODJ_BROWSERS=firefox` to repeat it in an installed Playwright Firefox;
+in PowerShell, use `$env:AUTODJ_BROWSERS = 'firefox'` before the command.
+It checks both themes, keyboard/menu/editor journeys, axe, minimum targets,
+including 44-pixel minimum height for collection buttons and menu items,
+computed button-text and focus-ring contrast, 320-pixel reflow and emulated forced
+colors. The report retains axe incomplete nodes. A shown row menu sits inside
+its cell, so axe's label-content-name-mismatch rule counts the menu items' words
+as that cell's visible label. The audit sets aside only that case, where the
+cell's name is exactly its own words (its Options button's name, or its text),
+and lists it under `reviewed` in the report; any other node still fails. Hidden popup references are
+checked directly against the DOM; computed contrast supplements overlap cases
+that axe cannot resolve. Results go to
+`.codex-tmp/collections-audit.json`; `AUTODJ_COLLECTIONS_REPORT` overrides the
+path, and `AUTODJ_BROWSERS` can select additional installed engines. This fixture
+does not verify the live backend, persistence or screen-reader speech. Use the
+procedure below for the remaining visual and platform evidence.
+
+Use `collection-table.js`, the `.collection-table` class, `tableRow` and
+`installTableNavigation`. Each native table has a native `<caption>` naming it
+(WCAG technique H39) rather than `aria-label`, real column headings, plain
+grid cells and one Tab stop. The caption is visually hidden only where a
+heading just above the table already says the same; otherwise it stays visible.
+Every other table in the page has a caption the same way. Preserve cell focus rather than moving onto an
+ordinary action button: the established NVDA behavior avoids duplicate cell and
+button speech. Do not introduce row headers. Empty collections contain one
+`.no-results` row spanning all columns, including the Actions column.
+NVDA says no table headings in focus mode, so `table-navigation.js` names the
+cell an arrow key moves to until focus leaves it (#712): its text, then the
+column heading when the column changed, then the row's name cell when the row
+changed, for example "3:00, Length" or "Second artist, Second song". A cell
+holding a button, input or select keeps its control's own name and gets no
+label. Clear the temporary name on focusout. While a row's menu is shown inside
+its Actions cell, that cell is named by its Options button alone, never by the
+button and the menu. What NVDA speaks depends on its
+configuration, notably the Document Formatting table headers setting, and an
+earlier sample heard headings twice with a different rule. Issue #712 chose
+this rule; record that NVDA setting with every future speech sample.
+
+Each row with actions ends in one **Actions** column holding only its **Options
+for <row name>** button. Its menu holds every action of the row, the most
+frequent first, such as Edit or Open. Read-only tables have no Actions column.
+Shift+F10, the Applications (Menu) key and right-click on any cell of a row
+open that row's menu through one `contextmenu` listener on the table body; the
+browser's own menu remains on rows without actions. `row-actions-menu.js` implements the
+menu-button contract: `aria-haspopup="menu"`, `aria-expanded`, `aria-controls`,
+`role="menu"` and `menuitem` children. Enter/Space opens from the grid cell.
+When the button itself receives focus, Enter, Space or Down opens on the first
+item and Up opens on the last. Grid-cell arrows keep their existing navigation.
+Inside the popup, Up/Down, Home/End and type-ahead move through choices. Enter
+activates. Escape closes and returns to the cell the menu opened from: the
+Actions cell from its button, the focused cell for Shift+F10 or the Applications
+key, the clicked cell for right-click. That cell remains the table's only Tab
+stop; arrows immediately continue table navigation. An action that does not
+move focus restores this cell too. An action that opens an editor or
+confirmation moves focus straight from the menu, and cancelling returns to the
+Actions cell. Standalone menus return to their button. Tab closes and leaves the menu. Disabled actions remain present
+and reachable with `aria-disabled`. Their reason is linked with
+`aria-describedby`, and activation announces it without performing the action.
+
+A column that turns its row on or off, such as a schedule event's **Enabled**,
+holds a native checkbox built by the shared table's `toggle` column option.
+Arrow navigation enters that cell on the checkbox, and Space turns the row on or
+off in place with one request. The checkbox keeps focus, is marked busy
+through `withDisabled` without `aria-disabled`, ignores a second press while
+saving, then shows the server's current state (its previous state when the
+change fails) and announces the
+result through the panel's status region. Its name is the action and the row,
+"Enable <event name>", so it is not the column heading again. An ended event
+that is off has no checkbox: its cell says "No, ended, no runs left". One still
+on keeps its checked checkbox, described by a visible "Ended, no runs left"
+note, so it can be turned off. The menu has no
+Enable or Disable.
+
+Keep keyed rows and controls mounted during refresh. The shared table reuses
+the focus-preserving placement from `dom-helpers`. Removing a focused row moves
+focus to a usable nearby row or panel fallback and announces the new destination
+through `announceStatus`. Quiet refreshes do not announce unchanged rows.
+Action outcomes, disabled reasons and validation announcements also use the
+shared status helper, with the editor's region while a dialog is open.
+
+Use `createEditorDialog` for add/edit and `collection-delete.js` for removal.
+The removal helper calls `confirmAction` unless Undo is available. Clockwheel
+steps retain Undo and their Alt+Up/Down, Delete and Ctrl+Z accelerators. Do not
+add a step-delete confirmation. Read-only tables use the shared class and
+navigation without a menu. The cart wall and text-only lists remain exceptions
+as specified by ADR 21.
+
+For each migrated panel, verify these paths in a real browser with populated
+and empty data:
+
+1. Tab into and out of each table. Check exactly one table stop, arrow movement,
+   Home/End and Ctrl+Home/End. Confirm no extra stops on row buttons or closed
+   menu items. Read data and column headings in browse mode as well as focus mode.
+   In focus mode, move horizontally: hear the cell's text, then its column
+   heading. Move vertically between differently named rows: hear the text, then
+   the destination row's name. Leave the cell and check no stale label remains.
+   Record NVDA's Document Formatting table headers setting with the sample.
+2. Open Options with Enter/Space from its cell, then test the focused button's
+   Down/Up keys. From a data cell, open the same row's menu with Shift+F10 and
+   with the Applications key, and by right-clicking another row; each opens the
+   intended row's menu. Right-click a read-only table and check the browser's
+   own menu appears. Space on the button opens on release and must not immediately
+   close the popup or reopen it after activating an item. Check first/last item
+   focus, arrows, Home/End and type-ahead.
+   Activate one enabled item with Enter. Activate a disabled item and verify
+   its reason is announced without mutation. Check that `aria-describedby`
+   resolves to the same restriction before activation.
+   On a schedule event's **Enabled** checkbox, press Space: check that it is
+   announced as **Enable <event name>**, checkbox, with its state, that one
+   request turns the event off or on, that focus stays on the checkbox and the
+   result is announced once. Make the server refuse (for example an event whose
+   dates have passed) and check that the checkbox returns and the reason is said.
+   Stop the station while an event menu is open. Run now must stay focusable,
+   send no request on mouse, Enter, Space or type-ahead followed by Enter, and
+   announce "Start the station to run this event now" on each attempt.
+3. Escape from an open menu. Check focus returns directly to the cell it opened
+   from (the Actions cell, the focused cell or the clicked cell) and the expanded
+   state becomes false. In NVDA, check that opening says only the menu and its
+   first item, without the Actions cell or button name (if NVDA names the cell,
+   it says **Options for <row name>** once, never followed by the menu's name), that NVDA's focus ends on
+   that item rather than the menu, and that a single Escape closes the menu
+   without switching to browse mode. Press Left and Right immediately and
+   confirm cell movement without toggling NVDA mode. Repeat after cancelling
+   Delete and after a completed menu action. Tab and Shift+Tab must close the menu without
+   trapping focus or exposing its hidden items in the page Tab sequence.
+   An outside click closes it; opening another row's menu leaves only one open.
+4. Open an editor, cancel it, reopen it and save. Check field labels, dirty-edit
+   confirmation, error focus, pending-save guards and direct return to the row's
+   action cell. Opening should focus the requested first field directly, without
+   an intermediate field, dialog or form focus and repeated opening announcement.
+   Its opening description should contain short help,
+   never read all field labels, options, buttons or status text together. Repeat
+   after another update removes the original row.
+5. Refresh and reorder rows with a cell focused, and again with a menu open.
+   Check preserved focus and current action data. Remove the focused row and
+   then the final row; verify the destination and exactly one status announcement.
+6. In saved Clockwheels, act on a row while another wheel is open. Verify the
+   selected row owns Duplicate, Rename, Activate/Turn off and Delete. With unsaved
+   work open, Duplicate must name that wheel in its discard confirmation;
+   declining must preserve the working copy. Create a wheel and verify its row
+   says Not saved. Its Options, Delete must ask before discarding it and must
+   not send a DELETE request for an unsaved file. In steps,
+   test Alt+Up/Down, Delete and Undo, including deletion of the last step. Check
+   Ctrl+Z still edits text normally in fields. Check **New clockwheel name** has
+   short help naming both Create and Import .PAL; Create prefills its editable
+   Name dialog. Clear the panel's name, open a saved wheel, and check it stays
+   empty. Type a new name and repeat; preserve the exact text after Open, Save,
+   Create, Import .PAL, Duplicate and Rename. Duplicate starts with its own empty
+   Name; Rename starts with the selected saved wheel's name. Check saved
+   wheels show Name, Active and Actions, and steps show Step and Actions. Each
+   Step cell reads its number and full sentence, such as "1. music from Rock,
+   least recently played", with track and preset targets, ad-break spot and
+   seconds limits, picking mode, rules and hours when they apply.
+7. Repeat in Light and Dark. Run axe's WCAG 2.2 A/AA rules; measure collection
+   button/menu targets at least 24 CSS pixels wide and 44 CSS pixels high,
+   text/control contrast and visible, unobscured focus.
+   Check 320-pixel reflow, 400% zoom, 200% text, text spacing and forced
+   colors, including visible table captions. Menus must
+   stay visible and usable near viewport and scroll-container edges.
+8. Select Settings, then Tab forward from Skip to main content. The selected
+   Settings tab must be the main strip's only Tab stop. Repeat for Library tools,
+   after mouse, shortcut and restored selection, and with NVDA browse-mode
+   Ctrl+Home then Tab. Follow [Tab entry with NVDA](#tab-entry-with-nvda) for
+   Settings' three groups, including groups without a selected tab.
+
+Record automated browser and axe results separately from real screen-reader
+speech. Sample NVDA in Chrome and Firefox, including table/menu/dialog transitions,
+disabled reasons, removed-row focus and Undo. Record revision, OS, browser and
+screen-reader versions, exact flows and defects, speech-capture method and whether
+a person listened. Unperformed platform or speech checks remain explicit limits.
+
+For the remaining collection panels, repeat the keyboard and speech checks above:
+
+- Categories and intro rules: Edit, first in Options, opens on Name, errors retain
+  the field's help, and Save returns to the saved row's Actions cell. Delete
+  returns to that cell when cancelled and a nearby row or Add when confirmed.
+- Matched intros: Add intro opens on Audio file. Upload returns to the saved
+  row's Actions cell. The Listen item reads Stop listening until the clip is
+  stopped or ends; Remove confirms before deletion. Check both song and artist
+  tables.
+- Liner files: Play dates, first in Options, opens its editor; Save and Cancel
+  return to the row's Actions cell. The menu also offers Track info and Delete,
+  with readable restrictions for legacy entries.
+- Ads: Edit opens the spot or break editor. Options contains Delete and, for
+  breaks, Run now. Check booked-spot and station restrictions. The delivery
+  report's Totals and Every spot are plain tables with row headers in Tab-reachable
+  scrolling regions: read them with NVDA's browse-mode table keys, and check an
+  empty report hides both.
+- Profiles and Browser access: test Activate and Rename, first in Options, then
+  Reset/Delete or Revoke access/Forget. Cancelled confirmations and a renamed
+  device return to the row's Actions cell, with the new name.
+
+These are procedures to perform, not records of completed platform testing.
+
 ## Continuous integration
 
-Add/Edit forms for categories, intro rules, scheduled events, ad spots and ad
-breaks use `editor-dialog.js`. Keep feature validation and API operations in
+Add/Edit forms for categories, intro rules, scheduled events, clockwheel steps,
+ad spots and ad breaks, matched-intro uploads, liner play dates and browser
+renaming use `editor-dialog.js`. Migrated collections use it for
+all add/edit operations. Keep feature validation and API operations in
 their panel; pass the save callback the controller's current-request guard and
 check it after every await before changing the UI. Close the controller when
 station or authentication state is cleared. Save closes onto the saved row's
-Edit control; Cancel and Escape return to the opener, asking before discarding
-changed fields. A pending save prevents another submission or dismissal.
+Actions cell in a shared collection table; Cancel and Escape
+return to the opener, asking before discarding changed fields. A pending save
+prevents another submission or dismissal.
+Preserve caller-provided short help as the dialog description. Otherwise the
+shared editor supplies "Use Tab to move between fields and actions." An explicit
+description avoids NVDA deriving one from the form. Do not describe the dialog by its whole form or
+live status region. Fields retain their individual labels and error/help links.
+Opening assigns focus to the requested field once; do not focus another field,
+the form or the dialog first. Test the opening focus sequence separately from
+speech: a DOM focus assertion cannot establish how often NVDA speaks a title.
 
-Use the dialog's own status region while it is open. `showEditorError` places
+Use the dialog's own status region while it is open. `showFieldError` places
 the error beside its field and links and focuses it; it announces separately
 only when focus cannot convey the error. Each editor owns its dialog and draft,
 so opening a second editor preserves the first. Test this with nested dialogs,
@@ -364,8 +610,10 @@ The visual audit (`npm run audit:visual`, part of `audit:ci`) loads every view a
 Checkboxes and radio buttons are a deliberate exception to the authored control-boundary rule. In the default color mode they keep the browser and operating system's native appearance; AutoDJ does not replace that appearance or draw a custom border. The forced-colors rules may apply system colors such as `CanvasText` and `Highlight`, but they do not disable the native appearance. Test both checked and unchecked states during release sampling when a sampled flow contains these controls.
 
 Settings > Station > Stations is audited again with a refused New station request from a stood-in server.
-The error must appear beside Station ID, link to that field, and move focus there. Each browser
-must keep a refused create silent apart from the focused field. A stood-in successful create
+The error must appear beside Station ID and link to that field. Submitting from the Create
+button must move focus to Station ID without repeating the error in the status region.
+Submitting with Enter while Station ID already has focus must keep focus there and announce
+the same error once through the shared status helper. A stood-in successful create
 must announce once in the panel's status region and move focus to Switch. The audit never
 creates a station; the stand-in answers every create request.
 
@@ -444,7 +692,7 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   between tabs says the tab's name and "selected" once, not "selected selected".
 - Settings subtabs: the arrow keys, Home and End move between them and skip Stream outside
   stream mode; clicking one moves focus to its panel's heading; the page reopens on the last
-  one used; and Profiles and access loads its lists when shown.  Settings that have no
+  one used; and Station, Profiles and Global, Server load their collection tables when shown.  Settings that have no
   effect stay hidden, for example the DJ-mix options with saved segue points.
 - Playback controls, seeking, volume, and the spoken hotkeys.
 - Search, queue additions, reordering, removal, and empty states.
@@ -461,7 +709,7 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   radio group read with its name, its help available through browsing, a choice said as the checked radio button and
   nothing more, and the visible status message's Dismiss button reachable without it being
   announced along with the message.
-- Settings, Profiles and access: renaming a device (focus back on its Rename, the new name said
+- Settings, Global, Server: renaming a device (focus back on its Rename action cell, the new name said
   once), and Show pairing code (the code said once, the countdown silent, a device that pairs
   meanwhile said once, and the used code hidden with focus on Show pairing code).
 - Library-job status and review of the persistent output log. Leave a job running for several
@@ -480,7 +728,8 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   Opus quality read with their help, a choice saved once it settles and said once ("Opus stream
   on at 64 kbps."), the address list read as plain text with a named Copy button for each
   format; Listener statistics read by heading, the summary as one paragraph, both tables with
-  their captions and column headers (table navigation reads each cell with its column and row),
+  their captions and native column headers (arrow moves add the column heading and
+  available row context to plain data cells),
   the session lengths as a list, Refresh statistics, Show and Days to keep each said once, and
   nothing said while the tables are being read.
 - DMCA mode (on in Settings > Station > Broadcasting): the "DMCA mode is on" line under the feed links read as
@@ -516,7 +765,9 @@ Before every release, each flow below must be sampled with either NVDA and Firef
 - Settings, Station, Stations (#233): browse the station list and read New station fields with their short
   labels. Station ID includes its format hint. Choosing a copy reveals Also copy as a group of
   three checkboxes; choosing AutoDJ defaults hides that group and its help. A refused ID or name
-  is read once with focus on its field. Create station says "Created <name>, off air." once and
+  is read once with focus on its field. Check both submission from Create station and Enter
+  from the refused field: the latter keeps focus and says the error through the status region.
+  Create station says "Created <name>, off air." once and
   focuses Switch; Switch focuses the Station button, now named after the new station.
 - The listener request page (`/requests`), without JavaScript:
   - The search field is read with its label. A refused search is read with its error, and the
@@ -525,11 +776,15 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   - The confirmation is read with the song and the optional name field, with its hint.
   - Each answer page's title and first heading say what happened.
 - Queue & Search, Listener requests: the card is read with its summary.
-  - Each waiting request is read with who sent it, when, and where it would fit. Approve,
-    Play next and Turn down are each read with the song's name.
+  - Waiting requests expose Song, Requested ("by <name> at <time>") and Fit columns and an
+    Actions column whose Options for the song contains Approve, Play next and Turn down. Unavailable
+    Approve stays reachable and explains why. Recent decisions are a read-only table.
+    Turn down asks before rejecting; Cancel retains the request and restores focus.
   - A button's result is said once, and focus moves to the next request, or to the card's heading
     when none is left. A refused Approve says why.
-  - A refresh that finds a new request says nothing.
+  - A refresh that finds a new request says nothing. Hold an older refresh reply
+    until after Approve, Play next or Turn down succeeds; its late arrival must
+    not restore that request to Waiting or replace the successful decision.
 - The player page (`/player`) and the embeddable player (`/embed`, also inside an `<iframe>` with
   a title on another page): Play read as a button, pressing it saying "Connecting to the stream."
   and "Playing." once each and the button then read as Stop; Stop saying "Stopped." with focus
@@ -542,13 +797,15 @@ Before every release, each flow below must be sampled with either NVDA and Firef
 - Library tools, folder table: arrow onto each checkbox and hear its name and checked state;
   toggle it once, keep focus while saving and after the next poll, and confirm only one save.
   After a failed save, check that the saved value is restored and focus stays on the checkbox.
-  Search and History action cells focus their buttons and announce the button role without
-  repeating the track name; returning from Track info leaves arrow navigation working.
+  Search and History action cells retain cell focus; returning from Track info
+  leaves arrow navigation working. An action in a cell that also has an input
+  returns to the cell, while an explicitly targeted input retains native focus.
 - Queue & Search, browsing: Tab to Type, Folder, Search text and Search; one result grid with
   arrows, Home and End, and Enter or Space activating each action; the track count said once per
   search and page, with focus staying on Previous or Next (or moving to the other when a page ends);
-  and Track info returning focus to its result. Under Settings > Voice liners, check Delete and
-  Play dates with focus moving to the next liner or the list.
+  and Track info returning focus to its result. Under Settings > Voice liners, check Options, Play dates and Options, Delete.
+  Saving or cancelling dates returns to the row's Actions cell. Confirmed deletion
+  moves to a nearby row or the panel fallback and announces the destination.
 - Track info, Tags: each field read with its label and, for Year, BPM, Key and ISRC, its help;
   Save tags with a refused field marking it invalid, focusing the first one and reading its
   error; a save said once with focus staying on Save tags; and switching tracks with unsaved tags
@@ -557,9 +814,9 @@ Before every release, each flow below must be sampled with either NVDA and Firef
 - Library tools, Categories: Add category and Edit landing on Name; the source radio buttons
   showing the query or the playlist field; Check saying the count once while the count line
   stays silent; a missing name or a refused query said once, marked invalid and focused; Save
-  saying the count once and landing on the category's Edit button; Cancel returning to the
-  button that opened the form; Delete naming the clockwheels that use the category and landing
-  on the next Edit button or Add category; and the list never spoken on its 15-second refresh.
+  saying the count once and landing on the category's Actions cell; Cancel returning to the
+  opening cell or Add category; Options, Delete naming the clockwheels that use the category
+  and landing on a nearby row or Add category; and the table never spoken on its 15-second refresh.
   In Clockwheels, a Music condition with Field Category showing the named Category choice;
   multiple categories read with the chosen Match all/any; a legacy category step opening as
   Music with its category selected; a missing category named as unavailable; Category absent
@@ -571,23 +828,45 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   condition once none are left; an invalid value or duration marked invalid and focused; Match
   all/Match any and every condition read in the step summary; and saved values and keyboard focus
   preserved when folder, genre or Beets choices refresh, with an open genre list left alone.
-- Library tools, Clockwheels, the step list: Tab into the list turning on NVDA's focus mode on
-  the first step name (a grid cell, not a button); Up and Down moving between names and Left,
-  Right, Home and End along a row without leaving focus mode; Enter and Space pressing the focused
-  cell's button; Alt+Up and Alt+Down moving the step and saying its new position once; and the
-  Delete key behaving like the Delete button; Delete and Undo disabled while a step is being
-  edited, with its unsaved fields preserved; Undo step change and Ctrl+Z restoring the step and
-  its focus, including after deleting the last step; and Ctrl+Z still undoing text in inputs.
-- Library tools, Shows: Add show and Edit landing on Name; a refused field marked invalid, its
-  error read with it and focused; Open list moving focus to the list heading and saying the total
-  once; each song's Move up, Move down and Remove buttons named with the song, focus staying on
-  the moved song's button with its new number said once, Move up on the first song read as
-  unavailable and saying why; Remove moving focus to the next song, or the previous one after the
-  last (the search box when none is left); the list buttons unavailable while it is generated; a
-  song listed twice read with its warning; Search
-  results with their Add buttons, the added song said once; Generate list saying the result once
-  with focus kept on the button; Stop show leaving focus on Add show; and nothing said by the
-  15-second refresh or a song change, and a failing refresh said once.
+- Settings, Schedule and Library tools, Clockwheels: follow the
+  [collection-table procedure](#collection-tables), including named columns,
+  one table Tab stop, Options menu navigation and editor focus restoration.
+  Saved clockwheel actions must name and affect their row, even while another
+  wheel is open. Upcoming and Runs must expose their data without action menus.
+- Library tools, Clockwheels, the step table: Tab enters a plain grid cell with
+  no row-header announcement; arrows, Home/End and Ctrl+Home/End navigate its Step
+  and Actions columns. Enter/Space in the Actions cell, Shift+F10 or the
+  Applications key opens Options, whose first item is Edit. Alt+Up/Down
+  moves the step and says its new position once. Delete behaves like Options,
+  Delete, with Undo and no confirmation. Disabled menu actions remain reachable
+  and explain their reason. Undo step change and Ctrl+Z restore the step and its
+  focus, including after deleting the last step; Ctrl+Z still undoes text in inputs.
+- Library tools, Shows: Add show and Options, Edit open the shared dialog on Name;
+  check validation, dirty cancellation and focus return. Open list moves to its heading
+  and says the total once. Each song's Options has Track info, Move up, Move down
+  and Remove; Alt+Up/Down reorder the focused song. Move up on the first song remains
+  reachable and explains why it is unavailable. Remove confirms and moves focus to a
+  remaining song or the search field. Preserve generation restrictions, duplicate-song
+  warnings and quiet refresh. Search results have Options with Add and Add to edition.
+  Check Generate list and Stop show announcements and focus as before.
+- Prepared editions: occurrences and takes each have one table Tab stop. A take's
+  Options contains Listen, Re-record, Review, Approve, Reattach and Remove.
+  Check disabled reasons, receipt-dependent approval, confirmed removals and the
+  Reattach Position dialog's cancel/save focus return. Verify reordering preserves
+  distinct repeated-song occurrences and existing take bindings. During a pending
+  edition save, Remove must remain reachable with its wait reason and send no
+  delete request, including if the save begins after its confirmation opens.
+  After a station or session change, reopening the edition must allow new saves;
+  completion of the old request must not change the new edition view.
+- Queue: Track info returns to its original row or the named queue fallback. Options
+  owns Move to top, Move up, Move down and confirmed Remove; Clear queue still confirms.
+  Check optimistic reordering, rejected-change rollback, duplicate songs, live voice
+  conflict choices and keyboard refusal when the station is stopped.
+- Voice-track bookings: the shared table shows at most 50 bookings. Options, Cancel
+  opens "Cancel this booking?"; cancellation returns to its row, and unavailable
+  cancellation retains its reason. Refresh must retain row identity and focus.
+  If refresh removes a booking while cancellation fails, retain the visible error
+  and associate it with the focused Voice tracks heading.
 - EQ: each band's slider, its spoken value, and resetting the bands.
 - History: the History tab's table read with table navigation, its pagination, the empty state,
   and a new song added to the top of page 1 without the reading position moving or anything said.
@@ -605,6 +884,21 @@ Before every release, each flow below must be sampled with either NVDA and Firef
   position, and "Hour preview finished" said once.
 
 For that release, record the date, exact screen reader and browser versions, flows sampled, results, and defects found. Keep this record with the release evidence so readers can find any limits or unresolved defects.
+
+For the opt-in local programme prototype, sample Take local control and Return
+to automation with Tab, Enter and Space. Both native buttons remain mounted and
+keep focus when their availability changes. Verify the visible status and one
+polite announcement per ownership state change, including refusal and recovery;
+refreshes must not repeat announcements. Check both themes, focus visibility and
+minimum target size. The automated Chromium/axe and signal audit is
+`node tests/playwright/local_programme_prototype_audit.mjs`, run after installing
+Chromium and FFmpeg. The Playwright stream-audit CI job runs it and uploads the
+report directory. Set `LOCAL_PROGRAMME_AUDIT_ROOT` to choose that directory;
+the default is `test-results/local-programme-prototype`.
+Its page shell uses production markup and owner controls, a synthetic catalog,
+and real Player/SQLite/mix-bus/FFmpeg components. It does not establish normal
+application startup or screen-reader speech. NVDA capture for this prototype is
+assigned to the reviewer; no speech result is inferred from axe or DOM checks.
 
 Do not claim support or verified behavior for NVDA, JAWS, VoiceOver, screen readers generally, or assistive technology generally unless the exact screen-reader/browser pairing and flow named in the claim were tested and recorded. Results from one pairing or flow do not transfer to another.
 
@@ -635,3 +929,12 @@ candidate revision. Check these flows with the real station:
 
 Capture NVDA speech, keyboard focus and actual heard joins separately. Do not
 infer an aired take from an estimate or a previous run's lost temporary booking.
+
+### Initial collection state and announcement lifetime
+
+Before the first collection request completes, verify a spanning `.no-results`
+row is present rather than headers alone. When the last focused row disappears,
+verify the announcement names the actual fallback control, including a labelled
+input such as Profile name. A later persistent focus announcement must survive
+the previous action message's dwell timer. The collection-table and live-region
+unit tests cover these regressions; browser/speech evidence remains separate.

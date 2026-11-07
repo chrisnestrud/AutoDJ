@@ -317,14 +317,88 @@ The browser UI uses native HTML and shared rules in
 `src/autodj/static/app.css`. Use `.card` for a grouped surface,
 `.settings-row` for a label and its control, `.setting-desc` for visible help,
 `.field-error` for an error stated in text, and `.no-results` for an empty
-list. Use `.dialog-actions` for a right-aligned, wrapping button row. These
-patterns preserve source and keyboard order; keep action-list rows aligned with
-their labels, and keep purpose-specific layouts such as the clockwheel step
-grid and dense tables local to their feature. Reuse the existing theme and
-spacing tokens, and keep native focus, forced-colors, and narrow-screen
-behavior in view.
+list. Use `.dialog-actions` for a right-aligned, wrapping button row.
+Collections, including clockwheel steps and dense data tables, use the shared
+`.collection-table` class and `modules/collection-table.js`, built on `tableRow`
+and `installTableNavigation`. Keep one Tab stop and only columns an operator
+scans or compares down the table; fold secondary facts into one cell sentence.
+A row with actions ends in one **Actions** column holding only its **Options for
+<row name>** menu button; the menu lists every action, the most used first, and
+Shift+F10, the Applications key and right-click open it too. NVDA says no table
+headings in focus mode, so a moved-to data cell is named by its text, then the
+column heading when the column changed, then the row's name when the row
+changed (#712); clear this temporary name on focusout. Control cells retain
+their own names. Escape and actions that leave focus alone return to the cell
+the menu opened from, and cancelled confirmations to the Actions cell, so arrow
+navigation continues. Standalone menus
+return to their buttons. Editor descriptions contain short help only, never the
+whole form or its live status region. Opening an editor focuses its requested
+field directly, without an intermediate focus target. In tab strips, the selected
+tab is the sole Tab stop, including after click, shortcut or restored selection.
+Use the shared `tablist.js` entry guard too: screen-reader browse mode can focus
+negative-tabindex tabs. Outside focus enters on the selected tab, or the first
+visible tab in a Settings group without a selection. Preserve pointer activation,
+browse-mode focus-then-click activation and internal arrow/Home/End navigation
+([ADR 11](docs/adr/0011-verify-accessibility-with-browser-and-speech-evidence.md#amendment-2026-10-31-browse-mode-tab-entry)).
+Use `createEditorDialog` for add/edit and `deleteCollectionItem` for removal:
+confirm unless the screen offers Undo. Empty tables contain one `.no-results`
+row spanning every column, drawn by the builder before the first asynchronous load.
+Disabled row actions remain focusable with
+`aria-disabled` and explain why when activated. Read-only tables need no menu.
+The cart wall and text-only lists remain exceptions. See
+[ADR 21](docs/adr/0021-unify-collection-tables.md) for the contract and phased
+migration. Reuse theme and spacing tokens. Collection buttons and menu items
+must be at least 24 CSS pixels wide and 44 CSS pixels high. Preserve visible
+focus, forced-colors and narrow-screen behavior.
+
+### Shared browser helpers
+
+Use one shared implementation for each browser-page job, including older screens
+when they are touched. Do not add local copies of these helpers:
+
+- `dom-helpers.showFieldError` and `clearFieldError` own invalid state, visible
+  `.field-error` text and description links. Preserve existing help. Map server
+  `field` keys with `applyServerFieldError(error, fieldMap, errorNode, status)`;
+  unknown keys fall back to the ordinary failure message. Use `{ focus: false }`
+  only when an existing dialog or background workflow must keep its focus.
+- `api-client.withDisabled(control, operation, { pendingText, say, signal })`
+  owns pending CSS, `aria-busy`, control restoration and delayed progress words.
+  It preserves focused-button accessibility and serializes focused native input
+  changes. Keep feature-specific duplicate submission and stale-response guards.
+  Abort the presentation hold when its view clears; aborting does not undo a write.
+- `live-region.makeSay(region, options)` creates status announcers. Pass string
+  tones such as `"info"`, `"success"` and `"error"`, never booleans. A region resolver
+  can choose the active dialog. It delegates repeat handling and toasts to
+  `announceStatus`; do not copy timers or no-break-space toggles. Passive state
+  displays may update quietly without announcing each poll.
+- `api-client.failureText(action, error)` formats request failures and recognizes
+  stale station replies. Preserve action wording when migrating callers. Keep
+  actionable field refusals with their controls instead of flattening them into
+  generic failure text.
+- `standalone-settings.createSettingsSave` owns the single-flight lifecycle of
+  explicit standalone settings saves. Supply the feature's endpoint/validation
+  in its save callback and clear the controller on authentication/view reset.
+  Existing Settings draft groups retain `registerSettingsGroup`; individual
+  record editors retain `createEditorDialog`.
+- `card-state.onCardOpen(card, refresh, { onClose })` owns toggle-to-refresh wiring.
+  It ignores nested card toggles and does not perform an initial refresh. Keep
+  initial loading and long-running polling policy with the feature.
+- Status-region markup uses `role="status" aria-live="polite" aria-atomic="true"`.
+  Field errors use `.field-error`, not per-ID color rules or duplicate live alerts.
+  `dialogStatusLine` creates a status region inside an actual dialog only.
 
 ## Where things live
+
+Domain refusals raise the shared `autodj.errors.FieldError`; the app renders
+their public message, field and status. Use `first_issue` for Pydantic errors,
+keeping domain-specific wording in the owning module. File replacement and
+invalid-file recovery use `fsutil.atomic_write` and `fsutil.set_aside`, preserving
+permissions and documented recovery names. See [the error contract](docs/adr/0022-share-public-error-handling.md)
+and [state recovery](docs/adr/0010-preserve-state-through-atomic-writes-and-recovery.md).
+
+CLI usage errors use `click.UsageError` or `click.BadParameter` and exit 2;
+other application failures use `click.ClickException` and exit 1. All write to
+stderr. Setup preserves its child process's exit status.
 
 - `src/autodj/cli.py` — CLI entry points (Click).
 - `src/autodj/server.py` — FastAPI + WebSocket web layer.

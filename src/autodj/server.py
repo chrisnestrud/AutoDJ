@@ -55,7 +55,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, Literal
+from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, Literal, cast
 
 from fastapi import (
     FastAPI,
@@ -67,7 +67,6 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import (
@@ -85,7 +84,7 @@ from starlette.convertors import Convertor, register_url_convertor
 from starlette.datastructures import Headers
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.staticfiles import NotModifiedResponse
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 # PlayerBridge lives in autodj._bridge; it is re-exported here.
 from autodj._bridge import LibraryServices, PlayerBridge
@@ -99,7 +98,7 @@ from autodj.breaks_api import (
     VOICE_UPLOAD_PATH,
 )
 from autodj.breaks_api import MULTIPART_OVERHEAD_BYTES as BREAK_MULTIPART_OVERHEAD
-from autodj.catalog import ADVANCED_MAX_MINUTES_LIMIT
+from autodj.catalog import ADVANCED_MAX_MINUTES_LIMIT, normalize_path
 from autodj.config import AdsConfig, BreaksConfig
 from autodj.icy import METAINT
 from autodj.indexer import analysis_identity
@@ -139,6 +138,9 @@ from autodj.security import (
     emit_audit,
     new_request_id,
     peer_address,
+)
+from autodj.security import (
+    advertised_server_origin as _advertised_server_origin,
 )
 from autodj.station_log import (
     CURRENT_STATION,
@@ -446,26 +448,6 @@ async def _broadcast_state_once(
 # Moved to autodj.stations; still importable from here.
 _quiesce_cache_writers = quiesce_cache_writers
 _tick_stream_workers = tick_stream_workers
-
-
-def _advertised_server_origin(policy: SecurityPolicy) -> str:
-    """Choose one browser URL accepted by both transport and request policy."""
-    from urllib.parse import urlsplit
-
-    expected_scheme = "https" if policy.secure_cookie else "http"
-    for origin in policy.effective_allowed_origins():
-        parsed = urlsplit(origin)
-        origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        if (
-            parsed.scheme == expected_scheme
-            and origin_port == policy.config.port
-            and policy.host_allowed(parsed.netloc)
-        ):
-            return origin
-    raise ValueError(
-        "server.allowed_origins must include an allowed origin whose hostname is "
-        "present in server.allowed_hosts and whose scheme and port match server TLS/bind"
-    )
 
 
 # Browsers get index.html fresh every time; scripts and the stylesheet
@@ -1002,6 +984,9 @@ def create_app(
     extra_stations: Sequence[ExtraStation] = (),
 ) -> FastAPI:
     """Create the server with shared library services and station factories."""
+    from autodj.runtime_packages import require_runtime_packages
+
+    require_runtime_packages()
     _lyrics_read_gate = asyncio.Semaphore(1)
     install_log_prefix()
     cfg = services.cfg
@@ -1042,6 +1027,7 @@ def create_app(
         library = SharedLibrary(shared.library, stations)
         await stations.start_all()
         await library.start()
+        app.state.acme.start()
         STARTUP_COMPLETE.set()
         logger.info(
             "Startup: stations and background services started in %.2f s (audio readiness logged separately)",
@@ -1077,6 +1063,7 @@ def create_app(
                 previews_stopped,
                 rescan_stopped,
                 reviews_stopped,
+                acme_stopped,
             ) = await asyncio.gather(
                 # A Library tools job is a child process: stop it as its Stop
                 # button does, so a restart does not leave it beside the next server.
@@ -1095,9 +1082,12 @@ def create_app(
                 stopped("stopping hour previews", getattr(app.state, "hour_previews", None)),
                 stopped("stopping the cue rescan", getattr(app.state, "cue_rescan", None)),
                 stopped("stopping review jobs", getattr(app.state, "review_jobs", None)),
+                stopped("stopping ACME", getattr(app.state, "acme", None)),
             )
             if job_was_running:
                 logger.info("Stopped the running library job")
+            if not acme_stopped:
+                logger.warning("ACME worker did not stop within its shutdown deadline")
             if not speech_stopped:
                 logger.warning(
                     "Speech worker is still stopping; pending requests will not be retried"
@@ -1173,36 +1163,10 @@ def create_app(
 
     app.state.cue_rescan = CueRescan()
 
+    from autodj.api_errors import install_error_handlers
     from autodj.speech_api import SPEECH_BODY_LIMIT, WRITE_ROUTES, install_speech
 
-    @app.exception_handler(RequestValidationError)
-    async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
-        """Return a 422 whose body is always JSON-encodable.
-
-        FastAPI's default handler echoes the rejected input back to the
-        client.  A rejected ``NaN``/``Infinity`` cannot be re-encoded, so the
-        echo itself would raise and turn a validation error into a 500.  Only
-        the type, location and message are returned.
-
-        Errors marked ``reports_field`` answer
-        with their message and ``field`` so the editor can focus that input.
-        Other validation errors keep the list format.
-        """
-        for error in exc.errors():
-            cause = (error.get("ctx") or {}).get("error")
-            named = getattr(cause, "field", None)
-            if getattr(cause, "reports_field", False) is True and isinstance(named, str) and named:
-                message = str(getattr(cause, "message", "") or cause)
-                return JSONResponse(status_code=422, content={"detail": message, "field": named})
-        detail = [
-            {
-                "type": str(error.get("type", "")),
-                "loc": [str(part) for part in error.get("loc", ())],
-                "msg": str(error.get("msg", "")),
-            }
-            for error in exc.errors()
-        ]
-        return JSONResponse(status_code=422, content={"detail": detail})
+    install_error_handlers(app)
 
     def _liner_upload_max_bytes() -> int:
         return (
@@ -1361,12 +1325,35 @@ def create_app(
     # lives on a NAS mount and the file is ~80 KB.
     try:
         _index_html_cache = _static_html_path.read_text(encoding="utf-8")
+        if cfg.server.local_programme_enabled:
+            # Available before scripts or gestures can create the shared context.
+            _index_html_cache = _index_html_cache.replace(
+                '<html lang="en">', '<html lang="en" data-local-programme-enabled="true">', 1
+            )
     except OSError as exc:  # pragma: no cover -- only when the package is corrupt
         logger.error("Could not read %s at startup: %s", _static_html_path, exc)
         _index_html_cache = (
             "<!doctype html><meta charset=utf-8>"
             "<title>AutoDJ unavailable</title>"
             "<p>Web UI files missing — see server log.</p>"
+        )
+
+    from html import escape as escape_html
+
+    from autodj.runtime_packages import missing_runtime_packages
+
+    optional_packages = missing_runtime_packages(include_extras=True)
+    if optional_packages:
+        warning = (
+            "Optional Python packages missing or too old: "
+            + ", ".join(p.name for p in optional_packages)
+            + ". Run `autodj doctor --fix` to repair the installed profile."
+        )
+        _index_html_cache = _index_html_cache.replace(
+            '<p id="runtime-package-warning" role="status" hidden aria-live="polite" aria-atomic="true"></p>',
+            '<p id="runtime-package-warning" role="status" aria-live="polite" aria-atomic="true">'
+            + escape_html(warning)
+            + "</p>",
         )
 
     @app.get("/", response_class=HTMLResponse)
@@ -2173,10 +2160,10 @@ def create_app(
         """Return the embedded album art for a track (304 if unchanged)."""
         # Only serve art for tracks that exist in the index — prevents
         # arbitrary file access through the path parameter.
-        known = shared.entry_for_path(path) is not None
-        if not known:
+        entry = shared.entry_for_path(path)
+        if entry is None:
             raise HTTPException(status_code=404, detail="Track not in index")
-        result = await asyncio.to_thread(shared.cover_art_for, path)
+        result = await asyncio.to_thread(shared.cover_art_for, entry.path)
         if result is None:
             raise HTTPException(status_code=404, detail="No embedded cover art")
         data, mime = result
@@ -2188,7 +2175,12 @@ def create_app(
         authorized_entry = shared.entry_for_path(path)
         if authorized_entry is None:
             raise HTTPException(status_code=404, detail="Track not in index")
-        lyrics = await _read_lyrics_owned(path)
+        # Keep lookup keys opaque; read the authorized entry's filesystem path.
+        # Identity-only entries use the normalized, already-authorized key.
+        read_path = getattr(authorized_entry, "path", None)
+        if read_path is None:
+            read_path = normalize_path(path)
+        lyrics = await _read_lyrics_owned(read_path)
         if shared.entry_for_path(path) != authorized_entry:
             raise HTTPException(status_code=409, detail="Track index changed")
         return {"path": path, "lyrics": lyrics}
@@ -2200,9 +2192,10 @@ def create_app(
     @app.api_route("/api/audio", methods=["GET", "HEAD"])
     async def api_audio(path: str, request: Request) -> Response:
         """Serve indexed audio with byte ranges; ALAC is transcoded to MP3."""
-        if shared.entry_for_path(path) is None:
+        entry = shared.entry_for_path(path)
+        if entry is None:
             raise HTTPException(status_code=404, detail="Track not in index")
-        audio_path = Path(path)
+        audio_path = Path(entry.path)
         try:
             metadata = await asyncio.to_thread(audio_path.stat)
         except OSError:
@@ -2823,6 +2816,9 @@ def create_app(
         policy,
         allow_lan_plain_http=bool(getattr(cfg.server, "live_plain_http_lan", False)),
     )
+    from autodj.local_programme_routes import install_local_programme_routes
+
+    install_local_programme_routes(app, policy)
 
     def prepare(station: StationRuntime) -> None:
         """Wire a station that is about to start to this app."""
@@ -3192,6 +3188,14 @@ def _apply_time_settings(cfg: AutoDJConfig, library: Any) -> None:
     timefmt.time_format = "12" if catalog.get_setting("time_format") == "12" else "24"
 
 
+@dataclass(frozen=True)
+class ServePreflight:
+    """Successful CLI safety checks, retained through the startup write phase."""
+
+    tls_context: ssl.SSLContext | None
+    advertised_origin: str
+
+
 def serve(
     cfg: AutoDJConfig,
     sim: SimilarityIndex,
@@ -3202,6 +3206,7 @@ def serve(
     stream: bool | None = None,
     lan_configured_hosts: list[str] | None = None,
     library: LibraryManager | None = None,
+    preflight: ServePreflight | None = None,
 ) -> int | None:
     """Start the Player thread and the FastAPI/uvicorn web server.
 
@@ -3231,6 +3236,9 @@ def serve(
     a :class:`~autodj.tls.CertificateReloader` then loads renewed files into
     the running server.
     """
+    from autodj.runtime_packages import require_runtime_packages
+
+    require_runtime_packages()
     started = time.perf_counter()
     from dataclasses import replace
 
@@ -3238,8 +3246,6 @@ def serve(
 
     from autodj.config import StationSpec, validate_server_exposure
     from autodj.stereo import configure_spill_dir
-
-    configure_spill_dir(cfg.index.index_dir)
 
     # One exact search per pick: OpenMP's thread pool makes it slower (27 ms
     # on one thread against 41 ms on four, measured on 77k tracks) and
@@ -3249,13 +3255,23 @@ def serve(
     host = cfg.server.host if host is None else host
     port = cfg.server.port if port is None else port
     staged_server = replace(cfg.server, host=host, port=port)
-    validate_server_exposure(staged_server)
+    from autodj.library import require_configured_library
+    from autodj.tls import validate_tls_pair
+
+    if preflight is None:
+        validate_server_exposure(staged_server)
+        advertised_origin = _advertised_server_origin(
+            SecurityPolicy(staged_server, secure_cookie=staged_server.ssl_certfile is not None)
+        )
+        tls_context = validate_tls_pair(staged_server)
+        require_configured_library(cfg)
+    else:
+        tls_context = preflight.tls_context
+        advertised_origin = preflight.advertised_origin
+    configure_spill_dir(cfg.index.index_dir)
     ssl_certfile = staged_server.ssl_certfile
     ssl_keyfile = staged_server.ssl_keyfile
     secure_cookie = ssl_certfile is not None
-    advertised_origin = _advertised_server_origin(
-        SecurityPolicy(staged_server, secure_cookie=secure_cookie)
-    )
     cfg.server = staged_server
     host = staged_server.host
     port = staged_server.port
@@ -3265,7 +3281,7 @@ def serve(
     from autodj.library import LibraryManager
 
     if library is None:
-        library = LibraryManager(cfg, sim)
+        library = LibraryManager(cfg, sim, compatibility_checked=True)
     _apply_time_settings(cfg, library)
     timezone = cfg.station.timezone or system_timezone()
     default = cfg.default_station or StationSpec(slug=DEFAULT_SLUG, autostart=True, cfg=cfg)
@@ -3405,10 +3421,11 @@ def serve(
         certfile, keyfile = ssl_certfile, ssl_keyfile
 
         def _watched_ssl_context(
-            _config: object, default_factory: Callable[[], ssl.SSLContext]
+            _config: object, _default_factory: Callable[[], ssl.SSLContext]
         ) -> ssl.SSLContext:
             """Build uvicorn's context and reload renewed certificate files into it."""
-            context = default_factory()
+            assert tls_context is not None
+            context = tls_context
             reloader = CertificateReloader(context, certfile, keyfile)
             app.state.certificate_reloader = reloader
             reloader.start()
@@ -3426,7 +3443,30 @@ def serve(
     #
     # uvicorn.Server rather than uvicorn.run: Settings, Updates' Restart
     # (autodj.updates_api) stops this server through app.state.server_exit.
-    server = uvicorn.Server(uvicorn.Config(app, **uvicorn_kwargs))
+    transport_app: ASGIApp = app
+    if cfg.server.local_programme_enabled:
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        from autodj.local_programme_routes import RawPeerMiddleware
+
+        # Capture protocol provenance before Uvicorn rewrites client/scheme.
+        # The opt-out path above retains Uvicorn's existing middleware setup.
+        # Uvicorn and Starlette annotate the same ASGI protocol with different
+        # dictionary types. Adapt those annotations at this tested boundary.
+        proxy_app = cast(ASGIApp, ProxyHeadersMiddleware(cast(Any, app), trusted_hosts=allow))
+        transport_app = RawPeerMiddleware(
+            proxy_app,
+            proxy_configured=bool(
+                cfg.server.trusted_proxies or os.environ.get("FORWARDED_ALLOW_IPS")
+            ),
+        )
+        uvicorn_kwargs["proxy_headers"] = False
+        uvicorn_kwargs["ws_max_size"] = 65536
+        uvicorn_kwargs["ws_max_queue"] = 4
+        # The installed sans-I/O implementation ignores ws_max_queue. Select the
+        # bounded receiver explicitly for this opt-in experiment.
+        uvicorn_kwargs["ws"] = "websockets"
+    server = uvicorn.Server(uvicorn.Config(transport_app, **uvicorn_kwargs))
 
     def _server_exit() -> None:
         server.should_exit = True

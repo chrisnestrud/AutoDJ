@@ -16,7 +16,7 @@ import {
   initAuthDialog,
   reconnectWebSocketAfterClose,
 } from "./modules/auth.js";
-import {
+import { failureText,
   captureAuthenticatedRequestEpoch,
   invalidateAuthenticatedRequestEpoch,
   isAuthenticatedRequestCurrent,
@@ -208,6 +208,7 @@ const streamMode = createStreamMode({
   fetchInfo: () => requestJson(pinnedStationApi("/api/stream", listenStation)),
   // The stream never starts before it has the page's volume and mute.
   beforePlay: () => applyPageLevel(),
+  canListen: () => !localOwner.owned && !localOwner.acquiring,
 });
 const relaySettings = installRelaySettings({
   doc: document,
@@ -215,9 +216,9 @@ const relaySettings = installRelaySettings({
   post: (url, body, control, options) => postSettings(url, body, control, options),
   remove: async (url) => {
     try { await requestJson(url, { method: "DELETE" }); return true; }
-    catch (err) { announceStatus(settingsStatus, `Could not remove relay: ${err.message}`, { tone: "error", force: true }); return false; }
+    catch (err) { announceStatus(settingsStatus, failureText("remove relay", err), { tone: "error", force: true }); return false; }
   },
-  announce: (message, error = false) => announceStatus(settingsStatus, message, { tone: error ? "error" : "success", force: true }),
+  announce: makeSay(settingsStatus, { tone: "success" }),
 });
 // Whether the listener has started playback with Play or Pause (or its
 // hotkey), or pressed Listen here, on this page since signing in.  A page
@@ -304,8 +305,7 @@ const liveDesk = installLiveDesk({ doc: document, srStatus: document.getElementB
 const liveSettings = installLiveSettings({
   doc: document,
   request: requestJson,
-  announce: (message, error = false) => announceStatus(settingsStatus, message,
-    { tone: error ? "error" : "success", force: true, dwellMs: 6000 }),
+  announce: makeSay(settingsStatus, { tone: "success", dwellMs: 6000 }),
   onInfo: (info) => {
     liveDesk?.setInfo(info);
   },
@@ -346,6 +346,7 @@ function invalidateReconnectAttempt() {
 // A link that only drops stops nothing (see ws.onclose).
 function stopProtectedPlayback() {
   holdVolumeCeiling();
+  localOwner.stop("Session ended; returning to automation");
   stopAllDecks();
   streamMode.stop();
   stopActiveLiners();
@@ -417,15 +418,16 @@ function clearStationViews({ keepSettings = false } = {}) {
     publicSettings.clear();
     linerControls?.clear();
   }
-  _profileEls.list.replaceChildren();
-  _profileEls.status.textContent = "";
+  // Undefined when the page has no Profiles markup.
+  profileControls?.clear();
+  if (_profileEls.status) _profileEls.status.textContent = "";
   queueAnnounce.textContent = "";
   settingsStatus.textContent = "";
   clockwheelPanelControls?.clearProtectedData();
   introRulesControls?.clear();
   // Shows are the station's own (#106).
   showsPanelControls?.clearProtectedData();
-  schedulerPanelControls?.clear();
+  if (!keepSettings) schedulerPanelControls?.clear();
   rotationTestControls?.clear();
   hourPreviewControls?.clear();
   programmeReviewControls?.clear();
@@ -459,8 +461,9 @@ function clearProtectedSessionData() {
   _pageLevelSet = false;
   applyPageLevel();
   volAnnounce.textContent = "";
-  _accessEls.list.replaceChildren();
-  _accessEls.status.textContent = "";
+  // Undefined when the page has no Browser access markup.
+  accessControls?.clear();
+  if (_accessEls.status) _accessEls.status.textContent = "";
   searchInput.value = "";
   searchInput.dispatchEvent(new Event("input"));
   registeredLibraryFolders = [];
@@ -636,6 +639,7 @@ function applyState(s, { announceTrack = true } = {}) {
   _lastStreamMode = inStream;
   _lastStreamServerAudio = inStream && Boolean(s.stream_server_audio);
   streamMode.apply(s);
+  localProgrammeControls.apply(s);
   streamSettings.apply(s);
   recordingControls.apply(s.stream_mode ? { ...s.recording, available: true } : { running: false, available: false });
   liveDesk?.applyState(s);
@@ -789,7 +793,7 @@ function applyState(s, { announceTrack = true } = {}) {
   // saved volume and mute, never from the slider's 100 % default.  With
   // --server-audio as well they drive the machine's speakers, and this
   // page's listening follows the server's volume and mute.
-  const pageOnlyVolume = inStream && !_lastStreamServerAudio;
+  const pageOnlyVolume = localOwner.owned || (inStream && !_lastStreamServerAudio);
   const takeServerLevel = !pageOnlyVolume || !_pageLevelSet;
   if (takeServerLevel && !volumeSaveHolds(s.volume)) {
     // After the link has dropped, a server volume above the page's own
@@ -1060,6 +1064,10 @@ async function _refreshAudioDevices() {
 
 // Explicit saves use the shared result region; background failures are deduplicated.
 async function _applySink(sinkId, { reportError = true } = {}) {
+  if (localOwner.owned) {
+    if (reportError) announceStatus(settingsStatus, "Return to automation before changing the monitor device.");
+    return false;
+  }
   // Prefer AudioContext.setSinkId — it actually routes the live crossfade
   // graph.  Element-level setSinkId is a fallback for browsers that lack
   // ctx.setSinkId (Firefox 116+) AND only works when we're playing the
@@ -1088,8 +1096,7 @@ async function _applySink(sinkId, { reportError = true } = {}) {
   }
   if (lastErr) {
     if (reportError && settingsStatus) {
-      announceStatus(settingsStatus, "Could not switch audio device: "
-        + (lastErr.message || lastErr.name || "unknown"),
+      announceStatus(settingsStatus, failureText("switch audio device", { message: lastErr.message || lastErr.name || "unknown" }),
         { dwellMs: 5000, tone: "error" });
     }
     return false;
@@ -1101,9 +1108,9 @@ async function _grantDeviceLabels() {
   // Briefly request the microphone, immediately stop it.  This is what
   // populates the .label field on subsequent enumerateDevices() calls
   // in every privacy-conscious browser (Chromium, Firefox).
+  return withDisabled(audioDeviceRefresh, async () => {
   if (audioDeviceRefresh) {
     audioDeviceRefresh.textContent = "Requesting permission…";
-    audioDeviceRefresh.disabled = true;
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1111,7 +1118,6 @@ async function _grantDeviceLabels() {
     await _refreshAudioDevices();
     if (audioDeviceRefresh) {
       audioDeviceRefresh.textContent = "Show device names";
-      audioDeviceRefresh.disabled = false;
     }
   } catch (err) {
     console.warn("microphone permission denied:", err);
@@ -1121,7 +1127,6 @@ async function _grantDeviceLabels() {
     // the prompt would lock the user out forever.
     if (audioDeviceRefresh) {
       audioDeviceRefresh.textContent = "Permission denied — click to retry";
-      audioDeviceRefresh.disabled = false;
     }
     if (settingsStatus) {
       // Clicking again after a denial must say so again, and the region
@@ -1136,6 +1141,7 @@ async function _grantDeviceLabels() {
       // on the button overwrites it anyway.
     }
   }
+  });
 }
 
 // React to permission changes pushed by the browser (e.g. user resets
@@ -1263,6 +1269,19 @@ import {
 // can invoke unlockAndPlay.
 setApplyState(applyState);
 
+import { ProgrammeOwner } from "./modules/local-programme.js";
+import { installLocalProgrammeControls } from "./modules/local-programme-controls.js";
+const localOwner = new ProgrammeOwner({ stopListening: () => streamMode.stop() });
+const localProgrammeControls = installLocalProgrammeControls({
+  wrap: document.getElementById("local-programme-controls"),
+  take: document.getElementById("take-local-control"),
+  returnButton: document.getElementById("return-to-automation"),
+  status: document.getElementById("local-programme-status"),
+  announce: makeSay(document.getElementById("sr-status"), { dwellMs: 5000, mirror: false, force: false }),
+  owner: localOwner,
+});
+window.addEventListener("pagehide", () => localOwner.stop());
+
 
 
 import {
@@ -1307,7 +1326,7 @@ function applyWhyState(s) {
 
 
 import {
-  applyQueueState, installQueueButtons, resetQueueState,
+  applyQueueState, installQueueButtons, resetQueueState, setQueueDisabledReason,
 } from "./modules/queue.js";
 
 const _queueEls = { queueList, queueCount, queueAnnounce };
@@ -1424,7 +1443,7 @@ const _accessEls = {
   pairCopy:      document.getElementById("pair-copy"),
   pairRefresh:   document.getElementById("pair-refresh"),
 };
-installAccess(_accessEls, {
+const accessControls = installAccess(_accessEls, {
   // Stop protected activity before pairing again or leaving for SSO sign-out.
   onSignedOut: (reason, logoutUrl) => {
     expireAuthenticatedSession();
@@ -1724,6 +1743,7 @@ const btnStationStart = document.getElementById("station-start");
 // The panels that show one station; their names add the station's.
 let offAirTimer = null;
 let stationOffAir = false;
+const OFF_AIR_QUEUE_REASON = "Start the station to change the queue.";
 
 const stationSwitcher = installStationSwitcher({
   wrap: document.getElementById("station-switcher"),
@@ -1795,6 +1815,9 @@ function renderListenContext() {
 
 function setOffAir(offAir) {
   stationOffAir = offAir;
+  schedulerPanelControls?.setOffAir(offAir);
+  setQueueDisabledReason(_queueEls, offAir ? OFF_AIR_QUEUE_REASON : "");
+  listenerRequestControls?.setQueueDisabledReason(offAir ? OFF_AIR_QUEUE_REASON : "");
   setStoppedPlaybackControls(offAir);
   if (offAir) stoppedActionsObserver.observe(document.body, { childList: true, subtree: true });
   else stoppedActionsObserver.disconnect();
@@ -1811,14 +1834,14 @@ function setOffAir(offAir) {
 function setStoppedPlaybackControls(stopped) {
   const controls = [
     btnPause, btnSkip, btnShuffle, btnDiscovery,
-    ...document.querySelectorAll("#queue-clear, #recording-toggle, #ln-test, #shows-play-now, .result-btn, .queue-btn, #cart-wall [data-slot], #schedule-events [data-role='run'], #ads-breaks button[aria-label^='Run now, ad break']"),
+    ...document.querySelectorAll("#queue-clear, #recording-toggle, #ln-test, #shows-play-now, .result-btn, #cart-wall [data-slot], #ads-breaks button[aria-label^='Run now, ad break']"),
   ].filter(Boolean);
   for (const control of controls) control.disabled = stopped;
 }
 
 document.addEventListener("click", (event) => {
   if (!stationOffAir) return;
-  const action = event.target?.closest?.("#queue-clear, #recording-toggle, #ln-test, #shows-play-now, .result-btn, .queue-btn, #cart-wall [data-slot], #schedule-events [data-role='run'], #ads-breaks button[aria-label^='Run now, ad break']");
+  const action = event.target?.closest?.("#queue-clear, #recording-toggle, #ln-test, #shows-play-now, .result-btn, #cart-wall [data-slot], #ads-breaks button[aria-label^='Run now, ad break']");
   if (!action) return;
   event.preventDefault();
   event.stopImmediatePropagation();
@@ -1830,8 +1853,8 @@ const stoppedActionsObserver = new document.defaultView.MutationObserver((record
     for (const node of record.addedNodes) {
       if (node.nodeType !== 1) continue;
       const actions = [];
-      if (node.matches?.(".result-btn, .queue-btn, #cart-wall [data-slot], #schedule-events [data-role='run'], #ads-breaks button[aria-label^='Run now, ad break']")) actions.push(node);
-      actions.push(...node.querySelectorAll?.(".result-btn, .queue-btn, #cart-wall [data-slot], #schedule-events [data-role='run'], #ads-breaks button[aria-label^='Run now, ad break']") || []);
+      if (node.matches?.(".result-btn, #cart-wall [data-slot], #ads-breaks button[aria-label^='Run now, ad break']")) actions.push(node);
+      actions.push(...node.querySelectorAll?.(".result-btn, #cart-wall [data-slot], #ads-breaks button[aria-label^='Run now, ad break']") || []);
       for (const action of actions) action.disabled = true;
     }
   }
@@ -2000,7 +2023,8 @@ async function loadStation({ announce = true } = {}) {
 // and drops clockwheel changes not saved and a voice track not booked,
 // so the page asks first: once, naming everything that would go.
 async function confirmLeavingStation(name) {
-  const decks = Boolean(_lastBrowserPlayback && playbackEnabled);
+  const local = localOwner.owned || localOwner.acquiring;
+  const decks = local || Boolean(_lastBrowserPlayback && playbackEnabled);
   const unsaved = [
     clockwheelPanelControls?.hasUnsavedWork() && "the clockwheel changes not saved yet",
     voiceTrackerControls?.hasUnsavedWork() && "the voice track not booked yet",
@@ -2012,13 +2036,21 @@ async function confirmLeavingStation(name) {
   const ok = await confirmAction(document, {
     title: `Switch to ${name}?`,
     message: [
-      decks && `This page is playing ${stationName()} itself. Switching stops that music on this page; the station goes on for everyone else.`,
+      local ? "Switching returns this station to automation."
+        : decks && `This page is playing ${stationName()} itself. Switching stops that music on this page; the station goes on for everyone else.`,
       lost,
     ].filter(Boolean).join(" "),
     confirmLabel: unsaved.length ? "Switch and discard" : "Switch and stop",
   });
   if (!ok) return false;
   if (!decks) return true;
+  if (local) {
+    try { await localOwner.returnToAutomation(); }
+    catch (error) {
+      announceStatus(document.getElementById("sr-status"), error.message, { tone: "error" });
+      return false;
+    }
+  }
   stopAllDecks();
   stopActiveLiners();
   resetTransitionCaches();
@@ -2079,7 +2111,7 @@ btnStationStart?.addEventListener("click", () => void withDisabled(btnStationSta
     if (!stationOffAir) document.getElementById("btn-pause")?.focus();
   } catch (errorValue) {
     announceStatus(document.getElementById("sr-status"),
-      `Could not start ${name}. ${errorValue.message}`, { dwellMs: 6000, force: true, tone: "error" });
+      failureText(`start ${name}.`, errorValue), { dwellMs: 6000, force: true, tone: "error" });
   }
 }));
 
@@ -2128,6 +2160,11 @@ function announcePlayState(paused) {
 }
 
 btnPause.addEventListener("click", async () => {
+  if (localOwner.owned) {
+    try { announcePlayState(await localOwner.togglePause()); }
+    catch (error) { localOwner.stop(error.message); }
+    return;
+  }
   const epoch = captureAuthenticatedRequestEpoch();
   // First-click unlock path \u2014 synchronous play() inside the click
   // handler is required for iOS autoplay grants.
@@ -2215,6 +2252,11 @@ function returnToOwnTempo({ audio, deck, path, rate, prevPitch }, finished) {
 }
 
 btnSkip.addEventListener("click", async () => {
+  if (localOwner.owned) {
+    try { await localOwner.transition(); }
+    catch (error) { localOwner.stop(error.message); }
+    return;
+  }
   const epoch = captureAuthenticatedRequestEpoch();
   // In browser-playback mode, run a client-side crossfade with the
   // current transition effect.  Falls back to plain server skip if the
@@ -2460,7 +2502,7 @@ function sayMuteState(muted) {
 btnMute.addEventListener("click", async () => {
   // Stream mode: mute this page's listening only, never the station.
   // With --server-audio as well, the server's mute covers both.
-  if (_lastStreamMode && !_lastStreamServerAudio) {
+  if (localOwner.owned || (_lastStreamMode && !_lastStreamServerAudio)) {
     _pageMuted = !_pageMuted;
     applyPageLevel();
     renderMute(_pageMuted);
@@ -2533,7 +2575,7 @@ let volTimer = null;
 let volAnnounceTimer = null;
 
 // Live-region helpers live in ./modules/live-region.js.
-import {
+import { makeSay,
   announceStatus,
   clearLiveRegionLater,
   installVisibleStatusBehaviour,
@@ -2659,7 +2701,7 @@ volSlider.addEventListener("input", () => {
   _pageGain = _sliderToGain(val);
   _pageLevelSet = true;
   applyPageLevel();
-  if (!_lastStreamMode || _lastStreamServerAudio) sendVolume(val);
+  if (!localOwner.owned && (!_lastStreamMode || _lastStreamServerAudio)) sendVolume(val);
   // Polite announce for shortcut presses, debounced so holding the key
   // does not read every intermediate step.
   // Cleared 3 s after the announcement so AT users running with a
@@ -2780,7 +2822,7 @@ installHotkeys({
   // In stream mode Play / Pause stops the station for every listener, so
   // Space and k toggle Listen here (this page only) instead.
   togglePlay:  () => {
-    if (!_lastStreamMode) {
+    if (localOwner.owned || !_lastStreamMode) {
       btnPause.click();
       return;
     }
@@ -2961,6 +3003,7 @@ function historyRowHtml(it, withType = false) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "history-info";
+    button.dataset.action = "info";
     button.dataset.path = it.path || "";
     button.dataset.kind = kind === "liner" ? "liner" : "music";
     button.dataset.historyId = historyId;
@@ -3105,7 +3148,7 @@ async function fetchHistory(page, { announce = false, anchor = null } = {}) {
     const empty = document.getElementById("history-empty");
     if (!announce && tbody?.contains(document.activeElement)) {
       announceStatus(document.getElementById("sr-status"),
-        `Could not refresh history: ${err.message}`,
+        failureText("refresh history", err),
         { dwellMs: 6000, force: true, tone: "error" });
       return;
     }
@@ -3119,13 +3162,13 @@ async function fetchHistory(page, { announce = false, anchor = null } = {}) {
     if (pag) pag.setAttribute("hidden", "");
     if (focusHidden) document.getElementById("hist-refresh")?.focus();
     if (empty) {
-      empty.textContent = `Could not load history: ${err.message}`;
+      empty.textContent = failureText("load history", err);
       empty.removeAttribute("hidden");
     }
     // A button press that fails must say so; the note above is not live.
     if (announce) {
       announceStatus(document.getElementById("sr-status"),
-        `Could not load history: ${err.message}`, { dwellMs: 6000, force: true, tone: "error" });
+        failureText("load history", err), { dwellMs: 6000, force: true, tone: "error" });
     }
   }
 }
@@ -3239,8 +3282,7 @@ function noteTrackForHistory(s) {
     }
   });
   installHistoryExport({
-    announce: (message, tone) => announceStatus(document.getElementById("sr-status"), message,
-      { dwellMs: tone === "error" ? 6000 : 3000, force: true, tone }),
+    announce: makeSay(document.getElementById("sr-status"), { dwellMs: 3000, errorDwellMs: 6000 }),
   });
 }
 
@@ -3277,7 +3319,7 @@ categoriesPanelControls = installCategoriesPanel({ onChange: () => {
 } });
 introRulesControls = installIntroRulesPanel({ createCategory });
 showsPanelControls = installShowsPanel();
-schedulerPanelControls = installSchedulerPanel();
+schedulerPanelControls = installSchedulerPanel({ offAir: stationOffAir });
 rotationTestControls = installRotationTest();
 hourPreviewControls = installHourPreview();
 programmeReviewControls = installProgrammeReview();
@@ -3370,7 +3412,7 @@ async function playBrowserClip(arrayBuf, duckDb, sources, epoch) {
   // own after both decks, so a crossfade running under the clip (a
   // Test press, or a fade that starts mid-clip) keeps its ramps and
   // both of its decks are ducked.
-  if (duckDb < 0 && playbackEnabled && !_lastState?.is_paused) {
+  if (!localOwner.owned && duckDb < 0 && playbackEnabled && !_lastState?.is_paused) {
     duckMusic(Math.pow(10, duckDb / 20), dur);
   }
   sources.add(src);
@@ -3398,7 +3440,7 @@ function startAuthenticatedApp(initialState) {
   // Whenever the server mixes the audio (stream mode or --server-audio),
   // Test asks the server to play the liner or time check into that mix;
   // only browser playback plays it on this page.
-  const testOnServer = () => _lastStreamMode || _lastState?.browser_playback === false;
+  const testOnServer = () => !localOwner.owned && (_lastStreamMode || _lastState?.browser_playback === false);
   // Scheduled liners and the time check after the hour join music that is
   // playing: none plays while paused, or after a hard stop (the session
   // ended) until the listener has pressed Play again.  Nor during a
@@ -3420,6 +3462,7 @@ function startAuthenticatedApp(initialState) {
   timeCheckControls = installTimeChecks(linerAudio);
   speechControls = installSpeechStudio();
   listenerRequestControls = installListenerRequests({ isEnabled: authenticatedInteractionEnabled });
+  listenerRequestControls.setQueueDisabledReason(stationOffAir ? OFF_AIR_QUEUE_REASON : "");
   breakSettingsControls = installBreakSettings();
   linerControls = installLiners(_linerEls, linerAudio);
   // When the server mixes, it plays the cart itself and the page only

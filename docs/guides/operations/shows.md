@@ -28,7 +28,7 @@ below Clockwheels. Each station has its own.
      on the air. Leave it empty to keep the name in use, the active clockwheel's or the normal one.
      See [A station name while a clockwheel or show is on the air](../streaming-and-relays.md#a-station-name-while-a-clockwheel-or-show-is-on-the-air).
 
-   Press **Save show**, then **Open list** on the show.
+   Press **Save show**, then choose **Open list** from the show's **Options** menu.
 2. Press **Generate list**. AutoDJ runs the rotation tester's dry run of the station's own picker
    (see [Testing the rotation](rotation-preview.md#testing-the-rotation)): a category is played as a one-step
    clockwheel that picks its songs at random, a clockwheel in its own order. The repeat rules,
@@ -41,21 +41,22 @@ below Clockwheels. Each station has its own.
    and hours and a step's hours count then: use it to plan a Christmas show in November.
    Generating runs off the web server's event loop, below normal priority, for at most 20
    seconds, one show at a time for the whole server.
-3. Edit the list. Every song has **Move up**, **Move down** and **Remove** buttons; Move up on
-   the first song and Move down on the last stay in the tab order and say why they do nothing.
-   Focus stays on the moved song's button, and Remove moves it to the next song's Remove, or the
-   previous song's when it was the last (the search box when none is left). Under **Add
-   songs**, search the library by title, artist or album and press **Add** to put a song at the
+3. Choose **Track info** from a song's **Options** menu to open its details. **Return to track
+   list** returns to that song's row. The same menu has **Move up**, **Move down** and
+   **Remove**. Remove asks for confirmation. Alt+Up and Alt+Down also move the focused song.
+   Unavailable moves remain reachable in the menu and explain their restriction. Focus stays
+   with the moved song; removal returns to a nearby row or the search box when none remains. Under **Add
+   songs**, search the library by title, artist or album and choose **Add** from a result's **Options** menu to put a song at the
    end. Each change is saved at once and said once, with the new total against the target. A
    song whose file has gone from the library stays in the list, marked, and is skipped on the
    air. A song may be in the list more than once; each copy plays, and the list and its total
-   warn about it. While the list is being generated, Move up, Move down, Remove and Add stay in
-   the tab order but are marked unavailable and say why, and the server refuses a change to the
+   warn about it. While the list is being generated, Move up, Move down, Remove and Add remain
+   reachable but are marked unavailable and explain why, and the server refuses a change to the
    list (409) until the new list is saved. A list holds at most 500 songs, and a station at most
    200 shows.
 
-**Edit** changes the name, source, target or station name and keeps the list; generate again to apply a new
-source. **Delete** asks first and names the schedule events that play the show; those events
+In the saved show's **Options** menu, **Edit** opens a dialog for its name, source, target or
+station name and keeps the list. Generate again to apply a new source. **Delete** in the same menu asks first and names the schedule events that play the show; those events
 fail, in the run log, until you change them.
 
 ## Airing a show

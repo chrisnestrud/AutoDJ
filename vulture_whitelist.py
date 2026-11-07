@@ -6,6 +6,9 @@ tests use is dead: delete it, and move what the tests need into tests/.
 
 # ruff: noqa: B018, F821
 
+# Loaded by name through runpy in the dependency-light launcher.
+synchronize
+
 # sqlite3.Connection attribute.
 _.row_factory
 # shlex.shlex attributes.
@@ -17,6 +20,8 @@ _.imag
 _.LimitFlags
 # urllib.request.HTTPRedirectHandler override.
 _.redirect_request
+# acme.ClientNetwork invokes this transport override from its public request methods.
+_._send_request
 # torch.nn.Module and transformers hooks.
 _.forward
 _._attn_implementation

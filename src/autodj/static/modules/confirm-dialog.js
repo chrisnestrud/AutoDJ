@@ -1,8 +1,10 @@
-import { openDialog, otherModalOpen } from "./dialog-guard.js";
+import { closeDialog, openDialog, otherModalOpen } from "./dialog-guard.js";
 import {
   dialogReturnPlace, dialogStatusLine, focusAfterDialog, focusSteadyPlace, releaseDialogFocus,
 } from "./dom-helpers.js";
-import { sayIfStillPending } from "./live-region.js";
+import { makeSay, clearAnnouncedStatus } from "./live-region.js";
+import { withDisabled } from "./api-client.js";
+import { tableFocusTarget } from "./table-row.js";
 
 // Shared "are you sure" step for actions that cannot be undone: Clear
 // queue, Replace profile, Delete profile, Delete liner, Sign out and Revoke
@@ -125,19 +127,19 @@ function ask(doc, {
   }
   // This opening shows the dialog idle, whatever a replaced opening, still
   // waiting for its action, left: a busy confirm button, "Removing…".
-  confirmButton.removeAttribute("aria-busy");
   const status = doc.getElementById("confirm-status");
-  if (status && dialog.contains(status)) status.textContent = "";
+  if (status && dialog.contains(status)) clearAnnouncedStatus(status);
   heading.textContent = title;
   text.textContent = message;
   confirmButton.textContent = confirmLabel;
   dialog.returnValue = "";
-  const opener = doc.activeElement === doc.body ? null : doc.activeElement;
+  const opener = doc.activeElement === doc.body ? null : tableFocusTarget(doc.activeElement);
   // Where focus goes if the opener is gone when the dialog closes.
   const place = dialogReturnPlace(opener);
   const modal = otherModalOpen(doc, dialog);
   let release = () => {};
   return new Promise((resolve) => {
+    const busyController = new AbortController();
     const opening = { settled: false, pending: false, closeCame: false, settle, detach, closedElsewhere };
     state.current = opening;
     const listeners = [
@@ -172,6 +174,7 @@ function ask(doc, {
     const showing = () => state.current === opening;
     // Every listener this opening added goes.
     function detach() {
+      busyController.abort();
       for (const [target, type, listener, capture] of listeners) {
         target?.removeEventListener(type, listener, capture);
       }
@@ -192,6 +195,7 @@ function ask(doc, {
     // Answer, then close the dialog with focus going straight to *target*,
     // or back to the opener when there is none.
     function finish(answer, target) {
+      target = tableFocusTarget(target);
       settle(answer);
       // A later opening has the dialog now: this one only answers.
       if (!showing()) return;
@@ -206,18 +210,8 @@ function ask(doc, {
         if (answer === "confirm" && !(target?.isConnected && focusAfterDialog(target))) returnFocus();
         return;
       }
-      const elsewhere = target?.isConnected && target !== opener;
-      // The browser would put focus back on the opener first; an inert
-      // control cannot take it.
-      const hold = elsewhere && opener?.isConnected && !opener.hasAttribute("inert");
-      if (hold) opener.setAttribute("inert", "");
-      try {
-        dialog.close(answer);
-      } finally {
-        if (hold) opener.removeAttribute("inert");
-      }
+      closeDialog(dialog, { opener, target, place, value: answer });
       if (closing) state.checks.push(() => checkFocus(false));
-      if (!(elsewhere && focusAfterDialog(target))) returnFocus();
     }
     async function accept(event) {
       event.preventDefault();
@@ -226,20 +220,15 @@ function ask(doc, {
       if (onConfirm) {
         opening.pending = true;
         const status = dialogStatusLine(dialog, "confirm-status");
-        confirmButton.setAttribute("aria-busy", "true");
-        const stopPending = sayIfStillPending((text) => {
-          if (showing()) status.textContent = text;
-        }, pendingText);
         try {
-          target = await onConfirm();
+          target = await withDisabled(confirmButton, onConfirm, {
+            signal: busyController.signal, pendingText,
+            say: makeSay(() => showing() ? status : null, { force: false }),
+          });
         } catch (_) {
           target = null;
         } finally {
-          stopPending();
-          if (showing()) {
-            status.textContent = "";
-            confirmButton.removeAttribute("aria-busy");
-          }
+          if (showing()) clearAnnouncedStatus(status);
           opening.pending = false;
         }
         // Taken out of the page meanwhile.

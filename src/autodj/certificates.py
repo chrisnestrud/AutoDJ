@@ -14,14 +14,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-
 from autodj.secret_files import write_private_file
 
 if TYPE_CHECKING:
+    from cryptography import x509
+
     from autodj.config import AutoDJConfig
 
 MAX_CERTIFICATES = 20
@@ -94,6 +91,11 @@ class CertificateStore:
 
     @staticmethod
     def _metadata(cert: x509.Certificate, name: str, ident: str, cert_type: str) -> dict:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+
+        from autodj.tls import certificate_date_warning
+
         try:
             sans = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
             hosts = sorted(
@@ -115,6 +117,7 @@ class CertificateStore:
             "expires": after.isoformat(),
             "fingerprint": cert.fingerprint(hashes.SHA256()).hex(),
             "status": "expired" if datetime.now(UTC) > after else "valid",
+            "warning": certificate_date_warning(before, after),
         }
 
     @staticmethod
@@ -124,7 +127,19 @@ class CertificateStore:
             cert, name, ident, "Self-signed" if cert.issuer == cert.subject else "Imported"
         )
 
-    def _store(self, name: str, cert_pem: bytes, key_pem: bytes, cert_type: str) -> dict:
+    def _store(
+        self,
+        name: str,
+        cert_pem: bytes,
+        key_pem: bytes,
+        cert_type: str,
+        *,
+        lineage: str | None = None,
+    ) -> dict:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+
         if (
             not isinstance(name, str)
             or not name.strip()
@@ -173,6 +188,8 @@ class CertificateStore:
             raise CertificateError("certificate inventory is full")
         ident = uuid.uuid4().hex
         item = self._metadata(cert, name.strip(), ident, cert_type)
+        if lineage is not None:
+            item["acme_lineage"] = lineage
         directory = self.root / ident
         if directory.exists() or directory.is_symlink() or directory.is_junction():
             raise CertificateError("certificate inventory path is unsafe")
@@ -196,6 +213,11 @@ class CertificateStore:
         return dict(item)
 
     def create(self, name: str, hosts: list[str]) -> dict:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
         if not hosts or len(hosts) > 100:
             raise CertificateError("one to 100 host names are required")
         now = datetime.now(UTC).replace(microsecond=0)
@@ -254,8 +276,54 @@ class CertificateStore:
         with self._lock:
             return self._store(name, cert_pem, key_pem, "Imported")
 
+    def save_acme(self, name: str, cert_pem: bytes, key_pem: bytes, lineage: str) -> dict:
+        """Publish once, including after interruption between inventory and job writes."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+
+        if not _ID.fullmatch(lineage):
+            raise CertificateError("invalid ACME lineage")
+        fingerprint = x509.load_pem_x509_certificate(cert_pem).fingerprint(hashes.SHA256()).hex()
+        with self._lock:
+            for item in self._load()["certificates"]:
+                if item.get("acme_lineage") == lineage and item["fingerprint"] == fingerprint:
+                    return dict(item)
+            return self._store(name, cert_pem, key_pem, "Let's Encrypt", lineage=lineage)
+
+    def activate_if_current(
+        self, ident: str, expected: str, apply: Callable[[Path, Path], None] | None = None
+    ) -> bool:
+        """A manual selection during renewal wins under the same inventory lock."""
+        with self._lock:
+            if self._load()["active"] != expected:
+                return False
+            self.activate(ident, apply)
+            return True
+
+    def prune_acme(
+        self,
+        lineage: str,
+        current: str,
+        previous: str,
+        *,
+        running: tuple[Path, Path] | None = None,
+    ) -> None:
+        """Retain the renewed, previous and serving pairs without touching other owners."""
+        with self._lock:
+            data = self._load()
+            keep = {current, previous, data.get("active")}
+            for item in data["certificates"]:
+                if (
+                    item.get("acme_lineage") == lineage
+                    and item["id"] not in keep
+                    and self.paths(item["id"]) != running
+                ):
+                    self.delete(item["id"])
+
     def validate_hosts(self, ident: str, hosts: list[str]) -> None:
         """Require every requested DNS/IP host to be covered by the stored SAN."""
+        from cryptography import x509
+
         cert_path, _ = self.paths(ident)
         try:
             cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
@@ -284,6 +352,8 @@ class CertificateStore:
                 raise CertificateError("certificate does not cover all required hosts")
 
     def list(self) -> list[dict]:
+        from cryptography import x509
+
         with self._lock:
             items = self._load()["certificates"]
             for item in items:
@@ -304,17 +374,26 @@ class CertificateStore:
             raise CertificateError("unknown certificate")
         with self._lock:
             self._safe_root()
-            if not any(x["id"] == ident for x in self._load()["certificates"]):
+            directories = {x["id"]: self.root / x["id"] for x in self._load()["certificates"]}
+            if ident not in directories:
                 raise CertificateError("unknown certificate")
-            directory = self.root / ident
+            root = self.root.resolve()
+            directory = directories[ident]
             if (
                 directory.is_symlink()
                 or directory.is_junction()
                 or (directory.exists() and not directory.is_dir())
+                or not directory.resolve().is_relative_to(root)
             ):
                 raise CertificateError("certificate inventory path is unsafe")
             paths = directory / "cert.pem", directory / "key.pem"
-            if any(p.is_symlink() or p.is_junction() for p in paths):
+            if any(
+                p.is_symlink()
+                or p.is_junction()
+                or not p.resolve().is_relative_to(root)
+                or (p.exists() and p.stat().st_nlink != 1)
+                for p in paths
+            ):
                 raise CertificateError("certificate inventory path is unsafe")
             return paths
 
@@ -332,13 +411,15 @@ class CertificateStore:
             data["certificates"] = entries
             cert_path.unlink(missing_ok=True)
             key_path.unlink(missing_ok=True)
-            directory = self.root / ident
+            directory = cert_path.parent
             if directory.exists():
                 directory.rmdir()
             # Keep the row retryable if cleanup fails or the process stops midway.
             self._save(data)
 
     def activate(self, ident: str, apply: Callable[[Path, Path], None] | None = None) -> None:
+        from cryptography import x509
+
         with self._lock:
             cert_path, key_path = self.paths(ident)
             try:

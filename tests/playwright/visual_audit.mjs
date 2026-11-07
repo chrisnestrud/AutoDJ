@@ -166,6 +166,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { expect } from "@playwright/test";
 import { runAudit } from "./audit_helpers.mjs";
 
 const BASE = process.env.AUTODJ_URL || "http://localhost:8080";
@@ -211,10 +212,10 @@ const ROTATION_SECTIONS = [
   { title: "Songs", lines: [
     "The library has 77,000 songs; 2,604 played and 74,396 never played.",
   ] },
-  { title: "Top 20 songs", lines: Array.from({ length: 20 }, (_, i) => `Artist ${i + 1} — Song ${i + 1}, ${100 - i} times.`) },
+  { title: "Top 20 songs", lines: Array.from({ length: 20 }, (_, i) => `Artist ${i + 1} â€” Song ${i + 1}, ${100 - i} times.`) },
   { title: "Songs never played, first 2", lines: [
-    "Example Artist — An_Exceptionally_Long_Title_Without_Any_Spaces_From_A_Tagless_File_0001",
-    "Another Example — Song 2",
+    "Example Artist â€” An_Exceptionally_Long_Title_Without_Any_Spaces_From_A_Tagless_File_0001",
+    "Another Example â€” Song 2",
   ] },
   { title: "Top 20 artists", lines: Array.from({ length: 20 }, (_, i) => `Artist ${i + 1}, ${100 - i} times.`) },
   { title: "Categories", lines: [
@@ -409,10 +410,13 @@ async function openTrackTags(page, visit) {
   await visit("track-info/tags-errors");
   // Matched intros: both lists shown, then Upload intro with no file chosen,
   // its error shown under the field and linked to it.
-  await page.locator("#intros-artist-list li").first().waitFor({ state: "visible" });
+  await page.locator("#intros-artist-list tbody tr[data-row-key]").first().waitFor({ state: "visible" });
+  await page.locator("#intro-add").click();
+  await page.locator("#intros-form").waitFor({ state: "visible" });
   await page.locator("#intro-upload").click();
   await page.locator("#intro-file-error").waitFor({ state: "visible" });
-  await visit("track-info/intros-error");
+  await inspectEditorModal(page, "intros-form", visit, "track-info/intros-error");
+  await cancelEditor(page, "intros-form", "intro-cancel");
   // Choosing another song with those edits unsaved opens Save, Discard or
   // Keep editing; Keep editing closes it again with the edits kept.
   await page.evaluate((path) => document.dispatchEvent(new CustomEvent("autodj:edit-points",
@@ -600,15 +604,15 @@ const REQUESTS = {
     {
       id: "a".repeat(32), title: "Slow Ballad", artist: "Example Singer", name: "Sam",
       requested_at: 1767268800, status: "pending", bridges: [],
-      fit: "Fits after Example Artist — Song 3. It is far from the songs around it, so approving it looks for up to three bridge songs to lead into it first.",
-      reason: "Fits after Example Artist — Song 3. It is far from the songs around it, so approving it looks for up to three bridge songs to lead into it first.",
+      fit: "Fits after Example Artist â€” Song 3. It is far from the songs around it, so approving it looks for up to three bridge songs to lead into it first.",
+      reason: "Fits after Example Artist â€” Song 3. It is far from the songs around it, so approving it looks for up to three bridge songs to lead into it first.",
       can_approve: true,
     },
     {
       id: "b".repeat(32), title: "An_Exceptionally_Long_Request_Title_Without_Any_Spaces_0001",
       artist: "Another Example", name: "", requested_at: 1767269100, status: "pending", bridges: [],
-      fit: "Fits after Example Artist — Song 4: 30 BPM apart. No smooth spot within the next 30 minutes. Approving it uses the best legal spot.",
-      reason: "Fits after Example Artist — Song 4: 30 BPM apart. No smooth spot within the next 30 minutes. Approving it uses the best legal spot.",
+      fit: "Fits after Example Artist â€” Song 4: 30 BPM apart. No smooth spot within the next 30 minutes. Approving it uses the best legal spot.",
+      reason: "Fits after Example Artist â€” Song 4: 30 BPM apart. No smooth spot within the next 30 minutes. Approving it uses the best legal spot.",
       can_approve: true,
     },
   ],
@@ -616,9 +620,9 @@ const REQUESTS = {
     {
       id: "c".repeat(32), title: "Quiet Song", artist: "Example Band", name: "Alex",
       requested_at: 1767265200, status: "queued", decided_at: 1767265260,
-      note: "Bridge to Example Band — Quiet Song through Example Artist — Song 2.",
-      reason: "Bridge to Example Band — Quiet Song through Example Artist — Song 2.",
-      bridges: ["Example Artist — Song 2"],
+      note: "Bridge to Example Band â€” Quiet Song through Example Artist â€” Song 2.",
+      reason: "Bridge to Example Band â€” Quiet Song through Example Artist â€” Song 2.",
+      bridges: ["Example Artist â€” Song 2"],
     },
   ],
 };
@@ -632,19 +636,22 @@ async function standInForRequests(page) {
     : route.continue()));
 }
 
-// Two queue rows that lead into a request, drawn by the page's own queue
-// module.  Only the drawing: the queue the server pushes is unchanged, so
-// it does not redraw over them.
+// Two queue rows that lead into a request, applied through the page's queue
+// state entry point. This does not mutate the backend queue.
 async function showBridgedQueue(page) {
+  const queue = [
+    { path: "/audit/bridge-1.mp3", artist: "Example Artist", title: "Song 2", bridge_to: "Example Band â€” Quiet Song" },
+    { path: "/audit/bridge-2.mp3", artist: "Example Artist", title: "An_Exceptionally_Long_Bridge_Title_Without_Spaces_0002", bridge_to: "Example Band â€” An_Exceptionally_Long_Request_Title_Without_Spaces" },
+    { path: "/audit/request.mp3", artist: "Example Band", title: "Quiet Song" },
+  ];
+  // Keep subsequent stood-in status pushes consistent with this visible state.
+  livePages.get(page).queue = queue;
   // The page's own module URL, passed in so the import is the page's.
-  await page.evaluate(async (moduleUrl) => {
-    const { renderQueue } = await import(moduleUrl);
-    renderQueue([
-      { path: "/audit/bridge-1.mp3", artist: "Example Artist", title: "Song 2", bridge_to: "Example Band — Quiet Song" },
-      { path: "/audit/bridge-2.mp3", artist: "Example Artist", title: "An_Exceptionally_Long_Bridge_Title_Without_Spaces_0002", bridge_to: "Example Band — An_Exceptionally_Long_Request_Title_Without_Spaces" },
-      { path: "/audit/request.mp3", artist: "Example Band", title: "Quiet Song" },
-    ], { queueList: document.getElementById("queue-list"), queueCount: document.getElementById("queue-count") });
-  }, "/modules/queue.js");
+  await page.evaluate(async ({ moduleUrl, queue }) => {
+    const { applyQueueState } = await import(moduleUrl);
+    applyQueueState(queue, { queueList: document.getElementById("queue-list"), queueCount: document.getElementById("queue-count") });
+  }, { moduleUrl: "/modules/queue.js", queue });
+  await page.waitForFunction(() => document.querySelectorAll('#queue-list tbody tr[data-row-key]').length === 3);
 }
 
 // Smooth transitions: a Roughness limit out of range is refused in the
@@ -915,6 +922,8 @@ async function inspectEditorModal(page, formId, visit, target) {
   if (!name.open || name.modal || name.ariaModal !== "true" || !name.backdrop || !name.labelled) {
     throw new Error(`${formId} is not an accessible dialog kept modal without showModal(): ${JSON.stringify(name)}`);
   }
+  await expect(dialog).toHaveAccessibleName(await dialog.evaluate((element) => document.getElementById(element.getAttribute("aria-labelledby")).textContent.trim()));
+  await expect(dialog).toHaveAccessibleDescription("Use Tab to move between fields and actions.");
   const viewport = page.viewportSize() || { width: 1280, height: 800 };
   await page.setViewportSize({ width: 320, height: 640 });
   await settle(page);
@@ -1006,8 +1015,9 @@ async function openDaypartErrors(page, visit) {
   await page.locator("#categories-form-error").waitFor({ state: "visible" });
   await inspectEditorModal(page, "categories-form", visit, "library/category-dates-error");
   await cancelEditor(page, "categories-form", "categories-cancel");
-  await page.locator("#clock-name").fill("Audit");
   await page.locator("#clock-create").click();
+  await page.locator("#clock-editor-name").fill("Audit");
+  await page.locator('#clock-name-form button[type="submit"]').click();
   await page.locator("#clock-new-step").click();
   const condition = page.locator("#clock-step-conditions").getByRole("group").first();
   await condition.getByLabel("Condition type", { exact: true }).selectOption("title");
@@ -1087,7 +1097,7 @@ async function standInForIntroRules(page) {
 // liners, linked to the first liner's checkbox and focused.  Nothing is
 // sent; Cancel closes the form again.
 async function openIntroRuleError(page, visit) {
-  await page.locator("#intro-rules-list li").first().waitFor({ state: "visible" });
+  await page.locator("#intro-rules-list tbody tr[data-row-key]").first().waitFor({ state: "visible" });
   await page.locator("#intro-rules-add").click();
   await page.locator("#intro-rules-form").waitFor({ state: "visible" });
   await page.locator("#intro-rules-label").fill("Audit draft");
@@ -1154,11 +1164,33 @@ async function standInForShows(page) {
 // Shows: one list open with a search result, then Save show refused by the
 // server with its error on the page, linked to Name and focused.
 async function openShowStates(page, visit) {
-  await page.locator("#shows-list button[data-action='open']").first().click();
-  await page.locator("#shows-songs li[data-index]").first().waitFor({ state: "visible" });
+  const replies = [];
+  const record = (response) => {
+    if (/\/api\/(shows|editions)/.test(response.url())) replies.push({ url: response.url(), status: response.status() });
+  };
+  page.on("response", record);
+  try {
+    // Open list is the first item of the show's Options menu (#712).
+    await page.locator("#shows-list [aria-haspopup='menu']").first().click();
+    await page.locator("#shows-list button[data-action='open']").first().click();
+    await page.locator("#shows-songs tbody tr[data-row-key]").first().waitFor({ state: "visible" });
+  } catch (error) {
+    const state = await page.evaluate(() => {
+      const ancestors = [];
+      for (let element = document.getElementById("shows-songs"); element; element = element.parentElement) {
+        ancestors.push({ id: element.id, tag: element.tagName, hidden: element.hidden,
+          open: element.open, display: window.getComputedStyle(element).display });
+      }
+      return { width: window.innerWidth, font: window.getComputedStyle(document.documentElement).fontSize,
+        theme: document.documentElement.dataset.theme, rows: document.querySelectorAll('#shows-songs tbody tr[data-row-key]').length,
+        showStatus: document.getElementById("shows-status")?.textContent,
+        editionStatus: document.getElementById("edition-status")?.textContent, ancestors };
+    });
+    throw new Error(`${error}\nShows state: ${JSON.stringify({ ...state, replies })}`, { cause: error });
+  } finally { page.off("response", record); }
   await page.locator("#shows-search").fill("example");
   await page.locator("#shows-search-run").click();
-  await page.locator("#shows-results li").first().waitFor({ state: "visible" });
+  await page.locator("#shows-results tbody tr[data-row-key]").first().waitFor({ state: "visible" });
   await visit("library/show-list");
   await page.locator("#shows-close").click();
   await page.locator("#shows-add").click();
@@ -1289,8 +1321,14 @@ async function openVoiceStates(page, visit) {
   await visit("voice/recording");
   await record.click();
   await page.waitForFunction(() => /^Recorded/.test(document.getElementById("vt-timer").textContent));
-  await page.waitForFunction(() => document.getElementById("vt-fit").textContent.includes("Full chain speech"));
-  const forecast = await page.locator("#vt-fit").textContent();
+  // Polling can clear the forecast between a readiness check and a second DOM
+  // read. Assert the completed snapshot returned by the readiness check itself.
+  const ready = await page.waitForFunction(() => {
+    const text = document.getElementById("vt-fit").textContent;
+    return text.includes("Full chain speech") ? text : null;
+  });
+  const forecast = await ready.jsonValue();
+  await ready.dispose();
   if (!forecast.includes("Full chain speech") || !forecast.includes("tail")) {
     throw new Error(`prepared voice forecast is missing queued speech or cue tail: ${forecast}`);
   }
@@ -1371,6 +1409,7 @@ async function standInForLiveDj(page) {
           if (hourFitPages.has(page) && parsed.settings?.playback) {
             parsed.settings.playback.hour_fit = true;
           }
+          if (state.queue) parsed.queue = state.queue;
           data = JSON.stringify({ ...parsed, live: state.live, talkover: false });
         }
       } catch { /* not JSON: passed on as it is */ }
@@ -1511,7 +1550,7 @@ async function standInForAds(page) {
 // Ads with the spot form refused (its error linked to the file field), the
 // break form open, and the report shown as its two tables.
 async function openAdsStates(page, visit) {
-  await page.locator("#ads-spots li button").first().waitFor({ state: "visible" });
+  await page.locator("#ads-spots tbody [aria-haspopup=menu]").first().waitFor({ state: "visible" });
   await page.locator("#ads-spot-add").click();
   await page.locator("#ads-spot-save").click();
   await page.locator("#ads-spot-error").waitFor({ state: "visible" });
@@ -1532,12 +1571,12 @@ async function openAdsStates(page, visit) {
 // with no file names it in words, links the words to it, says them once
 // and keeps focus there; Cancel goes back to Add spot; Show report keeps
 // focus on its button, says the totals once and shows two tables with
-// headers, each in a region that takes focus.
+// headers and one cell Tab stop in each shared table.
 async function adsProblems(page) {
   await standInForAds(page);
   await page.goto(BASE, { waitUntil: "networkidle", timeout: 20000 });
   await page.locator("#tab-ads").click();
-  await page.locator("#ads-spots li button").first().waitFor({ state: "visible" });
+  await page.locator("#ads-spots tbody [aria-haspopup=menu]").first().waitFor({ state: "visible" });
   const problems = [];
   await page.evaluate(() => {
     window.__adsSaid = [];
@@ -1946,6 +1985,12 @@ function controlBoundaryProblems(page) {
     ].join(", "));
     for (const control of controls) {
       if (!control.getClientRects().length || control.closest("[hidden], [aria-hidden='true']")) continue;
+      if (control.matches('.collection-table button, .row-actions-menu [role="menuitem"]')) {
+        const rect = control.getBoundingClientRect();
+        if (rect.width < 24 || rect.height < 44) {
+          problems.push(`${control.getAttribute("aria-label") || control.textContent.trim()} target ${rect.width}x${rect.height}, needs 24px width and 44px height`);
+        }
+      }
       // A busy (.is-pending) control is still active, so it is measured.
       if (control.disabled || control.getAttribute("aria-disabled") === "true") continue;
       const style = window.getComputedStyle(control);
@@ -2567,8 +2612,8 @@ async function toastBehaviourProblems(page) {
 // The preview output device setting, in whatever this engine supports.
 // Settings > General > Server with an announcer token chosen: the Station
 // choice shows (#88).  Back to the default choice with `false`.
-// New station by keyboard: a refused create marks, links and focuses
-// Station ID and says nothing else; a stood-in create says it once and
+// New station by keyboard: an already-focused refused Station ID is said
+// once; Create moves focus to the error without duplicate speech. A create says it once and
 // moves focus to Switch to <name>.  Nothing reaches the server.
 async function stationCreateProblems(page) {
   await page.goto(BASE, { waitUntil: "networkidle", timeout: 20000 });
@@ -2576,6 +2621,14 @@ async function stationCreateProblems(page) {
   await clickSubtabUnprompted(page, "stab-stations");
   await page.locator("#station-create-name").waitFor({ state: "visible" });
   const problems = [];
+  await page.evaluate(() => {
+    window.__stationCreateSaid = [];
+    const region = document.getElementById("stations-status");
+    window.__stationCreateObserver = new window.MutationObserver(() => {
+      if (region.textContent) window.__stationCreateSaid.push(region.textContent.trim());
+    });
+    window.__stationCreateObserver.observe(region, { childList: true, characterData: true, subtree: true });
+  });
   const state = () => page.evaluate(() => {
     const slug = document.getElementById("station-create-slug");
     return {
@@ -2584,6 +2637,7 @@ async function stationCreateProblems(page) {
       error: document.getElementById("station-create-error").textContent.trim(),
       focus: document.activeElement?.id,
       said: document.getElementById("stations-status").textContent.trim(),
+      announcements: [...window.__stationCreateSaid],
       done: !document.getElementById("station-create-done").hidden,
     };
   });
@@ -2591,13 +2645,34 @@ async function stationCreateProblems(page) {
   await page.locator("#station-create-slug").fill("audit-refused");
   await page.locator("#station-create-slug").press("Enter");
   await page.locator("#station-create-error").waitFor({ state: "visible" });
+  const message = `Could not create the station. ${CREATE_REFUSAL.detail}`;
+  await expect(page.locator("#stations-status")).toHaveText(message);
   const refused = await state();
   if (!refused.error) problems.push("a refused create shows no error");
   if (refused.invalid !== "true") problems.push("Station ID is not marked invalid");
   if (!refused.linked.includes("station-create-error")) problems.push("the error is not linked to Station ID");
   if (!refused.linked.includes("station-create-slug-help")) problems.push("the ID's format hint lost its link");
   if (refused.focus !== "station-create-slug") problems.push(`a refused create moved focus to ${refused.focus}`);
-  if (refused.said) problems.push(`a refused create also said ${JSON.stringify(refused.said)}`);
+  if (refused.said !== message || JSON.stringify(refused.announcements) !== JSON.stringify([message])) {
+    problems.push(`an already-focused refusal did not say the exact error once: ${JSON.stringify(refused.announcements)}`);
+  }
+  // Submitting from Create must instead move focus to the described field.
+  await page.locator("#station-create-slug").fill("audit-refused");
+  await page.evaluate(() => {
+    document.getElementById("stations-status").textContent = "";
+    window.__stationCreateSaid = [];
+  });
+  await page.locator("#station-create-submit").focus();
+  await page.keyboard.press("Enter");
+  await page.locator("#station-create-error").waitFor({ state: "visible" });
+  const fromButton = await state();
+  if (fromButton.error !== message || fromButton.invalid !== "true"
+      || !fromButton.linked.includes("station-create-error") || !fromButton.linked.includes("station-create-slug-help")) {
+    problems.push("a button-submitted refusal lost its exact field error or hint association");
+  }
+  if (fromButton.focus !== "station-create-slug") problems.push(`Create refusal moved focus to ${fromButton.focus}`);
+  if (fromButton.said || fromButton.announcements.length) problems.push(`Create refusal also said ${JSON.stringify(fromButton.announcements)}`);
+  await page.evaluate(() => window.__stationCreateObserver.disconnect());
 
   const created = {
     ...STAND_IN_STATION, slug: "audit-created", name: "Audit Created Station",
@@ -3296,6 +3371,68 @@ async function auditStatusPages(browser, out) {
   }
 }
 
+async function selectedTabEntryProblems(page) {
+  const problems = [];
+  const expectFocus = async (id, context) => {
+    const active = await page.evaluate(() => document.activeElement.id);
+    if (active !== id) problems.push(`${context}: focused ${active}, expected ${id}`);
+  };
+  for (const view of ["library", "settings"]) {
+    await page.goto(`${BASE}/#${view}`);
+    await page.locator(`#tab-${view}[aria-selected="true"]`).waitFor();
+    await page.locator(".skip-link").focus();
+    await page.keyboard.press("Tab");
+    await expectFocus(`tab-${view}`, `${view}: native Tab entry`);
+    await page.locator(".skip-link").focus();
+    // NVDA's browse buffer can focus a negative-tabindex object directly.
+    await page.locator("#tab-now").evaluate((tab) => tab.focus());
+    await expectFocus(`tab-${view}`, `${view}: browse-mode focus entry`);
+    await page.locator("#tab-now").evaluate((tab) => tab.click());
+    await expectFocus("tab-now", `${view}: browse-mode focus then click`);
+    await page.locator(`#tab-${view}`).click();
+    await page.locator(".skip-link").focus();
+    await page.locator("#tab-now").click();
+    await expectFocus("tab-now", `${view}: pointer click`);
+  }
+  await page.goto(`${BASE}/#settings`);
+  await page.locator('#tab-settings[aria-selected="true"]').waitFor();
+  for (const [group, selected, first, other] of [
+    ["Profile", "stab-sound", "stab-mixing", "stab-stations"],
+    ["Station", "stab-schedule", "stab-stations", "stab-sound"],
+    ["Global", "stab-display", "stab-server", "stab-sound"],
+  ]) {
+    await page.locator(`#${selected}`).click();
+    await page.locator(".skip-link").focus();
+    await page.locator(`#${first}`).evaluate((tab) => tab.focus());
+    await expectFocus(selected, `${group}: outside focus entry`);
+    await page.locator(`#${first}`).evaluate((tab) => tab.click());
+    if (await page.locator(`#${first}`).getAttribute("aria-selected") !== "true") problems.push(`${group}: browse-mode click did not select`);
+    await page.locator(`#${selected}`).click();
+    await page.locator(".skip-link").focus();
+    await page.locator(`#${first}`).click();
+    if (await page.locator(`#${first}`).getAttribute("aria-selected") !== "true") problems.push(`${group}: pointer click did not select`);
+    await page.locator(`#${other}`).click();
+    await page.locator(`#${selected}`).evaluate((tab) => tab.focus());
+    await expectFocus(first, `${group}: group without selection`);
+    await page.keyboard.press("End");
+    const last = await page.locator(`#${first}`).evaluate((tab) => [...tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]')].filter((each) => !each.hidden).at(-1).id);
+    await expectFocus(last, `${group}: End`);
+    await page.keyboard.press("Home");
+    await expectFocus(first, `${group}: Home`);
+    await page.keyboard.press("ArrowRight");
+    const second = await page.locator(`#${first}`).evaluate((tab) => [...tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]')].filter((each) => !each.hidden)[1].id);
+    await expectFocus(second, `${group}: ArrowRight`);
+  }
+  problems.push(...await page.evaluate(() => {
+    const tabs = [...document.querySelectorAll('#view-nav [role="tab"]')];
+    const selected = document.getElementById("tab-settings");
+    const problems = [];
+    if (tabs.filter((tab) => tab.tabIndex === 0).length !== 1 || selected.tabIndex !== 0) problems.push("Selected main tab is not the sole tab stop");
+    return problems;
+  }));
+  return problems;
+}
+
 export async function audit(name, launcher) {
   const browser = await launcher.launch();
   const out = {
@@ -3308,15 +3445,23 @@ export async function audit(name, launcher) {
   try {
     const full = FULL_MODES[name] || FULL_MODES.chromium;
     for (const mode of THEME_MODES) {
-      if (full.includes(mode.name)) await auditTheme(browser, mode, out);
-      else if (!mode.stored) await checkSystemTheme(browser, mode, out);
+      if (full.includes(mode.name)) {
+        console.log(`${name}: ${mode.name} full theme checks`);
+        await auditTheme(browser, mode, out);
+      } else if (!mode.stored) {
+        console.log(`${name}: ${mode.name} system selection checks`);
+        await checkSystemTheme(browser, mode, out);
+      }
     }
     await auditStatusPages(browser, out);
+    console.log(`${name}: layout, focus and behavior checks`);
 
     const wide = await browser.newContext({ viewport: { width: 1280, height: 800 },
       reducedMotion: "reduce", colorScheme: "light", bypassCSP: true });
     const page = await newPage(wide);
     page.on("pageerror", (error) => out.pageerrors.push(error.message));
+    const selectedTab = await selectedTabEntryProblems(page);
+    if (selectedTab.length) out.behaviour.selectedTabEntry = selectedTab;
     await eachTarget(page, async (target) => {
       const small = await smallChoiceControls(page);
       if (small.length) out.smallChoices[target] = small;
@@ -3345,6 +3490,7 @@ export async function audit(name, launcher) {
     const switcher = await stationSwitcherProblems(page);
     if (switcher.length) out.behaviour.stationSwitcher = switcher;
     // 200 % text at the same window width.
+    console.log(`${name}: 200% text checks`);
     await wide.addInitScript(() => {
       document.addEventListener("DOMContentLoaded", () => {
         document.documentElement.style.fontSize = "200%";
@@ -3359,6 +3505,7 @@ export async function audit(name, launcher) {
     const narrow = await browser.newContext({ viewport: { width: 320, height: 640 },
       reducedMotion: "reduce", colorScheme: "light" });
     const phone = await newPage(narrow);
+    console.log(`${name}: 320px reflow checks`);
     phone.on("pageerror", (error) => out.pageerrors.push(error.message));
     await eachTarget(phone, async (target) => {
       const overflow = await horizontalOverflow(phone);
@@ -3392,6 +3539,6 @@ export function validateVisualAudit(name, result) {
 
 await runAudit({
   audit,
-  report: "visual_audit.json",
+  report: process.env.AUTODJ_VISUAL_REPORT || "visual_audit.json",
   validate: validateVisualAudit,
 });

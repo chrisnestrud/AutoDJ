@@ -22,7 +22,6 @@ import hmac
 import json
 import logging
 import math
-import os
 import queue
 import secrets
 import shutil
@@ -38,6 +37,7 @@ from typing import Any
 
 import numpy as np
 
+from autodj.fsutil import atomic_write
 from autodj.station_log import CURRENT_STATION, track_station_thread
 from autodj.stereo import SAMPLE_RATE
 
@@ -174,18 +174,7 @@ class DjCredentials:
         return {"version": 1, "users": users, "settings": settings}
 
     def _write(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(f"{self.path.name}.{secrets.token_hex(8)}.tmp")
-        try:
-            with temporary.open("x", encoding="utf-8") as out:
-                if os.name != "nt":
-                    os.chmod(temporary, 0o600)
-                json.dump(data, out, indent=2)
-                out.flush()
-                os.fsync(out.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        atomic_write(self.path, json.dumps(data, indent=2), mode=0o600)
 
     def accounts(self) -> list[dict[str, Any]]:
         """The accounts for the settings page: names only, never hashes."""
@@ -621,6 +610,7 @@ class LiveDesk:
         self.settings = self.credentials.settings()
         self._lock = threading.Lock()
         self._claiming = False
+        self._local_owner: object | None = None
         self._releasing: LiveSource | None = None
         self.source: LiveSource | None = None
         self.return_source: LiveSource | None = None
@@ -641,7 +631,7 @@ class LiveDesk:
             OSError: FFmpeg could not be started.
         """
         with self._lock:
-            if self.source is not None or self._claiming:
+            if self.source is not None or self._claiming or self._local_owner is not None:
                 return None
             self._claiming = True
         try:
@@ -738,11 +728,31 @@ class LiveDesk:
     def claim_mic(self) -> PcmBuffer | None:
         """The talkover buffer, or ``None`` while someone else is talking."""
         with self._lock:
-            if self.mic is not None:
+            if self.mic is not None or self._local_owner is not None:
                 return None
             self.mic = PcmBuffer(MIC_BUFFER_SECONDS)
         self.on_talkover()
         return self.mic
+
+    def reserve_local(self, owner: object) -> bool:
+        """Atomically exclude external sources and microphones during preparation."""
+        with self._lock:
+            if (
+                self._local_owner is not None
+                or self._claiming
+                or self.source is not None
+                or self.return_source is not None
+                or self.mic is not None
+            ):
+                return False
+            self._local_owner = owner
+            return True
+
+    def release_local(self, owner: object) -> None:
+        """A stale socket cannot release a newer browser's reservation."""
+        with self._lock:
+            if self._local_owner is owner:
+                self._local_owner = None
 
     def release_mic(self, mic: PcmBuffer) -> None:
         """Let the talker go; the music comes back up over the return time."""

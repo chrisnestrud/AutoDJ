@@ -39,8 +39,9 @@ def clear_autodj_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
 @pytest.fixture(autouse=True)
 def mock_library_startup():
     # CLI option tests use fake configs; catalog startup has separate integration tests.
-    def create(cfg, sim):
+    def create(cfg, sim, *, compatibility_checked=False):
         library = MagicMock()
+        library.compatibility_checked = compatibility_checked
         library.entries_snapshot.side_effect = sim.entries_snapshot
         library.snapshot.return_value = {
             "tracks_ready": sim.ntotal,
@@ -196,7 +197,7 @@ class TestCliConfigNotFound:
 
     def test_index_error_message_mentions_config(self, tmp_path: Path) -> None:
         result = CliRunner().invoke(cli, ["--config", self._missing(tmp_path), "index"])
-        assert "Config not found" in result.output or "config" in result.output.lower()
+        assert "Config not found" in result.stderr
 
     def test_prune_exits_on_missing_config(self, tmp_path: Path) -> None:
         result = CliRunner().invoke(cli, ["--config", self._missing(tmp_path), "prune"])
@@ -218,7 +219,7 @@ class TestCliConfigNotFound:
         )
         result = CliRunner().invoke(cli, ["--config", str(cfg), "enrich"])
         assert result.exit_code == 1
-        assert "beets" in result.output.lower()
+        assert "beets" in result.stderr.lower()
 
 
 class TestCliConfigSelection:
@@ -232,7 +233,7 @@ class TestCliConfigSelection:
         result = CliRunner().invoke(cli, ["--config", str(config_path), command])
 
         assert result.exit_code == 1
-        assert "Config not found or invalid" in result.output
+        assert "Config not found or invalid" in result.stderr
 
     @pytest.mark.parametrize(
         "section",
@@ -257,8 +258,8 @@ class TestCliConfigSelection:
         result = CliRunner().invoke(cli, ["--config", str(config_path), "serve"])
 
         assert result.exit_code == 1
-        assert "Config not found or invalid" in result.output
-        assert f"{section} section must be a table" in result.output
+        assert "Config not found or invalid" in result.stderr
+        assert f"{section} section must be a table" in result.stderr
 
     def test_unknown_key_warns_and_continues_to_index_check(self, tmp_path: Path) -> None:
         config_path = tmp_path / "config.toml"
@@ -269,7 +270,7 @@ class TestCliConfigSelection:
         assert result.exit_code == 1
         # Rich markup used to swallow "[playback]" as a style tag.
         assert "Ignoring unknown config keys in [playback]: ['bogus_key']" in result.output
-        assert "Current library not found" in result.output
+        assert "Current library not found" in result.stderr
         assert "Config not found or invalid" not in result.output
 
     def test_omitted_config_passes_none_to_loader(self) -> None:
@@ -286,7 +287,7 @@ class TestCliConfigSelection:
     def test_explicit_missing_config_exits_one(self, tmp_path: Path) -> None:
         result = CliRunner().invoke(cli, ["--config", str(tmp_path / "missing.toml"), "serve"])
         assert result.exit_code == 1
-        assert "Config not found" in result.output
+        assert "Config not found" in result.stderr
 
     def test_explicit_cli_host_port_override_effective_config(self) -> None:
         cfg = _make_cfg()
@@ -428,11 +429,20 @@ class TestResolveSeedBeets:
 
 
 class TestCmdServe:
-    def test_welcome_and_progress_precede_server_import(self) -> None:
+    @pytest.mark.parametrize("launcher_welcome", [False, True])
+    def test_welcome_and_progress_precede_server_import(
+        self, monkeypatch, launcher_welcome
+    ) -> None:
         import builtins
         import logging
 
         from autodj import __version__
+        from autodj.version import STARTUP_WELCOME_ENV
+
+        if launcher_welcome:
+            monkeypatch.setenv(STARTUP_WELCOME_ENV, "1")
+        else:
+            monkeypatch.delenv(STARTUP_WELCOME_ENV, raising=False)
 
         events = []
         original_import = builtins.__import__
@@ -459,9 +469,15 @@ class TestCmdServe:
         ):
             result = CliRunner().invoke(cli, ["serve"])
         assert result.exit_code == 0, result.output
-        assert f"Welcome to AutoDJ {__version__}" in events[0]
-        assert events[1] == "Starting the server: loading configuration and audio components..."
-        assert events.index("server import") > 1
+        if launcher_welcome:
+            assert not any("Welcome to AutoDJ" in event for event in events)
+        else:
+            assert f"Welcome to AutoDJ {__version__}" in events[0]
+        progress = 0 if launcher_welcome else 1
+        assert (
+            events[progress] == "Starting the server: loading configuration and audio components..."
+        )
+        assert events.index("server import") > progress
 
     def test_serve_exits_zero(self) -> None:
         cfg_mock = _make_cfg()
@@ -837,7 +853,7 @@ class TestCmdPrune:
         with patch("autodj.config.load_config", return_value=cfg_mock):
             result = CliRunner().invoke(cli, ["prune"])
         assert result.exit_code == 1
-        assert "No current library" in result.output
+        assert "No current library" in result.stderr
 
     def test_prune_previews_and_confirms_catalog_removal(self, tmp_path: Path) -> None:
         cfg_mock = _make_cfg()
@@ -931,7 +947,7 @@ class TestCmdEnrich:
         with patch("autodj.config.load_config", return_value=cfg_mock):
             result = CliRunner().invoke(cli, ["enrich"])
         assert result.exit_code == 1
-        assert "No current library" in result.output
+        assert "No current library" in result.stderr
 
     def test_enrich_all_synced(self, tmp_path: Path) -> None:
         cfg_mock = _make_cfg(beets_db=tmp_path / "library.db")
@@ -1123,7 +1139,7 @@ class TestCmdAnalyse:
         with patch("autodj.config.load_config", side_effect=FileNotFoundError("nope")):
             result = CliRunner().invoke(cli, ["analyse"])
         assert result.exit_code == 1
-        assert "Config not found" in result.output
+        assert "Config not found" in result.stderr
 
     def test_no_index(self, tmp_path: Path) -> None:
         cfg = _make_cfg()
@@ -1131,7 +1147,7 @@ class TestCmdAnalyse:
         with patch("autodj.config.load_config", return_value=cfg):
             result = CliRunner().invoke(cli, ["analyse"])
         assert result.exit_code == 1
-        assert "No current library" in result.output
+        assert "No current library" in result.stderr
 
     @pytest.mark.parametrize("command", ["analyse", "stats"])
     def test_old_index_format_exits_with_the_rebuild_hint(
@@ -1221,7 +1237,7 @@ class TestCmdAnalyse:
         ):
             result = CliRunner().invoke(cli, ["analyse"])
         assert result.exit_code == 1
-        assert "Analyse failed" in result.output
+        assert "Analyse failed" in result.stderr
 
     def test_missing_packages_exits(self, tmp_path: Path) -> None:
         import builtins
@@ -1236,7 +1252,7 @@ class TestCmdAnalyse:
         with patch("builtins.__import__", side_effect=fake_import):
             result = CliRunner().invoke(cli, ["analyse"])
         assert result.exit_code == 1
-        assert "missing packages" in result.output
+        assert "missing packages" in result.stderr
 
 
 def test_third_party_info_logs_are_quiet_unless_verbose() -> None:
@@ -1301,7 +1317,7 @@ class TestClaimIndexForServe:
         ctx, closers = self._ctx()
         _claim_index_for_serve(ctx, tmp_path / "default")
         try:
-            with pytest.raises(SystemExit):
+            with pytest.raises(click.ClickException):
                 _claim_index_for_serve(self._ctx()[0], tmp_path / "default")
         finally:
             for close in closers:
@@ -1313,7 +1329,7 @@ class TestClaimIndexForServe:
         active = tmp_path / "default"
         active.mkdir()
         (active / ".autodj-restore.json").write_text('{"state": "installing", "steps": []}')
-        with pytest.raises(SystemExit):
+        with pytest.raises(click.ClickException):
             _claim_index_for_serve(self._ctx()[0], active)
 
     def test_starts_with_only_old_copies_left(self, tmp_path: Path) -> None:

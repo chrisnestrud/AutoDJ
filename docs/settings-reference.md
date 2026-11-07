@@ -58,7 +58,7 @@ are station-owned settings in Stations.
 
 Relay, scheduled-event and DJ-account forms submit individual records. Profile
 edits use the selected profile in Settings and its shared draft save. Creation,
-activation, reset and deletion have their own buttons on Station > Profiles.
+activation, reset and deletion remain separate actions on Station > Profiles. Each profile's **Options** menu has **Activate**, **Reset** and **Delete**.
 Uploads, credentials, pairing and destructive actions also retain their explicit
 actions; they are not part of a tab's configuration save. Operational recording
 Start/Stop remains separate from recording configuration.
@@ -110,7 +110,7 @@ profile also has its own **Activate** action in the profile list; activation doe
 not change which target the Settings form edits. The picker marks the active
 profile with **(active)** and does not activate a selection. **Reset** requires confirmation; cancel
 leaves the saved profile and current draft intact. Deletion also requires
-confirmation. The Profiles tab shows which profile is active. Browser access is
+confirmation. The Profiles table shows which profile is active in its **Active** column. Browser access is
 managed separately in the Server tab.
 
 Profiles can override station programming and playback controls: preset,
@@ -244,6 +244,7 @@ TOML section: `[server]`.
 - `trusted_proxies`. Values: list of IP addresses or networks. Default: empty list. Lists proxy IP addresses or networks that AutoDJ trusts when they forward a listener's real IP address; do not list other clients.
 - `ssl_certfile`. Values: PEM certificate path or blank. Default: blank. Enables HTTPS with ssl_keyfile.
 - `ssl_keyfile`. Values: PEM private key path or blank. Default: blank. Enables HTTPS with ssl_certfile.
+- `local_programme_enabled`. Values: true or false. Default: false. Experimental local browser programme ownership on an already-running stream station. TOML-only and restart required; no Settings UI or alternate Save/Discard path. Requires direct native loopback access, Chromium and a verified 44,100 Hz audio context. Enables Take local control / Return to automation; monitor volume and mute remain local. Proxy deployments and unsupported programme content are refused. See [local control operations](reference/operations/server-playback.md#experimental-local-browser-control) and [ADR 20](adr/0020-local-browser-programme-ownership.md).
 - `live_plain_http_lan`. Values: true or false. Default: false. Allows live DJ passwords over plain HTTP on the LAN.
 
 ### Hugging Face
@@ -295,7 +296,7 @@ Station section: `playback` in `station.json`.
 - `liners_random_min_minutes`. Values: nonnegative number or blank. Default: blank. Sets the lower bound of a random liner interval. **Random window minimum (minutes)**.
 - `liners_random_max_minutes`. Values: nonnegative number or blank. Default: blank. Sets the upper bound of a random liner interval. **Random window maximum (minutes)**.
 - `liners_pick_mode`. Values: `random` (Random) or `sequential` (Sequential). Default: `random` (Random). Selects which eligible liner plays next. **Rotation mode**.
-- `liners_duck_db`. Values: -30 to 0 decibels. Default: -3.0. Lowers music under voice liners. **Music duck (dB)**.
+- `liners_duck_db`. Values: -30 to 0 decibels. Default: -3.0. Lowers music under voice liners. **Settings > Sound > Music duck (dB)**, available even when automatic voice liners are off.
 - `matched_intro_only_without_liner`. Values: true or false. Default: false. Plays matched intros only when no liner is due. **Only when no liner is scheduled**.
 - `liners_talk_up`. Legacy server live overlays and time checks only; values true or false, default false. Retained for existing configurations and live time checks. Saved-point automatic liners always use the shared cue-based handoff; the checkbox applies only to live server overlays. Browser playback ignores this key.
 

@@ -1,6 +1,7 @@
 // Pure DOM / formatting helpers shared across modules.
 
 import { announceStatus } from "./live-region.js";
+import { tableFocusTarget } from "./table-row.js";
 
 // ----------------------------------------------------------------
 // Debug logging — opt-in via `?debug=1` URL param OR
@@ -45,6 +46,11 @@ export function fmtTime(sec) {
   const s = Math.floor(sec % 60);
   const minutes = h ? `${h}:${String(m % 60).padStart(2, "0")}` : String(m);
   return `${minutes}:${String(s).padStart(2, "0")}`;
+}
+
+// A Details cell (#712): the facts that are set, one sentence each.
+export function sentences(...parts) {
+  return parts.filter(Boolean).map((part) => (/[.!?]$/.test(part) ? part : `${part}.`)).join(" ");
 }
 
 export function fmtTrack(t) {
@@ -134,6 +140,10 @@ export function focusRevealed(control, options) {
 
 // Keep field errors associated with their control without dropping its help.
 export function clearFieldError(control, error) {
+  if (Array.isArray(control)) {
+    control.forEach((field) => clearFieldError(field, error));
+    return;
+  }
   control?.removeAttribute("aria-invalid");
   if (!control || !error?.id) return;
   const ids = (control.getAttribute("aria-describedby") || "").split(/\s+/).filter((id) => id && id !== error.id);
@@ -159,22 +169,44 @@ export function clearFormErrors(form, error = null) {
   });
 }
 
-export function showFieldError(control, message, error, status) {
+// *status* is the live region that says the error when focus does not move
+// to the field (the focused field reads its own error), or a feature's
+// announcer, called as status(message, "error") in that case.
+export function showFieldError(control, message, error, status, { focus = true } = {}) {
+  const controls = (Array.isArray(control) ? control : [control]).filter(Boolean);
+  control = controls[0];
   error.textContent = message;
   error.hidden = false;
-  if (!control) { announceStatus(status, message, { force: true, tone: "error" }); return; }
-  control.setAttribute("aria-invalid", "true");
+  const announce = () => {
+    if (typeof status === "function") status(message, "error");
+    else announceStatus(status, message, { force: true, tone: "error" });
+  };
+  if (!control) { announce(); return; }
   // The error comes first, so it is read before a field's longer help.
-  const ids = new Set([error.id, ...(control.getAttribute("aria-describedby") || "").split(/\s+/)].filter(Boolean));
-  if (ids.size) control.setAttribute("aria-describedby", [...ids].join(" "));
+  for (const field of controls) {
+    field.setAttribute("aria-invalid", "true");
+    const ids = new Set([error.id, ...(field.getAttribute("aria-describedby") || "").split(/\s+/)].filter(Boolean));
+    if (ids.size) field.setAttribute("aria-describedby", [...ids].join(" "));
+  }
   const following = control.nextElementSibling;
   const label = control.closest("label") || (following?.htmlFor === control.id ? following : null);
   (label || control).after(error);
   const before = control.ownerDocument.activeElement;
-  focusRevealed(control);
-  if (before === control || control.ownerDocument.activeElement !== control) {
-    announceStatus(status, message, { force: true, tone: "error" });
-  }
+  if (focus) focusRevealed(control);
+  if (!focus || before === control || control.ownerDocument.activeElement !== control) announce();
+}
+
+// The server names its public field; each feature maps that key to its own
+// controls. Unknown keys stay with the caller's ordinary failure message.
+export function applyServerFieldError(error, fieldMap, errorNode, status, options) {
+  if (!errorNode || !Object.hasOwn(fieldMap, error?.field)) return false;
+  const mapped = fieldMap[error.field];
+  const controls = (Array.isArray(mapped) ? mapped : [mapped])
+    .map((field) => typeof field === "string" ? errorNode.ownerDocument.getElementById(field) : field)
+    .filter(Boolean);
+  if (!controls.length) return false;
+  showFieldError(controls, error.message, errorNode, status, options);
+  return true;
 }
 
 // ----------------------------------------------------------------
@@ -196,6 +228,7 @@ export function releaseDialogFocus(dialog) {
 // Once the dialog is closed.  A control the browser focused anyway lets go
 // and takes focus again, so the change is still reported.
 export function focusAfterDialog(control) {
+  control = tableFocusTarget(control);
   // The page body takes no focus, so it never counts as a place to return to.
   if (!control?.isConnected || control.disabled || control === control.ownerDocument.body) return false;
   if (control.ownerDocument.activeElement === control) control.blur();
@@ -312,13 +345,17 @@ export function placeRows(list, rows) {
 
 // Reuse direct-child rows by stable item key, update them in place, then
 // order them without moving the row that currently contains focus.
-export function reconcileRows(list, items, keyOf, createRow, updateRow, { fallback = null, onFocusLost = null } = {}) {
+export function reconcileRows(list, items, keyOf, createRow, updateRow, {
+  fallback = null, onFocusLost = null, rowSelector = "li",
+  controlSelector = ":scope > button:not(:disabled)", focusSelector = "button", focusControl = (active) => active,
+} = {}) {
   const active = list.ownerDocument.activeElement;
-  const focusedRow = active?.closest?.("li");
+  const focusedRow = active?.closest?.(rowSelector);
   const focusedIndex = focusedRow && focusedRow.parentElement === list ? [...list.children].indexOf(focusedRow) : -1;
   const focusedKey = focusedRow?.dataset.rowKey;
-  const focusedAction = active?.dataset?.action || active?.dataset?.role;
-  const focusedColumn = focusedRow ? [...focusedRow.querySelectorAll("button")].indexOf(active) : -1;
+  const control = focusControl(active);
+  const focusedAction = control?.dataset?.action || control?.dataset?.role;
+  const focusedColumn = focusedRow ? [...focusedRow.querySelectorAll(focusSelector)].indexOf(control) : -1;
   const existing = new Map([...list.children]
     .filter((row) => row.dataset.rowKey !== undefined)
     .map((row) => [row.dataset.rowKey, row]));
@@ -334,7 +371,7 @@ export function reconcileRows(list, items, keyOf, createRow, updateRow, { fallba
   const focused = focusedIndex >= 0 && (!active.isConnected || active.disabled);
   let target = null;
   if (focused) {
-    const candidates = (row) => [...row.querySelectorAll(":scope > button:not(:disabled)")];
+    const candidates = (row) => [...row.querySelectorAll(controlSelector)];
     const choose = (row) => {
       const buttons = candidates(row);
       return buttons.find((button) => (button.dataset.action || button.dataset.role) === focusedAction)

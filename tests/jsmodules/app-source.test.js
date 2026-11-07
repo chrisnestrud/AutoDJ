@@ -375,8 +375,9 @@ describe("durable playback semantics", () => {
     expect(describedBy).toContain("cue-summary");
     expect(describedBy).not.toContain("cue-details");
 
-    expect(queueList.getAttribute("role")).toBe("list");
-    expect(queueList.getAttribute("aria-label")).toBe("Queued tracks");
+    expect(queueList.tagName).toBe("DIV");
+    expect(queueList.hasAttribute("role")).toBe(false);
+    expect(queueList.hasAttribute("aria-label")).toBe(false);
     expect(queueList.getAttribute("tabindex")).toBe("-1");
     expect(queueList.hasAttribute("aria-live")).toBe(false);
   });
@@ -2313,15 +2314,15 @@ describe("app request behavior", () => {
       await setupApp({ onRequest: (url) => url.startsWith("/api/library/points?")
         ? jsonResponse({ path: "M:/song.flac", title: "Song", kind: "music", points: {} })
         : jsonResponse({ ok: true }) });
-      const { renderQueue } = await import("../../src/autodj/static/modules/queue.js");
+      const { applyQueueState } = await import("../../src/autodj/static/modules/queue.js");
       const list = document.querySelector("#queue-list");
       const els = { queueList: list, queueCount: document.querySelector("#queue-count") };
-      renderQueue([{ path: "M:/song.flac", title: "Song" }], els);
-      const opener = list.querySelector('[data-action="info"]');
+      applyQueueState([{ path: "M:/song.flac", title: "Song" }], els);
+      const opener = list.querySelector('button[data-action="info"]');
       opener.click();
       await vi.waitFor(() => expect(document.querySelector("#panel-track-info").hidden).toBe(false));
       document.querySelector("#track-info-return").click();
-      renderQueue([], els);
+      applyQueueState([], els);
       window.dispatchEvent(new window.HashChangeEvent("hashchange", {
         newURL: new URL("#track-info", location.href).href,
       }));
@@ -2334,7 +2335,7 @@ describe("app request behavior", () => {
     }
   });
 
-  it("returns to Now Playing and the Settings liner button", async () => {
+  it("returns to Now Playing and the Settings liner Options cell", async () => {
     window.location.hash = "#now";
     try {
       await setupApp({
@@ -2356,9 +2357,11 @@ describe("app request behavior", () => {
       const { renderLinerFileList } = await vi.importActual("../../src/autodj/static/modules/liners.js");
       const list = document.querySelector("#ln-file-list");
       renderLinerFileList(list, [{ id: "liner-1", name: "liner.wav", path: "N:/liner.wav" }], vi.fn());
-      const liner = list.querySelector('[aria-label="Track info for liner.wav"]');
+      const linerOptions = list.querySelector('[aria-label="Options for liner.wav"]');
+      const liner = linerOptions.closest("td");
       liner.focus();
-      liner.click();
+      linerOptions.click();
+      list.querySelector('[role="menuitem"][data-action="info"]').click();
       await vi.waitFor(() => expect(document.querySelector("#panel-track-info").hidden).toBe(false));
       expect(document.querySelector("#track-info-return").textContent).toBe("Return to Settings");
       document.querySelector("#track-info-return").click();
@@ -2485,7 +2488,7 @@ describe("app request behavior", () => {
     }
   });
 
-  it("returns to a queue Track info button after the queue redraws", async () => {
+  it("returns to a queue Track info cell after the queue redraws", async () => {
     window.location.hash = "#queue";
     try {
       await setupApp({
@@ -2493,21 +2496,21 @@ describe("app request behavior", () => {
           ? jsonResponse({ path: "M:/song.flac", title: "Song", kind: "music", points: {} })
           : jsonResponse({ ok: true }),
       });
-      const { renderQueue } = await import("../../src/autodj/static/modules/queue.js");
+      const { applyQueueState } = await import("../../src/autodj/static/modules/queue.js");
       const queueList = document.querySelector("#queue-list");
       const els = { queueList, queueCount: document.querySelector("#queue-count") };
-      renderQueue([{ path: "M:/song.flac", title: "Song" }], els);
-      const original = queueList.querySelector('[data-action="info"]');
+      applyQueueState([{ path: "M:/song.flac", title: "Song" }], els);
+      const original = queueList.querySelector('button[data-action="info"]');
       original.focus();
       original.click();
       await vi.waitFor(() => expect(document.querySelector("#panel-track-info").hidden).toBe(false));
       // The row went and came back: a new button for the same song.
-      renderQueue([], els);
-      renderQueue([{ path: "M:/song.flac", title: "Song" }], els);
-      const replacement = queueList.querySelector('[data-action="info"]');
+      applyQueueState([], els);
+      applyQueueState([{ path: "M:/song.flac", title: "Song" }], els);
+      const replacement = queueList.querySelector('button[data-action="info"]');
       expect(replacement).not.toBe(original);
       document.querySelector("#track-info-return").click();
-      await vi.waitFor(() => expect(document.activeElement).toBe(replacement));
+      await vi.waitFor(() => expect(document.activeElement).toBe(replacement.closest("td")));
     } finally {
       window.location.hash = "";
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -2867,6 +2870,28 @@ describe("app request behavior", () => {
     expect(document.querySelector("#progress-track").getAttribute("aria-valuenow")).toBe("0");
     expect(fetchImpl.mock.calls.some(([url]) => url === "/api/seek")).toBe(false);
     expect(deckAudio.currentTime).toBe(10);
+  });
+
+  it("signs out cleanly when the Profiles and Browser access installers found no markup", async () => {
+    const profilesPath = "../../src/autodj/static/modules/profiles.js";
+    const devicesPath = "../../src/autodj/static/modules/devices.js";
+    vi.doMock(profilesPath, async () => ({ ...(await vi.importActual(profilesPath)), installProfiles: () => undefined }));
+    vi.doMock(devicesPath, async () => ({ ...(await vi.importActual(devicesPath)), installAccess: () => undefined }));
+    try {
+      const { dialog } = await setupApp({
+        initialState: { current_track: { path: "current.mp3", title: "Current" } },
+        onRequest: (url) => url === "/api/pause"
+          ? jsonResponse({ detail: "Authentication required" }, 401)
+          : jsonResponse({ ok: true }),
+      });
+      document.querySelector("#btn-pause").click();
+      await vi.waitFor(() => expect(dialog.show).toHaveBeenCalledOnce());
+      expect(document.getElementById("profiles-status").textContent).toBe("");
+      expect(document.getElementById("access-status").textContent).toBe("");
+    } finally {
+      vi.doUnmock(profilesPath);
+      vi.doUnmock(devicesPath);
+    }
   });
 
   it("does not apply a shuffle response completed after confirmed expiry", async () => {
@@ -3536,8 +3561,11 @@ describe("stream mode", () => {
     // its own Volume slider.  A new play() must be added here on purpose.
     expect(found.plays.map((line) => line.replace(/^([^:]+):.*\| /, "$1: "))).toEqual([
       "modules/audio-engine.js: return deck.audio.play().catch((err) => {",
+      // Local control (#541) plays the same decks, through the master.
+      "modules/audio-engine.js: return Promise.resolve(deck.audio.play()).then(() => true).catch((err) => {",
       "modules/audio-engine.js: await deck.audio.play();",
       "modules/library-folders.js: await preview.play();",
+      "modules/local-programme.js: Promise.resolve().then(() => audio.play()).then(() => {",
       // Track info, Matched intros, Listen: a preview in the page, like Listen back.
       "modules/matched-intros.js: await playback.play();",
       "modules/player-page.js: playing = audio.play();",
@@ -4398,6 +4426,112 @@ describe("several stations (#70)", () => {
     expect(writes).toHaveLength(1);
     expect(JSON.parse(writes[0][1].body).changes).toEqual({ playback: { hour_fit_window_minutes: 9 } });
     expect(fit.disabled).toBe(false);
+  });
+
+  it("blocks stopped-station queue menu mutations but keeps Track info available", async () => {
+    let requestState = { enabled: true, approval: "manual", today: 2, daily_limit: 50, recent: [], pending: [
+      { id: "request-one", title: "Requested song", requested_at: 100, can_approve: true },
+      { id: "request-two", title: "Other request", requested_at: 101, can_approve: true },
+    ] };
+    const app = await setupApp({ stations: [AUTODJ, OWL], onRequest: (url) => {
+      if (/\/requests$/.test(url)) return jsonResponse(requestState);
+      if (url.endsWith("/requests/request-one/reject")) {
+        requestState = { ...requestState, pending: requestState.pending.slice(1) };
+        return jsonResponse(requestState);
+      }
+      return owlRequests(url);
+    } });
+    const sockets = trackSockets(app.WebSocketImpl);
+    chooseOwl();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0].onclose({ code: 4409, wasClean: true });
+    const { applyQueueState } = await import("../../src/autodj/static/modules/queue.js");
+    const host = document.getElementById("queue-list");
+    applyQueueState([{ path: "M:/song.flac", title: "Song" }, { path: "M:/other.flac", title: "Other" }],
+      { queueList: host, queueCount: document.getElementById("queue-count"), queueAnnounce: document.getElementById("queue-announce") });
+    host.querySelector('[aria-haspopup="menu"]').click();
+    const move = host.querySelector('button[data-action="down"]');
+    expect(move.getAttribute("aria-disabled")).toBe("true");
+    move.focus();
+    move.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(document.getElementById("queue-announce").textContent).toBe("Start the station to change the queue."));
+    expect(app.fetchImpl.mock.calls.some(([url, options]) => url.includes("/queue/") && options?.method === "POST")).toBe(false);
+    expect(host.querySelector('button[data-action="info"]').getAttribute("aria-disabled")).toBe("false");
+    const requests = document.getElementById("requests-list");
+    await vi.waitFor(() => expect(requests.querySelectorAll("tbody tr[data-row-key]")).toHaveLength(2));
+    const approve = requests.querySelector('button[data-action="approve"]');
+    expect(approve.getAttribute("aria-disabled")).toBe("true");
+    approve.click();
+    const requestOptions = requests.querySelector('[aria-haspopup="menu"]');
+    requestOptions.focus();
+    requestOptions.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    const playNext = requests.querySelector('button[data-action="play-next"]');
+    expect(document.activeElement).toBe(playNext);
+    expect(playNext.getAttribute("aria-disabled")).toBe("true");
+    playNext.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    expect(app.fetchImpl.mock.calls.some(([url, options]) => /\/requests\/[^/]+\/(approve|play-next)$/.test(url) && options?.method === "POST")).toBe(false);
+    const reject = requests.querySelector('button[data-action="reject"]');
+    expect(reject.getAttribute("aria-disabled")).toBe("false");
+    reject.focus();
+    reject.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(document.getElementById("confirm-dialog").open).toBe(true));
+    document.getElementById("confirm-accept").click();
+    await vi.waitFor(() => expect(requests.querySelectorAll("tbody tr[data-row-key]")).toHaveLength(1));
+    await vi.waitFor(() => expect(document.getElementById("confirm-dialog").open).toBe(false));
+    expect(app.fetchImpl.mock.calls.filter(([url, options]) => url.endsWith("/requests/request-one/reject") && options?.method === "POST")).toHaveLength(1);
+    document.getElementById("station-start").click();
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    sockets[1].onopen();
+    applyQueueState([{ path: "M:/song.flac", title: "Song" }, { path: "M:/other.flac", title: "Other" }], { queueList: host });
+    expect(host.querySelector('button[data-action="down"]').getAttribute("aria-disabled")).toBe("false");
+    expect(requests.querySelector('button[data-action="approve"]').getAttribute("aria-disabled")).toBe("false");
+    expect(requests.querySelector('button[data-action="play-next"]').getAttribute("aria-disabled")).toBe("false");
+  });
+
+  it("updates the schedule Run now menu action when the real app stops and starts a station", async () => {
+    const schedule = {
+      timezone: "UTC", actions: [], upcoming: [], runs: [],
+      events: [{ id: "event-one", name: "Morning show", enabled: true, repeat_text: "Daily at 07:00",
+        action_text: "Switch profile", timing: "soft" }],
+    };
+    const app = await setupApp({
+      stations: [AUTODJ, OWL],
+      onRequest: (url) => {
+        if (url.endsWith("/schedule")) return jsonResponse(schedule);
+        if (url.endsWith("/schedule/event-one/run")) return jsonResponse({ result: "ok" });
+        return owlRequests(url);
+      },
+    });
+    const sockets = trackSockets(app.WebSocketImpl);
+    chooseOwl();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    document.getElementById("tab-settings").click();
+    document.getElementById("stab-schedule").click();
+    await vi.waitFor(() => expect(document.querySelector('#schedule-events [aria-haspopup="menu"]')).not.toBeNull());
+    document.querySelector('#schedule-events [aria-haspopup="menu"]').click();
+    const run = document.querySelector('#schedule-events [role="menuitem"][data-action="run"]');
+    run.focus();
+    expect(run.getAttribute("aria-disabled")).toBe("false");
+    sockets[0].onclose({ code: 4409, wasClean: true });
+    expect(run.getAttribute("aria-disabled")).toBe("true");
+    expect(run.disabled).toBe(false);
+    expect(document.activeElement).toBe(run);
+    run.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(document.getElementById("schedule-status").textContent)
+      .toBe("Start the station to run this event now"));
+    const runCalls = () => app.fetchImpl.mock.calls.filter(([url]) => url.endsWith("/schedule/event-one/run"));
+    expect(runCalls()).toHaveLength(0);
+
+    document.getElementById("station-start").click();
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    sockets[1].onopen();
+    expect(run.getAttribute("aria-disabled")).toBe("false");
+    expect(run.disabled).toBe(false);
+    run.focus();
+    run.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(runCalls()).toHaveLength(1));
+    expect(runCalls()[0][0]).toBe("/api/stations/nightowl/schedule/event-one/run");
   });
 
   it("asks before leaving browser decks that play, and stops them only on yes", async () => {
